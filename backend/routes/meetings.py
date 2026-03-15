@@ -12,6 +12,7 @@ from agents.meeting_agent import (
     delete_meeting,
     optimize_meeting_schedule,
     suggest_nearby_venues,
+    parse_meeting_text,
 )
 
 meetings_bp = Blueprint("meetings", __name__, url_prefix="/api/meetings")
@@ -132,6 +133,32 @@ def suggest_schedule():
                 if summary:
                     suggestions.append({"suggestion": f"{date_label}: {summary}"})
         return jsonify({"success": True, "schedule": result, "suggestions": suggestions}), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@meetings_bp.route("/parse-text", methods=["POST"])
+def parse_text():
+    """
+    POST /api/meetings/parse-text
+    Body: { "text": "<raw email or WhatsApp text>", "source_type": "email"|"whatsapp" }
+    Returns extracted meeting fields ready to pre-fill the create form.
+    """
+    user = get_current_user()
+    if not user:
+        return jsonify({"success": False, "error": "Authentication required"}), 401
+
+    data = request.get_json(silent=True) or {}
+    text = (data.get("text") or "").strip()
+    source_hint = data.get("source_type", "email")
+
+    if not text:
+        return jsonify({"success": False, "error": "text is required"}), 400
+
+    try:
+        result = parse_meeting_text(text, source_hint=source_hint)
+        status = 200 if result.get("success") else 422
+        return jsonify(result), status
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 

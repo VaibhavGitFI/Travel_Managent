@@ -73,6 +73,14 @@ def plan_trip(trip_input: dict) -> dict:
     # Run all agents in parallel
     results = _run_agents_parallel(trip_details, user_id)
 
+    # Run validation layer after agents complete
+    try:
+        from agents.validator_agent import validate_trip_plan
+        validation = validate_trip_plan(trip_details, results)
+    except Exception as val_err:
+        logger.warning("[Orchestrator] Validator failed: %s", val_err)
+        validation = {"validation_flags": [], "overall": "pass", "ai_review": None, "flag_count": 0}
+
     # Build comprehensive response
     return {
         "success": True,
@@ -84,6 +92,7 @@ def plan_trip(trip_input: dict) -> dict:
         "checklist": results.get("checklist", {}),
         "guide": results.get("guide", {}),
         "meetings": results.get("meetings", {}),
+        "validation": validation,
         "metadata": {
             "destination": destination,
             "duration_days": duration_days,

@@ -1,14 +1,28 @@
 import { useState, useEffect, useRef } from 'react'
+import { useNavigate } from 'react-router-dom'
 import {
   Send, Sparkles, Copy, RefreshCw,
-  MapPin, CloudSun, Plane, Mic, Paperclip, X, Bot, MessageSquarePlus,
+  MapPin, CloudSun, Plane, Mic, Paperclip, X, Bot, MessageSquarePlus, Phone,
 } from 'lucide-react'
 import toast from 'react-hot-toast'
-import { sendMessage, getChatHistory } from '../api/chat'
+import { sendMessage, getChatHistory, sendStreamingMessage } from '../api/chat'
 import useStore from '../store/useStore'
 import Button from '../components/ui/Button'
 import Spinner from '../components/ui/Spinner'
 import { format } from 'date-fns'
+
+// Map chat agent target names → app routes
+const ROUTE_MAP = {
+  planner: '/planner',
+  hotels: '/accommodation',
+  expenses: '/expenses',
+  meetings: '/meetings',
+  requests: '/requests',
+  approvals: '/approvals',
+  analytics: '/analytics',
+  dashboard: '/dashboard',
+  chat: '/chat',
+}
 
 const SUGGESTIONS = [
   { icon: Plane, text: 'Plan a business trip from New York to London next week' },
@@ -31,6 +45,7 @@ const MAX_FILE_SIZE = 20 * 1024 * 1024
 
 export default function Chat() {
   const { auth } = useStore()
+  const navigate = useNavigate()
   const [messages, setMessages] = useState([])
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
@@ -73,6 +88,7 @@ export default function Chat() {
           content: m.content || m.message || m.text,
           time: m.created_at || m.timestamp || new Date().toISOString(),
           source: m.source,
+          action_cards: m.action_cards || [],
         })))
       }
     } catch {
@@ -166,34 +182,87 @@ export default function Chat() {
       inputRef.current.style.height = `${MIN_TEXTAREA_HEIGHT}px`
     }
 
+    // File attachments use the regular (non-streaming) endpoint
+    if (pendingFile) {
+      try {
+        const data = await sendMessage(content, { user: auth.user?.name }, pendingFile)
+        removeSelectedFile()
+        const reply = data.reply || data.message || data.response || 'Sorry, I could not process that.'
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: Date.now() + 1,
+            role: 'assistant',
+            content: reply,
+            time: new Date().toISOString(),
+            source: data.source,
+            action_cards: data.action_cards || [],
+          },
+        ])
+      } catch {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: Date.now() + 1,
+            role: 'assistant',
+            content: 'Sorry, I encountered an error. Please try again.',
+            time: new Date().toISOString(),
+            error: true,
+          },
+        ])
+      } finally {
+        setLoading(false)
+        inputRef.current?.focus()
+      }
+      return
+    }
+
+    // Text-only messages use the streaming SSE endpoint
+    const streamId = Date.now() + 1
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: streamId,
+        role: 'assistant',
+        content: '',
+        time: new Date().toISOString(),
+        streaming: true,
+        action_cards: [],
+      },
+    ])
+
     try {
-      const data = await sendMessage(content, { user: auth.user?.name }, pendingFile)
-      removeSelectedFile()
-
-      const reply = data.reply || data.message || data.response || 'Sorry, I could not process that.'
-
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: Date.now() + 1,
-          role: 'assistant',
-          content: reply,
-          time: new Date().toISOString(),
-          source: data.source,
+      await sendStreamingMessage(
+        content,
+        { user: auth.user?.name },
+        (token) => {
+          setMessages((prev) =>
+            prev.map((m) => (m.id === streamId ? { ...m, content: m.content + token } : m))
+          )
         },
-      ])
-
+        ({ action_cards, ai_powered }) => {
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === streamId
+                ? {
+                    ...m,
+                    streaming: false,
+                    action_cards: action_cards || [],
+                    source: ai_powered ? 'gemini-2.0-flash' : 'fallback',
+                  }
+                : m
+            )
+          )
+        }
+      )
     } catch {
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: Date.now() + 1,
-          role: 'assistant',
-          content: 'Sorry, I encountered an error. Please try again.',
-          time: new Date().toISOString(),
-          error: true,
-        },
-      ])
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === streamId
+            ? { ...m, streaming: false, content: m.content || 'Sorry, I encountered an error. Please try again.', error: !m.content }
+            : m
+        )
+      )
     } finally {
       setLoading(false)
       inputRef.current?.focus()
@@ -223,6 +292,25 @@ export default function Chat() {
     removeSelectedFile()
     if (inputRef.current) {
       inputRef.current.style.height = `${MIN_TEXTAREA_HEIGHT}px`
+    }
+  }
+
+  const handleCardAction = (card) => {
+    switch (card.action) {
+      case 'openTab':
+        navigate(ROUTE_MAP[card.target] || '/')
+        break
+      case 'openSOS':
+        toast(
+          '🚨 Emergency numbers — Ambulance: 108 · Police: 100 · Fire: 101 · General: 112',
+          { duration: 12000 }
+        )
+        break
+      case 'tel':
+        if (card.target) window.location.href = `tel:${card.target}`
+        break
+      default:
+        break
     }
   }
 
@@ -317,12 +405,13 @@ export default function Chat() {
                       message={msg}
                       onCopy={() => copyMessage(msg.content)}
                       onRegenerate={regenerateLastResponse}
+                      onAction={handleCardAction}
                       isLastAssistant={msg.role === 'assistant' && msg.id === lastAssistantId}
                       userInitial={userInitial}
                     />
                   ))}
 
-                  {loading && <TypingBubble />}
+                  {loading && !messages.some((m) => m.streaming) && <TypingBubble />}
                 </div>
               )}
 
@@ -481,10 +570,11 @@ function WelcomeScreen({ onSuggest, userName }) {
   )
 }
 
-function MessageBubble({ message: msg, onCopy, onRegenerate, isLastAssistant, userInitial }) {
+function MessageBubble({ message: msg, onCopy, onRegenerate, onAction, isLastAssistant, userInitial }) {
   const isUser = msg.role === 'user'
   const parsedDate = msg.time ? new Date(msg.time) : null
   const time = parsedDate && !Number.isNaN(parsedDate.getTime()) ? format(parsedDate, 'h:mm a') : ''
+  const cards = (!isUser && Array.isArray(msg.action_cards)) ? msg.action_cards : []
 
   return (
     <div className={`flex max-w-[min(48rem,92vw)] items-start gap-3 ${isUser ? 'ml-auto flex-row-reverse' : ''} animate-fade-in`}>
@@ -506,8 +596,45 @@ function MessageBubble({ message: msg, onCopy, onRegenerate, isLastAssistant, us
               : 'rounded-2xl border border-[#dce5ef] bg-[#f8fbff] text-[#2f435c]'
           }`}
         >
-          {renderMessageContent(msg.content)}
+          {msg.streaming && !msg.content ? (
+            <div className="flex items-center gap-1.5">
+              <span className="h-1.5 w-1.5 rounded-full bg-[#6e87a2] animate-bounce" style={{ animationDelay: '-0.2s' }} />
+              <span className="h-1.5 w-1.5 rounded-full bg-[#6e87a2] animate-bounce" style={{ animationDelay: '-0.1s' }} />
+              <span className="h-1.5 w-1.5 rounded-full bg-[#6e87a2] animate-bounce" />
+              <span className="ml-1 text-xs text-[#5f748c]">Thinking...</span>
+            </div>
+          ) : (
+            <>
+              {renderMessageContent(msg.content)}
+              {msg.streaming && (
+                <span className="ml-0.5 inline-block h-3.5 w-0.5 animate-pulse bg-[#4CC9F0] align-middle" />
+              )}
+            </>
+          )}
         </div>
+
+        {/* Action cards — quick-action buttons below assistant replies */}
+        {cards.length > 0 && (
+          <div className="mt-1 flex flex-wrap gap-2">
+            {cards.map((card, i) => (
+              <button
+                key={i}
+                type="button"
+                onClick={() => onAction?.(card)}
+                className={`flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium transition-colors ${
+                  card.action === 'openSOS'
+                    ? 'border-red-200 bg-red-50 text-red-700 hover:bg-red-500 hover:text-white hover:border-red-500'
+                    : card.action === 'tel'
+                    ? 'border-green-200 bg-green-50 text-green-700 hover:bg-green-500 hover:text-white hover:border-green-500'
+                    : 'border-[#4CC9F0]/50 bg-[#f0faff] text-[#1B263B] hover:bg-[#4CC9F0] hover:text-white hover:border-[#4CC9F0]'
+                }`}
+              >
+                {card.action === 'tel' && <Phone size={10} />}
+                {card.label}
+              </button>
+            ))}
+          </div>
+        )}
 
         <div className={`flex items-center gap-2 ${isUser ? 'flex-row-reverse' : ''}`}>
           {time && <span className="text-[10px] text-[#8ba0b6]">{time}</span>}

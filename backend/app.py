@@ -5,13 +5,13 @@ Flask REST API + React SPA frontend
 import os
 import logging
 from flask import Flask, send_from_directory, jsonify
-from flask_socketio import SocketIO, emit
+from flask_socketio import emit, join_room
 from flask_cors import CORS
 
 from config import Config
 from database import init_db
+from extensions import socketio, limiter
 
-socketio = SocketIO()
 logger = logging.getLogger(__name__)
 
 
@@ -35,6 +35,9 @@ def create_app() -> Flask:
     socketio.init_app(app, cors_allowed_origins=allowed_origins, async_mode="eventlet",
                       logger=False, engineio_logger=False)
 
+    # Rate limiter
+    limiter.init_app(app)
+
     with app.app_context():
         init_db(app)
 
@@ -52,20 +55,34 @@ def create_app() -> Flask:
     from routes.chat      import chat_bp
     from routes.uploads   import uploads_bp
     from routes.health    import health_bp
+    from routes.sos       import sos_bp
 
     for bp in (auth_bp, trips_bp, weather_bp, currency_bp, meetings_bp,
                expenses_bp, accommodation_bp, requests_bp, approvals_bp, analytics_bp,
-               chat_bp, uploads_bp, health_bp):
+               chat_bp, uploads_bp, health_bp, sos_bp):
         app.register_blueprint(bp)
 
     # ── SocketIO Events ────────────────────────────────────────────────────────
     @socketio.on("connect")
     def handle_connect():
-        emit("connected", {"status": "connected", "version": "3.0.0"})
+        from auth import get_current_user
+        user = get_current_user()
+        if user:
+            room = f"user_{user['id']}"
+            join_room(room)
+            emit("connected", {"status": "connected", "version": "3.0.0", "room": room})
+        else:
+            emit("connected", {"status": "connected", "version": "3.0.0"})
 
-    @socketio.on("subscribe_updates")
-    def handle_subscribe(data):
-        emit("subscribed", {"message": "Subscribed to real-time updates"})
+    @socketio.on("join_user_room")
+    def handle_join_room(data):
+        """Explicit room join — client sends user_id after auth."""
+        from auth import get_current_user
+        user = get_current_user()
+        if user:
+            room = f"user_{user['id']}"
+            join_room(room)
+            emit("room_joined", {"room": room})
 
     # ── Serve React SPA (production) ───────────────────────────────────────────
     @app.route("/", defaults={"path": ""})

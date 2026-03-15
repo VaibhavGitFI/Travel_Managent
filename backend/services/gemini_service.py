@@ -87,6 +87,36 @@ class GeminiService:
             logger.warning("[Gemini] Generate error: %s", e)
             return None
 
+    def generate_stream(self, prompt: str, system_instruction: str = None):
+        """
+        Stream text chunks from Gemini using the streaming API.
+        Yields string chunks as they arrive.
+        """
+        if not self.configured or not self._genai:
+            yield ""
+            return
+        if self._cooldown_until > time.time():
+            yield ""
+            return
+
+        try:
+            model_name = GEMINI_MODELS["flash"]
+            if system_instruction:
+                model = self._genai.GenerativeModel(model_name, system_instruction=system_instruction)
+            else:
+                model = self._genai.GenerativeModel(model_name)
+
+            response = model.generate_content(prompt, stream=True)
+            for chunk in response:
+                if chunk.text:
+                    yield chunk.text
+        except Exception as e:
+            error_text = str(e)
+            if self._is_quota_error(error_text):
+                self._enter_cooldown(error_text)
+            logger.warning("[Gemini] Stream error: %s", e)
+            return
+
     def generate_json(self, prompt: str, model_type: str = "flash") -> dict | None:
         """Generate and parse a JSON response."""
         full_prompt = prompt + "\n\nIMPORTANT: Respond with valid JSON only. No markdown, no explanation, just raw JSON."

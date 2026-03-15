@@ -30,3 +30,8 @@ export const getNearbyVenues = async (venueData) => {
   const { data } = await client.post('/meetings/nearby-venues', venueData)
   return data
 }
+
+export const parseMeetingText = async (text, sourceType = 'email') => {
+  const { data } = await client.post('/meetings/parse-text', { text, source_type: sourceType })
+  return data
+}

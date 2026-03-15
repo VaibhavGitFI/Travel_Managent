@@ -2,9 +2,38 @@
 Request Agent - Travel request CRUD + approval workflow
 Status flow: draft -> submitted -> pending_approval -> approved -> booked -> in_progress -> completed
 """
-from datetime import datetime
+import json
+import logging
+from datetime import datetime, date
 from database import get_db
 from agents.policy_agent import validate_request
+
+logger = logging.getLogger(__name__)
+
+# Valid manual transitions per role
+# Format: { current_status: [allowed_next_statuses] }
+_ALLOWED_TRANSITIONS = {
+    "employee": {
+        "approved":    ["booked"],
+        "booked":      ["in_progress"],
+        "in_progress": ["completed"],
+    },
+    "manager": {
+        "approved":    ["booked"],
+        "booked":      ["in_progress"],
+        "in_progress": ["completed"],
+    },
+    "admin": {
+        "draft":         ["submitted"],
+        "submitted":     ["pending_approval", "approved"],
+        "pending_approval": ["approved", "rejected"],
+        "approved":      ["booked", "rejected"],
+        "booked":        ["in_progress"],
+        "in_progress":   ["completed"],
+        "completed":     [],
+        "rejected":      [],
+    },
+}
 
 
 def create_request(data, user_id):
@@ -261,3 +290,233 @@ def get_pending_approvals(approver_id=None):
     rows = db.execute(query, params).fetchall()
     db.close()
     return [dict(r) for r in rows]
+
+
+def update_request_status(request_id: str, new_status: str, actor_user_id: int,
+                           actor_role: str = "employee") -> dict:
+    """
+    Transition a request to a new status.
+    Validates allowed transitions based on current status and actor role.
+    """
+    db = get_db()
+    req = db.execute(
+        "SELECT * FROM travel_requests WHERE request_id = ?", (request_id,)
+    ).fetchone()
+
+    if not req:
+        db.close()
+        return {"success": False, "error": "Request not found"}
+
+    req = dict(req)
+    current = req.get("status", "")
+
+    # Ownership check — non-admins can only change their own requests
+    if actor_role not in ("admin", "manager") and req.get("user_id") != actor_user_id:
+        db.close()
+        return {"success": False, "error": "You can only update your own requests"}
+
+    role_key = actor_role if actor_role in _ALLOWED_TRANSITIONS else "employee"
+    allowed = _ALLOWED_TRANSITIONS.get(role_key, {}).get(current, [])
+
+    if new_status not in allowed:
+        db.close()
+        return {
+            "success": False,
+            "error": f"Cannot transition from '{current}' to '{new_status}'",
+            "current_status": current,
+            "allowed_transitions": allowed,
+        }
+
+    now = datetime.now().isoformat()
+    db.execute(
+        "UPDATE travel_requests SET status=?, updated_at=? WHERE request_id=?",
+        (new_status, now, request_id)
+    )
+    db.commit()
+    db.close()
+
+    return {
+        "success": True,
+        "request_id": request_id,
+        "previous_status": current,
+        "status": new_status,
+        "message": f"Status updated to {new_status}",
+    }
+
+
+def check_and_auto_transition() -> list:
+    """
+    Auto-transition requests based on travel dates.
+    Call periodically or on list requests to keep statuses current.
+    - approved/booked + start_date <= today → in_progress
+    - in_progress + end_date < today → completed
+    Returns list of transitioned request_ids.
+    """
+    db = get_db()
+    today = date.today().isoformat()
+    transitioned = []
+
+    try:
+        # approved/booked → in_progress when start_date arrives
+        rows = db.execute("""
+            SELECT request_id, status, start_date, user_id, destination
+            FROM travel_requests
+            WHERE status IN ('approved', 'booked')
+              AND start_date IS NOT NULL AND start_date != ''
+              AND start_date <= ?
+        """, (today,)).fetchall()
+
+        for row in rows:
+            row = dict(row)
+            db.execute(
+                "UPDATE travel_requests SET status='in_progress', updated_at=? WHERE request_id=?",
+                (datetime.now().isoformat(), row["request_id"])
+            )
+            transitioned.append({"request_id": row["request_id"], "from": row["status"], "to": "in_progress"})
+            logger.info("[AutoTransition] %s: %s → in_progress", row["request_id"], row["status"])
+
+        # in_progress → completed when end_date has passed
+        rows = db.execute("""
+            SELECT request_id, user_id, destination
+            FROM travel_requests
+            WHERE status = 'in_progress'
+              AND end_date IS NOT NULL AND end_date != ''
+              AND end_date < ?
+        """, (today,)).fetchall()
+
+        for row in rows:
+            row = dict(row)
+            db.execute(
+                "UPDATE travel_requests SET status='completed', updated_at=? WHERE request_id=?",
+                (datetime.now().isoformat(), row["request_id"])
+            )
+            transitioned.append({"request_id": row["request_id"], "from": "in_progress", "to": "completed"})
+            logger.info("[AutoTransition] %s: in_progress → completed", row["request_id"])
+
+        db.commit()
+    except Exception as e:
+        logger.warning("[AutoTransition] Error: %s", e)
+    finally:
+        db.close()
+
+    return transitioned
+
+
+def generate_trip_report(request_id: str) -> dict:
+    """
+    Generate a post-trip summary report using Gemini AI.
+    Pulls expenses, meetings, compliance data from DB.
+    """
+    db = get_db()
+    try:
+        req = db.execute("""
+            SELECT tr.*, u.full_name as requester_name, u.department
+            FROM travel_requests tr
+            LEFT JOIN users u ON tr.user_id = u.id
+            WHERE tr.request_id = ?
+        """, (request_id,)).fetchone()
+
+        if not req:
+            return {"success": False, "error": "Request not found"}
+
+        req = dict(req)
+
+        expenses = db.execute(
+            "SELECT * FROM expenses_db WHERE request_id = ? OR trip_id = ?",
+            (request_id, request_id)
+        ).fetchall()
+        expenses = [dict(e) for e in expenses]
+        total_spent = sum(float(e.get("amount") or e.get("invoice_amount") or 0) for e in expenses)
+
+        meetings = db.execute(
+            "SELECT * FROM client_meetings WHERE user_id = ? AND LOWER(destination) LIKE ?",
+            (req.get("user_id"), f"%{(req.get('destination') or '').lower()}%")
+        ).fetchall()
+        meetings = [dict(m) for m in meetings]
+
+    finally:
+        db.close()
+
+    budget = float(req.get("estimated_total") or 0)
+
+    try:
+        from services.gemini_service import gemini
+        if gemini.is_available:
+            compliance_raw = req.get("policy_compliance_json") or "{}"
+            try:
+                compliance = json.loads(compliance_raw) if isinstance(compliance_raw, str) else compliance_raw
+            except Exception:
+                compliance = {}
+
+            expense_lines = "\n".join([
+                f"  - {e.get('category','misc')}: ₹{e.get('amount') or e.get('invoice_amount', 0)}"
+                for e in expenses[:10]
+            ]) or "  No expenses recorded"
+
+            meeting_lines = "\n".join([
+                f"  - {m.get('client_name')} ({m.get('company','')}) on {m.get('meeting_date','')} at {m.get('venue','')}"
+                for m in meetings[:10]
+            ]) or "  No meetings recorded"
+
+            prompt = f"""Generate a concise post-trip business report (3-5 paragraphs) for:
+
+Trip: {req.get('origin','N/A')} → {req.get('destination','N/A')}
+Employee: {req.get('requester_name','N/A')} ({req.get('department','N/A')})
+Dates: {req.get('start_date','N/A')} to {req.get('end_date','N/A')} ({req.get('duration_days',0)} days)
+Purpose: {req.get('purpose','N/A')}
+
+Budget: ₹{budget:,.0f} | Actual: ₹{total_spent:,.0f} | Variance: ₹{total_spent - budget:+,.0f}
+Policy Compliant: {compliance.get('is_compliant', 'N/A')}
+
+Expenses:
+{expense_lines}
+
+Client Meetings:
+{meeting_lines}
+
+Write a professional executive summary: key outcomes, budget performance, meetings conducted,
+and recommendations for future trips. Be specific and business-focused.
+"""
+            narrative = gemini.generate(prompt)
+            if narrative:
+                return {
+                    "success": True,
+                    "request_id": request_id,
+                    "report": {
+                        "narrative": narrative,
+                        "destination": req.get("destination"),
+                        "dates": f"{req.get('start_date')} to {req.get('end_date')}",
+                        "duration_days": req.get("duration_days"),
+                        "budget": budget,
+                        "actual_spend": total_spent,
+                        "variance": total_spent - budget,
+                        "expense_count": len(expenses),
+                        "meeting_count": len(meetings),
+                        "ai_generated": True,
+                    },
+                }
+    except Exception as e:
+        logger.warning("[TripReport] Gemini error: %s", e)
+
+    return {
+        "success": True,
+        "request_id": request_id,
+        "report": {
+            "narrative": (
+                f"Trip from {req.get('origin','N/A')} to {req.get('destination','N/A')} completed. "
+                f"Duration: {req.get('duration_days', 0)} days. "
+                f"Budget: ₹{budget:,.0f} | Spent: ₹{total_spent:,.0f}. "
+                f"Meetings conducted: {len(meetings)}. Expenses: {len(expenses)}. "
+                "Set GEMINI_API_KEY for an AI-generated executive summary."
+            ),
+            "destination": req.get("destination"),
+            "dates": f"{req.get('start_date')} to {req.get('end_date')}",
+            "duration_days": req.get("duration_days"),
+            "budget": budget,
+            "actual_spend": total_spent,
+            "variance": total_spent - budget,
+            "expense_count": len(expenses),
+            "meeting_count": len(meetings),
+            "ai_generated": False,
+        },
+    }

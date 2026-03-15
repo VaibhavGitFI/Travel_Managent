@@ -3,8 +3,14 @@ TravelSync Pro — Database Layer
 SQLite for development. Set DATABASE_URL for Cloud SQL PostgreSQL in production.
 
 Schema versioning via _apply_migrations() — safely adds new columns to existing DBs.
+
+get_db() returns a unified interface that works identically for both SQLite and PostgreSQL:
+  - Rows support both dict access (row["key"]) and attribute access
+  - SQL uses '?' placeholders (auto-converted to '%s' for PostgreSQL)
+  - .execute(), .fetchone(), .fetchall(), .commit(), .close() all work the same
 """
 import os
+import re
 import json
 import logging
 import sqlite3
@@ -14,7 +20,92 @@ DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "travelsync.d
 logger = logging.getLogger(__name__)
 
 
+class _PGRow(dict):
+    """Dict-like row wrapper that also supports attribute access (like sqlite3.Row)."""
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return list(self.values())[key]
+        return super().__getitem__(key)
+
+    def get(self, key, default=None):
+        return super().get(key, default)
+
+    def keys(self):
+        return super().keys()
+
+
+class _PGCursor:
+    """sqlite3-compatible cursor wrapper around psycopg2 cursor."""
+
+    def __init__(self, cur):
+        self._cur = cur
+
+    def execute(self, sql: str, params=()):
+        pg_sql = re.sub(r"\?", "%s", sql)
+        self._cur.execute(pg_sql, params or ())
+        return self
+
+    def fetchone(self):
+        row = self._cur.fetchone()
+        return _PGRow(row) if row else None
+
+    def fetchall(self):
+        return [_PGRow(r) for r in self._cur.fetchall()]
+
+    def __iter__(self):
+        return (_PGRow(r) for r in self._cur)
+
+
+class _PGAdapter:
+    """sqlite3-compatible wrapper around psycopg2 connection."""
+
+    def __init__(self, conn):
+        self._conn = conn
+        import psycopg2.extras
+        self._cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        self.row_factory = None  # compatibility attribute
+
+    def execute(self, sql: str, params=()):
+        cursor = _PGCursor(self._cur)
+        cursor.execute(sql, params)
+        return cursor
+
+    def commit(self):
+        self._conn.commit()
+
+    def close(self):
+        try:
+            self._cur.close()
+        except Exception:
+            pass
+        try:
+            self._conn.close()
+        except Exception:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, *args):
+        if exc_type:
+            self._conn.rollback()
+        self.close()
+
+
 def get_db():
+    """Return a database connection. Uses PostgreSQL if DATABASE_URL is set, else SQLite."""
+    database_url = os.getenv("DATABASE_URL")
+    if database_url:
+        try:
+            import psycopg2
+            conn = psycopg2.connect(database_url)
+            conn.autocommit = False
+            return _PGAdapter(conn)
+        except ImportError:
+            logger.warning("[DB] psycopg2 not installed — falling back to SQLite")
+        except Exception as exc:
+            logger.error("[DB] PostgreSQL connection failed: %s — falling back to SQLite", exc)
+
     db = sqlite3.connect(DB_PATH)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA foreign_keys = ON")

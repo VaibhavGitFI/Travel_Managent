@@ -7,6 +7,35 @@ from flask import Blueprint, request, jsonify
 from auth import get_current_user
 from agents.orchestrator import plan_trip
 from database import get_db
+from extensions import limiter
+
+
+def _emit_trip_update(user_id: int, destination: str, result: dict) -> None:
+    """Emit trip_update event to the requesting user. Silent on failure."""
+    try:
+        from extensions import socketio
+        hotel_count = len(result.get("hotels", {}).get("results", []))
+        mode_count = len(result.get("travel", {}).get("modes", {}).get("available", []))
+        detail = []
+        if hotel_count:
+            detail.append(f"{hotel_count} hotel{'s' if hotel_count > 1 else ''}")
+        if mode_count:
+            detail.append(f"{mode_count} travel option{'s' if mode_count > 1 else ''}")
+        summary = (", ".join(detail) + " found") if detail else "Plan is ready"
+        socketio.emit(
+            "trip_update",
+            {
+                "type": "trip_plan_ready",
+                "title": f"Trip Plan Ready — {destination} 🗺️",
+                "message": summary,
+                "destination": destination,
+                "timestamp": datetime.now().isoformat(),
+            },
+            to=f"user_{user_id}",
+            namespace="/",
+        )
+    except Exception:
+        pass
 
 trips_bp = Blueprint("trips", __name__, url_prefix="/api")
 
@@ -89,6 +118,7 @@ def _serialize_trip(row: dict) -> dict:
 
 @trips_bp.route("/plan-trip", methods=["POST"])
 @trips_bp.route("/trips/plan", methods=["POST"])
+@limiter.limit("10 per minute")
 def plan_trip_route():
     """POST /api/plan-trip and /api/trips/plan — run the A2A orchestrator."""
     user = get_current_user()
@@ -111,6 +141,7 @@ def plan_trip_route():
             or result.get("hotels", {}).get("data_source")
             or "live"
         )
+        _emit_trip_update(user["id"], trip_input["destination"], result)
         return jsonify(result), 200
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500

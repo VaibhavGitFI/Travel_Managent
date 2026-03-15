@@ -4,11 +4,15 @@ Dashboard stats, spend analysis, and policy compliance scorecard from real DB da
 """
 from flask import Blueprint, jsonify
 from auth import get_current_user
+from flask import request as flask_request
 from agents.analytics_agent import (
     get_dashboard_stats,
     get_spend_analysis,
     get_policy_compliance_scorecard,
+    get_carbon_analytics,
 )
+from agents.travel_mode_agent import calculate_carbon
+from services.maps_service import maps
 
 analytics_bp = Blueprint("analytics", __name__, url_prefix="/api/analytics")
 
@@ -50,6 +54,55 @@ def compliance():
 
     try:
         result = get_policy_compliance_scorecard()
+        return jsonify(result), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@analytics_bp.route("/carbon", methods=["GET"])
+def carbon():
+    """GET /api/analytics/carbon — CO₂ footprint trend, department comparison, greener alternatives."""
+    user = get_current_user()
+    if not user:
+        return jsonify({"success": False, "error": "Authentication required"}), 401
+
+    try:
+        result = get_carbon_analytics(user_id=user["id"], role=user.get("role", "employee"))
+        return jsonify(result), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@analytics_bp.route("/carbon/estimate", methods=["GET"])
+def carbon_estimate():
+    """
+    GET /api/analytics/carbon/estimate?origin=X&destination=Y&mode=flight&travelers=1
+    Returns quick CO₂ estimate for a proposed trip.
+    """
+    user = get_current_user()
+    if not user:
+        return jsonify({"success": False, "error": "Authentication required"}), 401
+
+    origin = flask_request.args.get("origin", "").strip()
+    destination = flask_request.args.get("destination", "").strip()
+    mode = flask_request.args.get("mode", "flight").strip().lower()
+    try:
+        num_travelers = max(1, int(flask_request.args.get("travelers", 1)))
+    except (ValueError, TypeError):
+        num_travelers = 1
+
+    if not destination:
+        return jsonify({"success": False, "error": "destination is required"}), 400
+
+    try:
+        dist_km = 0.0
+        if origin and destination:
+            dist_km = maps.get_distance_km(origin, destination) or 0.0
+        if not dist_km:
+            dist_km = 5000.0 if mode == "flight" else 700.0
+
+        result = calculate_carbon(dist_km, mode, num_travelers)
+        result["success"] = True
         return jsonify(result), 200
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500

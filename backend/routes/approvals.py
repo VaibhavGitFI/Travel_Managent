@@ -2,9 +2,38 @@
 TravelSync Pro — Approval Routes
 Manager-facing approval queue: list pending, approve, reject.
 """
+from datetime import datetime
 from flask import Blueprint, request, jsonify
 from auth import get_current_user
 from agents.request_agent import get_pending_approvals, process_approval
+
+
+def _notify_requester(request_id: str, title: str, message: str, notif_type: str) -> None:
+    """Emit a SocketIO notification to the request's owner. Silent on failure."""
+    try:
+        from extensions import socketio
+        from database import get_db
+        db = get_db()
+        req = db.execute(
+            "SELECT user_id, destination FROM travel_requests WHERE request_id = ?",
+            (request_id,)
+        ).fetchone()
+        db.close()
+        if req:
+            socketio.emit(
+                "notification",
+                {
+                    "type": notif_type,
+                    "title": title,
+                    "message": message,
+                    "request_id": request_id,
+                    "timestamp": datetime.now().isoformat(),
+                },
+                to=f"user_{req['user_id']}",
+                namespace="/",
+            )
+    except Exception:
+        pass
 
 approvals_bp = Blueprint("approvals", __name__, url_prefix="/api/approvals")
 
@@ -73,6 +102,25 @@ def approve_request(request_id):
     try:
         result = process_approval(request_id, approver_id=user["id"],
                                   action="approve", comments=comments)
+        if result.get("success"):
+            # Look up destination for the notification message
+            try:
+                from database import get_db
+                db = get_db()
+                req = db.execute(
+                    "SELECT destination FROM travel_requests WHERE request_id = ?",
+                    (request_id,)
+                ).fetchone()
+                db.close()
+                dest = req["destination"] if req else request_id
+            except Exception:
+                dest = request_id
+            _notify_requester(
+                request_id,
+                title="Trip Request Approved ✅",
+                message=f"Your trip to {dest} has been approved. You can now proceed with booking.",
+                notif_type="approval",
+            )
         status = 200 if result.get("success") else 400
         return jsonify(result), status
     except Exception as e:
@@ -96,6 +144,24 @@ def reject_request(request_id):
     try:
         result = process_approval(request_id, approver_id=user["id"],
                                   action="reject", comments=reason)
+        if result.get("success"):
+            try:
+                from database import get_db
+                db = get_db()
+                req = db.execute(
+                    "SELECT destination FROM travel_requests WHERE request_id = ?",
+                    (request_id,)
+                ).fetchone()
+                db.close()
+                dest = req["destination"] if req else request_id
+            except Exception:
+                dest = request_id
+            _notify_requester(
+                request_id,
+                title="Trip Request Rejected ❌",
+                message=f"Your trip to {dest} was not approved. Reason: {reason or 'See comments.'}",
+                notif_type="rejection",
+            )
         status = 200 if result.get("success") else 400
         return jsonify(result), status
     except Exception as e:

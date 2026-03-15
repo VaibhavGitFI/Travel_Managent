@@ -6,10 +6,20 @@ import json
 import os
 import logging
 from datetime import datetime
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, Response, stream_with_context
 from werkzeug.utils import secure_filename
 from auth import get_current_user
-from agents.chat_agent import process_message
+from extensions import limiter
+from agents.chat_agent import (
+    process_message,
+    SYSTEM_PROMPT,
+    _detect_intent,
+    _extract_entities,
+    _build_action_cards,
+    _enrich_reply,
+    _pattern_reply,
+)
+from services.gemini_service import gemini
 from database import get_db
 from config import Config
 from services.vision_service import vision
@@ -87,6 +97,7 @@ def _insert_chat_message(db, user_id: int, role: str, content: str, intent: str 
 
 
 @chat_bp.route("", methods=["POST"])
+@limiter.limit("30 per minute")
 def chat():
     """POST /api/chat — send a message to the AI travel assistant."""
     user = get_current_user()
@@ -150,6 +161,70 @@ def chat():
         return jsonify({"success": True, **result}), 200
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
+
+
+@chat_bp.route("/stream", methods=["POST"])
+@limiter.limit("30 per minute")
+def chat_stream():
+    """POST /api/chat/stream — progressive SSE streaming of AI response."""
+    user = get_current_user()
+    if not user:
+        return jsonify({"success": False, "error": "Authentication required"}), 401
+
+    data = request.get_json(silent=True) or {}
+    message = (data.get("message") or "").strip()
+    context = data.get("context") if isinstance(data.get("context"), dict) else {}
+
+    if not message:
+        return jsonify({"success": False, "error": "message is required"}), 400
+
+    intent = _detect_intent(message)
+    entities = _extract_entities(message, context=context)
+    action_cards = _build_action_cards(intent, entities)
+
+    user_context = f"User: {user.get('full_name') or user.get('name', '')} ({user.get('role', 'employee')}). "
+    prompt = f"{user_context}Query: {message}."
+
+    accumulated = []
+
+    def generate():
+        ai_powered = False
+
+        if gemini.is_available:
+            for chunk in gemini.generate_stream(prompt, system_instruction=SYSTEM_PROMPT):
+                accumulated.append(chunk)
+                yield f"data: {json.dumps({'token': chunk})}\n\n"
+            ai_powered = bool(accumulated)
+
+        full_reply = "".join(accumulated)
+
+        if not full_reply:
+            # Gemini unavailable or returned nothing — pattern fallback
+            full_reply = _pattern_reply(message, intent, entities)
+            yield f"data: {json.dumps({'token': full_reply})}\n\n"
+
+        enriched = _enrich_reply(full_reply, intent, entities)
+        extra = enriched[len(full_reply):]
+        if extra:
+            yield f"data: {json.dumps({'token': extra})}\n\n"
+
+        # Persist user message + assistant reply
+        try:
+            db = get_db()
+            _insert_chat_message(db, user["id"], "user", message, intent)
+            _insert_chat_message(db, user["id"], "assistant", enriched, intent, action_cards)
+            db.commit()
+            db.close()
+        except Exception as persist_err:
+            logger.warning("[Chat Stream] Persist error: %s", persist_err)
+
+        yield f"data: {json.dumps({'done': True, 'action_cards': action_cards, 'intent': intent, 'ai_powered': ai_powered})}\n\n"
+
+    return Response(
+        stream_with_context(generate()),
+        content_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @chat_bp.route("/history", methods=["GET"])

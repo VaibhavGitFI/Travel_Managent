@@ -373,6 +373,128 @@ def get_policy_compliance_scorecard() -> dict:
         db.close()
 
 
+def get_carbon_analytics(user_id: int = None, role: str = "employee") -> dict:
+    """
+    Compute carbon footprint analytics.
+    Returns monthly CO₂ trend, department comparison, and greener-alternative suggestions.
+    """
+    from agents.travel_mode_agent import calculate_carbon
+    from services.maps_service import maps
+
+    db = get_db()
+    try:
+        # Fetch completed/in_progress trips
+        if role in ("admin", "manager"):
+            rows = db.execute(
+                """SELECT tr.request_id, tr.origin, tr.destination, tr.trip_type,
+                          tr.duration_days, tr.num_travelers, tr.start_date,
+                          u.department
+                   FROM travel_requests tr
+                   LEFT JOIN users u ON u.id = tr.user_id
+                   WHERE tr.status IN ('completed', 'in_progress', 'approved', 'booked')
+                   ORDER BY tr.start_date DESC LIMIT 100"""
+            ).fetchall()
+        else:
+            rows = db.execute(
+                """SELECT tr.request_id, tr.origin, tr.destination, tr.trip_type,
+                          tr.duration_days, tr.num_travelers, tr.start_date,
+                          u.department
+                   FROM travel_requests tr
+                   LEFT JOIN users u ON u.id = tr.user_id
+                   WHERE tr.user_id = ? AND tr.status IN ('completed', 'in_progress', 'approved', 'booked')
+                   ORDER BY tr.start_date DESC LIMIT 50""",
+                (user_id,)
+            ).fetchall()
+    finally:
+        db.close()
+
+    # CO₂ per trip
+    monthly: dict[str, float] = {}
+    dept_totals: dict[str, float] = {}
+    trip_carbon_list = []
+    total_co2 = 0.0
+    total_savings_possible = 0.0
+    greener_suggestions = []
+
+    for row in rows:
+        r = dict(row)
+        origin = r.get("origin") or ""
+        dest = r.get("destination") or ""
+        trip_type = r.get("trip_type") or "domestic"
+        n = max(1, int(r.get("num_travelers") or 1))
+
+        # Determine distance
+        dist_km = 0.0
+        if origin and dest:
+            try:
+                dist_km = maps.get_distance_km(origin, dest) or 0.0
+            except Exception:
+                pass
+        if not dist_km:
+            # Rough fallback: domestic ~700 km avg, international ~5000 km avg
+            dist_km = 5000.0 if trip_type == "international" else 700.0
+
+        mode = "flight" if (trip_type == "international" or dist_km > 400) else "cab"
+
+        carbon = calculate_carbon(dist_km, mode, n)
+        co2 = carbon["co2_kg"]
+        total_co2 += co2
+
+        # Monthly bucket (YYYY-MM)
+        month = (r.get("start_date") or "")[:7]
+        if month:
+            monthly[month] = monthly.get(month, 0.0) + co2
+
+        # Department bucket
+        dept = r.get("department") or "General"
+        dept_totals[dept] = dept_totals.get(dept, 0.0) + co2
+
+        trip_carbon_list.append({
+            "request_id": r.get("request_id"),
+            "route": f"{origin} → {dest}",
+            "co2_kg": co2,
+            "mode": mode,
+            "distance_km": carbon["distance_km"],
+            "greener_alt": carbon.get("greener_alt"),
+            "saving_kg": carbon.get("greener_saving_kg"),
+        })
+
+        if carbon.get("greener_saving_kg") and carbon["greener_saving_kg"] > 5:
+            total_savings_possible += carbon["greener_saving_kg"]
+            if len(greener_suggestions) < 3:
+                greener_suggestions.append({
+                    "route": f"{origin} → {dest}",
+                    "current_mode": mode,
+                    "suggested_mode": carbon["greener_alt"],
+                    "saving_kg": round(carbon["greener_saving_kg"], 1),
+                    "saving_pct": round(carbon["greener_saving_kg"] / co2 * 100, 0) if co2 else 0,
+                })
+
+    # Sort monthly trend
+    monthly_trend = [
+        {"month": m, "co2_kg": round(v, 2)}
+        for m, v in sorted(monthly.items())
+    ]
+
+    # Department comparison
+    dept_comparison = [
+        {"department": d, "co2_kg": round(v, 2)}
+        for d, v in sorted(dept_totals.items(), key=lambda x: -x[1])
+    ]
+
+    return {
+        "success": True,
+        "total_co2_kg": round(total_co2, 2),
+        "total_trips_analyzed": len(rows),
+        "trees_to_offset": round(total_co2 / 21.77, 1),
+        "potential_savings_kg": round(total_savings_possible, 2),
+        "monthly_trend": monthly_trend,
+        "department_comparison": dept_comparison,
+        "top_trips": sorted(trip_carbon_list, key=lambda x: -x["co2_kg"])[:10],
+        "greener_suggestions": greener_suggestions,
+    }
+
+
 def _get_policy() -> dict:
     """Fetch active policy when present, else first row, else defaults."""
     db = get_db()
