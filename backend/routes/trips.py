@@ -1,0 +1,173 @@
+"""
+TravelSync Pro — Trip Planning Routes
+Orchestrates all agents in parallel to produce a complete trip plan.
+"""
+from datetime import datetime
+from flask import Blueprint, request, jsonify
+from auth import get_current_user
+from agents.orchestrator import plan_trip
+from database import get_db
+
+trips_bp = Blueprint("trips", __name__, url_prefix="/api")
+
+
+def _safe_int(value, default):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _normalize_trip_input(data: dict, user: dict) -> dict:
+    origin = (data.get("origin") or data.get("from_city") or "").strip()
+    destination = (data.get("destination") or data.get("to_city") or data.get("city") or "").strip()
+    start_date = (data.get("start_date") or data.get("travel_date") or "").strip()
+    end_date = (data.get("end_date") or data.get("return_date") or start_date).strip()
+    travel_dates = (data.get("travel_dates") or "").strip()
+    if not travel_dates and start_date:
+        travel_dates = f"{start_date} to {end_date}" if end_date else start_date
+
+    duration_days = _safe_int(data.get("duration_days"), 0)
+    if duration_days <= 0 and start_date:
+        try:
+            start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+            end_dt = datetime.strptime(end_date or start_date, "%Y-%m-%d")
+            duration_days = max((end_dt - start_dt).days + 1, 1)
+        except ValueError:
+            duration_days = 1
+    if duration_days <= 0:
+        duration_days = 1
+
+    num_travelers = _safe_int(data.get("num_travelers"), 1)
+    if num_travelers <= 0:
+        num_travelers = 1
+
+    purpose = (data.get("purpose") or "client meeting").replace("_", " ")
+
+    return {
+        "destination": destination,
+        "origin": origin,
+        "trip_type": data.get("trip_type", "domestic"),
+        "purpose": purpose,
+        "travelers": data.get("travelers", []),
+        "traveler_names": data.get("traveler_names", []),
+        "traveler_origins": data.get("traveler_origins", []),
+        "num_travelers": num_travelers,
+        "travel_dates": travel_dates,
+        "start_date": start_date,
+        "end_date": end_date,
+        "duration_days": duration_days,
+        "meeting_time": data.get("meeting_time", "10:00 AM"),
+        "meeting_days": data.get("meeting_days", []),
+        "budget": data.get("budget", "moderate"),
+        "weather": data.get("weather", ""),
+        "require_veg": bool(data.get("require_veg", False)),
+        "long_stay_mode": bool(data.get("long_stay_mode", False)),
+        "client_address": data.get("client_address", ""),
+        "is_rural": bool(data.get("is_rural", False)),
+        "user_id": user.get("id", 1),
+    }
+
+
+def _serialize_trip(row: dict) -> dict:
+    origin = row.get("origin") or row.get("from_city") or ""
+    destination = row.get("destination") or row.get("to_city") or ""
+    start_date = row.get("start_date") or row.get("travel_date") or ""
+    end_date = row.get("end_date") or row.get("return_date") or ""
+    status = row.get("status") or "draft"
+    return {
+        **row,
+        "from_city": origin,
+        "to_city": destination,
+        "travel_date": start_date,
+        "return_date": end_date,
+        "estimated_budget": row.get("estimated_total") or row.get("budget_inr") or 0,
+        "status": "pending" if status in ("submitted", "pending_approval") else status,
+        "raw_status": status,
+    }
+
+
+@trips_bp.route("/plan-trip", methods=["POST"])
+@trips_bp.route("/trips/plan", methods=["POST"])
+def plan_trip_route():
+    """POST /api/plan-trip and /api/trips/plan — run the A2A orchestrator."""
+    user = get_current_user()
+    if not user:
+        return jsonify({"success": False, "error": "Authentication required"}), 401
+
+    data = request.get_json(silent=True) or {}
+    trip_input = _normalize_trip_input(data, user)
+
+    if not trip_input["origin"] or not trip_input["destination"]:
+        return jsonify({"success": False, "error": "origin and destination are required"}), 400
+
+    try:
+        result = plan_trip(trip_input)
+        # Compatibility aliases for older frontend consumers.
+        result["summary"] = result.get("summary") or result.get("trip_summary", {}).get("trip_type", "")
+        result["travel_options"] = result.get("travel", {}).get("modes", {})
+        result["source"] = (
+            result.get("travel", {}).get("data_source")
+            or result.get("hotels", {}).get("data_source")
+            or "live"
+        )
+        return jsonify(result), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@trips_bp.route("/trips", methods=["GET"])
+def list_trips():
+    """GET /api/trips — list saved trip requests for dashboard and history views."""
+    user = get_current_user()
+    if not user:
+        return jsonify({"success": False, "error": "Authentication required"}), 401
+
+    limit = min(_safe_int(request.args.get("limit"), 50), 200)
+    db = get_db()
+    try:
+        if user.get("role") in ("admin", "manager"):
+            rows = db.execute(
+                "SELECT * FROM travel_requests ORDER BY created_at DESC LIMIT ?",
+                (limit,)
+            ).fetchall()
+        else:
+            rows = db.execute(
+                "SELECT * FROM travel_requests WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
+                (user["id"], limit)
+            ).fetchall()
+
+        trips = [_serialize_trip(dict(r)) for r in rows]
+        return jsonify({"success": True, "trips": trips, "total": len(trips)}), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+    finally:
+        db.close()
+
+
+@trips_bp.route("/trips/<string:trip_id>", methods=["GET"])
+def get_trip(trip_id: str):
+    """GET /api/trips/<id> — fetch a single trip by numeric id or request_id."""
+    user = get_current_user()
+    if not user:
+        return jsonify({"success": False, "error": "Authentication required"}), 401
+
+    db = get_db()
+    try:
+        if trip_id.isdigit():
+            row = db.execute("SELECT * FROM travel_requests WHERE id = ?", (int(trip_id),)).fetchone()
+        else:
+            row = db.execute("SELECT * FROM travel_requests WHERE request_id = ?", (trip_id,)).fetchone()
+
+        if not row:
+            return jsonify({"success": False, "error": "Trip not found"}), 404
+
+        trip = dict(row)
+        if user.get("role") not in ("admin", "manager") and trip.get("user_id") != user.get("id"):
+            return jsonify({"success": False, "error": "Forbidden"}), 403
+
+        return jsonify({"success": True, "trip": _serialize_trip(trip)}), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+    finally:
+        db.close()

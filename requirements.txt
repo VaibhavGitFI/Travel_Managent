@@ -1,0 +1,30 @@
+# Core Flask
+flask==3.1.0
+flask-cors==4.0.0
+python-dotenv==1.0.1
+werkzeug==3.1.3
+
+# SocketIO
+flask-socketio==5.5.1
+eventlet==0.36.1
+
+# Google APIs
+google-generativeai==0.8.3
+google-cloud-vision==3.8.0
+google-cloud-storage==2.18.2
+google-cloud-secret-manager==2.21.0
+
+# Travel APIs
+amadeus==9.0.0
+googlemaps==4.10.0
+
+# HTTP / Async
+requests==2.32.3
+aiohttp==3.10.10
+
+# Utilities
+cachetools==5.5.0
+Pillow==10.4.0
+
+# Production server
+gunicorn==23.0.0
