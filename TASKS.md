@@ -222,4 +222,150 @@ Protect all endpoints from abuse.
 ---
 
 *Last updated: 2026-03-15*
-*Next: Build Feature #1 — AI Chat Grounded Responses*
+
+---
+
+## Frontend Refactor & AI System Improvements
+
+### Design System Foundation
+- [x] Added semantic design tokens to `tailwind.config.js`: `brand.*` (dark, mid, light, muted, cyan) and `surface.*` (DEFAULT, raised, sunken, border, border-strong)
+- [x] Created `cn()` utility at `frontend/src/lib/cn.js` wrapping clsx for conditional classes
+- [x] Updated CSS custom properties in `index.css` to match new token system
+- [x] Added comprehensive chat markdown prose styles (`.chat-prose`) for rich AI response rendering
+- [x] Installed `react-markdown` + `remark-gfm` for proper markdown rendering in AI chat
+
+### Layout Shell Refactor
+- [x] **Sidebar** — Split navigation into "Travel" and "Manage" groups with section headings, added user profile footer (name/role/logout), removed CitySkylineSVG, added collapse/expand toggles, replaced all hardcoded hex with brand tokens, active indicator bar
+- [x] **Topbar** — Added Cmd+K shortcut trigger (navigates to AI Chat), shows user full name on desktop, removed dead breadcrumb code, cleaner health indicator, uses surface tokens
+- [x] **Layout** — Main content area now provides padding (`px-4 py-5 sm:px-6 sm:py-6`), pages no longer need their own rounded-3xl wrappers, background uses `bg-surface` token
+
+### AI Chat System Enhancement
+- [x] **Rich DB Context Injection** (`chat_agent.py`) — `_build_user_context()` queries real DB data: recent travel requests (last 5 with status/dates/budget), pending approvals (for managers), upcoming meetings (next 7 days), expense totals, travel policy summary. Injected as structured system prompt context.
+- [x] **Multi-turn Conversation** (`gemini_service.py`) — Added `generate_with_history()` and `stream_with_history()` using Gemini `model.start_chat(history=...)` for proper multi-turn context. Chat remembers last 6 messages.
+- [x] **History-Aware Streaming** (`routes/chat.py`) — Stream endpoint now uses `build_system_prompt()` with user DB context + `stream_with_history()` with conversation history
+- [x] **Markdown Rendering** (`Chat.jsx`) — Replaced naive `renderMessageContent()` with `react-markdown` + `remark-gfm`. Proper headings, bold, lists, tables, code blocks with syntax highlighting. `.chat-prose` CSS class for consistent styling.
+- [x] **Streaming Resilience** (`api/chat.js`) — Added 60s timeout via AbortController, JWT Bearer token in stream request headers
+- [x] **Grounding Instructions** — System prompt explicitly forbids inventing booking refs, flight numbers, or prices. Instructs model to cite actual context data.
+
+### Page-by-Page Token Cleanup
+- [x] **Dashboard** — Removed rounded-3xl wrapper, replaced 20+ hardcoded hex values with brand/surface tokens, cleaner stat cards and quick actions
+- [x] **Login** — Updated gradient to use brand-dark/navy tokens, cleaned submit button and placeholder colors
+- [x] **Requests** — Full token replacement, consistent surface borders and backgrounds
+- [x] **Meetings** — Full token replacement with cn() utility
+- [x] **Expenses** — Token replacement (kept chart SVG hex colors as-is)
+- [x] **Analytics** — Full token replacement
+- [x] **Approvals** — Full token replacement
+- [x] **TripPlanner** — Full token replacement
+- [x] **Accommodation** — Full token replacement
+- [x] **StatCard component** — Updated corporate accent to use surface/brand tokens
+
+### Real-Time Improvements
+- [x] **Stale Data Store** — Added `staleData` slice to Zustand store with `markStale(key)` and `clearStale(key)` actions for requests/meetings/expenses/approvals/analytics
+- [x] **WebSocket Data Changed Events** — Layout.jsx listens for `data_changed` socket events and marks corresponding data as stale
+- [x] **Backend Emissions** — Approval approve/reject routes now emit `data_changed` for both `approvals` and `requests` entities via SocketIO
+
+### New Libraries Added
+- `react-markdown` — Markdown rendering for AI chat responses
+- `remark-gfm` — GitHub Flavored Markdown support (tables, strikethrough, task lists)
+
+### Architecture Decisions
+- **No component library** — Kept existing custom Tailwind components (Button, Input, Modal, Badge, etc.) rather than adding shadcn/ui. Existing components work well and avoid a multi-day migration.
+- **No dark mode** — Deferred to avoid doubling design surface area before demo
+- **SSE kept for chat streaming** — No migration to WebSocket; SSE works correctly for unidirectional AI responses
+- **Multi-turn via Gemini chat sessions** — Uses `model.start_chat(history=...)` rather than concatenating all messages into a single prompt
+
+---
+
+## Tier 1: Advanced Real-Time + AI Features
+
+### 1. Skeleton Loading Screens `[x]`
+Content-shaped shimmer placeholders instead of centered spinners.
+- [x] `Skeleton.jsx` — composable primitives: `Skeleton`, `SkeletonText`, `SkeletonCard`, `SkeletonRow`, `SkeletonTable`
+- [x] Uses existing `.skeleton` CSS class (shimmer animation in `index.css`)
+- [x] Dashboard → 5x SkeletonRow in trips list
+- [x] Requests → SkeletonRow list
+- [x] Approvals → SkeletonRow list
+- [x] Expenses → SkeletonTable (desktop) + SkeletonRow (mobile)
+- [x] Meetings → 6x SkeletonCard in 3-col grid
+- [x] Analytics → stat card skeletons + chart area rectangles
+- [x] Chat → alternating message bubble skeletons
+- **Files:** `frontend/src/components/ui/Skeleton.jsx`, 7 page components
+
+### 2. Real-time Auto-Refresh `[x]`
+Pages auto-refresh when socket `data_changed` events fire.
+- [x] `useAutoRefresh.js` hook — watches `staleData[key]`, calls `fetchFn`, clears stale
+- [x] Wired into: Requests, Approvals, Expenses, Meetings, Analytics, Dashboard
+- [x] Backend emits `data_changed` from: requests (create/submit/status), expenses (submit), meetings (create/update/delete)
+- **Files:** `frontend/src/hooks/useAutoRefresh.js`, 6 page components, `backend/routes/requests.py`, `backend/routes/expenses.py`, `backend/routes/meetings.py`
+
+### 3. Pagination + Search `[x]`
+Server-side pagination and search for large lists.
+- [x] Backend: `?page=1&per_page=20&search=X` on GET /api/requests, /api/expenses, /api/meetings
+- [x] Response: `{success, items, total, page, per_page, total_pages}` + backward-compat keys
+- [x] `usePagination.js` hook — page/search/loading/fetch with 400ms debounced search
+- [x] `Pagination.jsx` — prev/next controls + page indicator
+- [x] Requests page: search input + pagination controls
+- [x] Expenses page: search input + pagination controls
+- [x] Meetings page: search input + pagination controls
+- **Files:** `frontend/src/hooks/usePagination.js`, `frontend/src/components/ui/Pagination.jsx`, 3 page components, 3 backend routes, 3 API modules
+
+### 4. Proactive AI Notifications `[x]`
+Smart alerts on Dashboard — upcoming trips, pending approvals, budget warnings.
+- [x] `alerts_agent.py` — `get_user_alerts(user)` queries DB for upcoming trips (3 days), pending approvals (managers), expiring requests, budget warnings (80%+ monthly limit)
+- [x] `GET /api/alerts` endpoint via `alerts_bp`
+- [x] `getAlerts()` in `analytics.js`
+- [x] Dashboard: dismissible AlertCard components above KPI stats (severity colors: info=blue, warning=amber, critical=red)
+- **Files:** `backend/agents/alerts_agent.py`, `backend/routes/alerts.py`, `backend/app.py`, `frontend/src/api/analytics.js`, `frontend/src/pages/Dashboard.jsx`
+
+### 5. Chat → Action Execution (Trip Planning Inline) `[x]`
+"Plan a trip to Mumbai" in chat runs the orchestrator and shows results inline.
+- [x] `chat_agent.py`: when intent=`plan_trip` + destination exists, calls `orchestrator.plan_trip()`
+- [x] `_summarize_trip_results()` extracts top 3 flights, top 3 hotels, weather summary
+- [x] Streaming endpoint: orchestrator runs before stream starts, `trip_results` included in `done` SSE event
+- [x] Non-streaming endpoint: `trip_results` in response dict
+- [x] `TripResultsCard` component: destination header, top flights/hotels with prices, weather summary, "View Full Plan" link
+- **Files:** `backend/agents/chat_agent.py`, `backend/routes/chat.py`, `frontend/src/pages/Chat.jsx`
+
+---
+
+## Tier 2: Differentiating Features
+
+### 6. AI Expense Anomaly Detection `[x]`
+Flag suspicious expenses with 5 detection rules.
+- [x] `anomaly_agent.py` — 5 detectors: duplicate amounts, weekend submissions, category outliers (2x avg), round amounts (>₹5000), rapid-fire submissions (<5min)
+- [x] `GET /api/expenses/anomalies` endpoint
+- [x] `getExpenseAnomalies()` API function
+- [x] Expenses page: "AI Anomaly Scan" panel with Scan button, color-coded anomaly cards (warning=amber, info=blue)
+- **Files:** `backend/agents/anomaly_agent.py`, `backend/routes/expenses.py`, `frontend/src/api/expenses.js`, `frontend/src/pages/Expenses.jsx`
+
+### 7. Smart Trip Recommendations `[x]`
+AI suggests optimal combos based on past trips + travel policy.
+- [x] `recommendation_agent.py` — queries past trips, historical expenses, travel policy; generates hotel/flight tips + budget insight
+- [x] Gemini AI insight: 3 actionable tips specific to the destination
+- [x] `POST /api/trips/recommendations` endpoint
+- [x] `getTripRecommendations()` API function
+- [x] TripPlanner: "AI Tips" button fetches recommendations, displays hotel/flight policy tips, budget info, AI insights
+- **Files:** `backend/agents/recommendation_agent.py`, `backend/routes/trips.py`, `frontend/src/api/trips.js`, `frontend/src/pages/TripPlanner.jsx`
+
+### 8. Redis Cache Layer `[x]`
+Unified cache with optional Redis + automatic TTLCache fallback.
+- [x] `cache_service.py` — `CacheStore` class: Redis primary (when `REDIS_URL` set), TTLCache fallback (zero config)
+- [x] Pre-configured instances: `weather_cache` (30min), `currency_cache` (1hr), `amadeus_cache` (5min), `session_cache` (24hr)
+- [x] `get_cache_status()` exposed in `/api/health`
+- [x] JSON serialization, namespace isolation, TTL per-key overrides
+- **Files:** `backend/services/cache_service.py`, `backend/routes/health.py`
+
+### 9. Background Task Queue `[x]`
+Thread-pool async task runner with SocketIO progress events.
+- [x] `task_queue.py` — `TaskQueue` class: ThreadPoolExecutor (4 workers), TTLCache task store (1hr), progress tracking
+- [x] `task_queue.submit()` returns task_id, emits `task_progress` socket events (pending→running→completed/failed)
+- [x] `POST /api/trips/plan-async` — async trip planning, returns 202 with task_id
+- [x] `GET /api/tasks/<id>` — task status; `GET /api/tasks/<id>/result` — task result; `GET /api/tasks` — list user tasks
+- **Files:** `backend/services/task_queue.py`, `backend/routes/trips.py`
+
+### 10. Nearby Venue Search UI `[x]`
+Wire existing backend venue search into Meetings page.
+- [x] "Find Venues" button in Meetings toolbar opens venue search modal
+- [x] Location input + search → shows hotels with conference, coworking spaces, cafes with ratings
+- [x] Uses existing `getNearbyVenues` API + `suggest_nearby_venues` backend
+- **Files:** `frontend/src/pages/Meetings.jsx`

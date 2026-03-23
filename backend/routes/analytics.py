@@ -2,6 +2,7 @@
 TravelSync Pro — Analytics Routes
 Dashboard stats, spend analysis, and policy compliance scorecard from real DB data.
 """
+import logging
 from flask import Blueprint, jsonify
 from auth import get_current_user
 from flask import request as flask_request
@@ -13,6 +14,8 @@ from agents.analytics_agent import (
 )
 from agents.travel_mode_agent import calculate_carbon
 from services.maps_service import maps
+
+logger = logging.getLogger(__name__)
 
 analytics_bp = Blueprint("analytics", __name__, url_prefix="/api/analytics")
 
@@ -28,7 +31,8 @@ def dashboard():
         result = get_dashboard_stats(user_id=user["id"])
         return jsonify(result), 200
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        logger.exception("Failed to load dashboard stats")
+        return jsonify({"success": False, "error": "Failed to load dashboard statistics"}), 500
 
 
 @analytics_bp.route("/spend", methods=["GET"])
@@ -42,7 +46,8 @@ def spend():
         result = get_spend_analysis()
         return jsonify(result), 200
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        logger.exception("Failed to load spend analysis")
+        return jsonify({"success": False, "error": "Failed to load spend analysis"}), 500
 
 
 @analytics_bp.route("/compliance", methods=["GET"])
@@ -56,7 +61,8 @@ def compliance():
         result = get_policy_compliance_scorecard()
         return jsonify(result), 200
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        logger.exception("Failed to load compliance scorecard")
+        return jsonify({"success": False, "error": "Failed to load compliance scorecard"}), 500
 
 
 @analytics_bp.route("/carbon", methods=["GET"])
@@ -70,7 +76,8 @@ def carbon():
         result = get_carbon_analytics(user_id=user["id"], role=user.get("role", "employee"))
         return jsonify(result), 200
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        logger.exception("Failed to load carbon analytics")
+        return jsonify({"success": False, "error": "Failed to load carbon analytics"}), 500
 
 
 @analytics_bp.route("/carbon/estimate", methods=["GET"])
@@ -105,4 +112,5 @@ def carbon_estimate():
         result["success"] = True
         return jsonify(result), 200
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        logger.exception("Failed to estimate carbon footprint")
+        return jsonify({"success": False, "error": "Failed to estimate carbon footprint"}), 500

@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Outlet } from 'react-router-dom'
 import toast from 'react-hot-toast'
-import clsx from 'clsx'
+import { cn } from '../../lib/cn'
 import { Phone, AlertTriangle, X, Loader2 } from 'lucide-react'
 import Sidebar from './Sidebar'
 import Topbar from './Topbar'
@@ -9,6 +9,7 @@ import useStore from '../../store/useStore'
 import client from '../../api/client'
 import socket from '../../lib/socket'
 import { triggerSOS, getEmergencyContacts } from '../../api/sos'
+import { getNotifications } from '../../api/notifications'
 
 const NOTIF_ICONS = {
   approval: '✅',
@@ -19,12 +20,24 @@ const NOTIF_ICONS = {
 }
 
 export default function Layout() {
-  const { auth, addNotification, setApiHealth, setSidebarCollapsed, sidebar } = useStore()
+  const { auth, addNotification, setNotifications, setApiHealth, setSidebarCollapsed, sidebar, markStale } = useStore()
   const [sosOpen,    setSosOpen]    = useState(false)
   const [sosCity,    setSosCity]    = useState('')
   const [sosMsg,     setSosMsg]     = useState('')
   const [sosLoading, setSosLoading] = useState(false)
   const [sosData,    setSosData]    = useState(null)
+
+  // ── Load persistent notifications from DB on login ──────────────────────────
+  useEffect(() => {
+    if (!auth.isLoggedIn) return
+    getNotifications(30)
+      .then((res) => {
+        if (res.success && res.notifications) {
+          setNotifications(res.notifications)
+        }
+      })
+      .catch(() => {})
+  }, [auth.isLoggedIn, setNotifications])
 
   // ── Real-time WebSocket ─────────────────────────────────────────────────────
   useEffect(() => {
@@ -67,15 +80,24 @@ export default function Layout() {
       toast.success(data.message || 'Trip plan is ready!', { duration: 5000 })
     }
 
+    const handleDataChanged = (data) => {
+      const entity = data?.entity
+      if (entity && ['requests', 'meetings', 'expenses', 'approvals', 'analytics'].includes(entity)) {
+        markStale(entity)
+      }
+    }
+
     socket.on('notification', handleNotification)
     socket.on('trip_update', handleTripUpdate)
+    socket.on('data_changed', handleDataChanged)
 
     return () => {
       socket.off('notification', handleNotification)
       socket.off('trip_update', handleTripUpdate)
+      socket.off('data_changed', handleDataChanged)
       socket.disconnect()
     }
-  }, [auth.isLoggedIn, addNotification])
+  }, [auth.isLoggedIn, addNotification, markStale])
 
   // Poll health every 60 s
   useEffect(() => {
@@ -168,7 +190,7 @@ export default function Layout() {
         type="button"
         aria-label="Close sidebar"
         onClick={() => setSidebarCollapsed(true)}
-        className={clsx(
+        className={cn(
           'fixed inset-0 z-30 bg-slate-950/40 backdrop-blur-[1px] transition-opacity duration-300 lg:hidden',
           sidebar.collapsed ? 'pointer-events-none opacity-0' : 'opacity-100'
         )}
@@ -178,8 +200,8 @@ export default function Layout() {
       <div className="flex flex-1 min-h-0 min-w-0 flex-col overflow-hidden">
         <Topbar />
 
-        <main className="flex-1 min-h-0 overflow-x-hidden overflow-y-auto">
-          <div className="page-enter min-h-full">
+        <main className="flex-1 min-h-0 overflow-x-hidden overflow-y-auto bg-surface">
+          <div className="page-enter min-h-full px-4 py-5 sm:px-6 sm:py-6">
             <Outlet />
           </div>
         </main>

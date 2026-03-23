@@ -6,7 +6,6 @@ import logging
 from datetime import datetime, date
 
 from database import get_db
-from services.amadeus_service import amadeus
 from services.gemini_service import gemini
 
 logger = logging.getLogger(__name__)
@@ -122,20 +121,7 @@ def forecast_budget(
         if spend_values:
             historical_avg = sum(spend_values) / len(spend_values)
 
-    # 2. Amadeus flight price analysis
-    amadeus_price = None
-    if amadeus.configured and start_date:
-        try:
-            origin_code = amadeus.get_airport_code(origin) if origin else None
-            dest_code = amadeus.get_airport_code(destination)
-            if origin_code and dest_code:
-                price_data = amadeus.get_price_analysis(origin_code, dest_code, start_date)
-                if price_data.get("source") == "amadeus_live":
-                    amadeus_price = price_data.get("level")
-        except Exception as exc:
-            logger.debug("[BudgetForecast] Amadeus price skip: %s", exc)
-
-    # 3. Build cost breakdown
+    # 2. Build cost breakdown
     # Flight (round-trip per traveler)
     is_intl = trip_type == "international" or tier_name == "international"
     base_flight = _FLIGHT_ESTIMATES["international" if is_intl else "domestic"]
@@ -144,13 +130,6 @@ def forecast_budget(
     flight_min = base_flight["min"] * n
     flight_mid = base_flight["mid"] * n
     flight_max = base_flight["max"] * n
-
-    if amadeus_price and str(amadeus_price).replace(".", "").isdigit():
-        # Use Amadeus reference price as mid
-        ref = float(amadeus_price) * n
-        flight_min = int(ref * 0.8)
-        flight_mid = int(ref)
-        flight_max = int(ref * 1.4)
 
     # Hotel
     hotel_daily = tier_rates.get("hotel", 3000)
@@ -182,7 +161,7 @@ def forecast_budget(
     # 4. Confidence level
     if len(history) >= 3:
         confidence = "high"
-    elif len(history) >= 1 or amadeus_price:
+    elif len(history) >= 1:
         confidence = "medium"
     else:
         confidence = "low"
@@ -221,7 +200,7 @@ def forecast_budget(
         },
         "historical_trips": len(history),
         "historical_avg": round(historical_avg, 0) if historical_avg else None,
-        "amadeus_price_data": bool(amadeus_price),
+
         "confidence": confidence,
         "ai_insight": ai_insight,
         "source": "budget_forecast_agent",

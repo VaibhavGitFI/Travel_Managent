@@ -1,7 +1,7 @@
 import client from './client'
 
-export const getRequests = async () => {
-  const { data } = await client.get('/requests')
+export const getRequests = async (params) => {
+  const { data } = await client.get('/requests', { params })
   return data
 }
 

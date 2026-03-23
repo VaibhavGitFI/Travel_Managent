@@ -2,9 +2,12 @@
 TravelSync Pro — Currency Routes
 Currency conversion and destination travel-info via Open Exchange Rates.
 """
+import logging
 from flask import Blueprint, request, jsonify
 from auth import get_current_user
 from services.currency_service import currency as currency_service
+
+logger = logging.getLogger(__name__)
 
 currency_bp = Blueprint("currency", __name__, url_prefix="/api/currency")
 
@@ -38,7 +41,8 @@ def convert():
             return jsonify({"success": False, **result}), 400
         return jsonify({"success": True, **result}), 200
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        logger.exception("Failed to convert currency")
+        return jsonify({"success": False, "error": "Failed to convert currency"}), 500
 
 
 @currency_bp.route("/travel-info", methods=["GET"])
@@ -56,4 +60,5 @@ def travel_info():
         result = currency_service.get_travel_currencies(destination)
         return jsonify({"success": True, **result}), 200
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        logger.exception("Failed to get travel currency info")
+        return jsonify({"success": False, "error": "Failed to get travel currency info"}), 500

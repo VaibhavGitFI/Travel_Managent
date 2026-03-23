@@ -53,3 +53,36 @@ export const getMe = async () => {
   const { data } = await client.get('/auth/me')
   return data
 }
+
+export const register = async (fullName, email, password, department) => {
+  const { data } = await client.post('/auth/register', {
+    full_name: fullName,
+    email,
+    password,
+    department,
+  })
+  if (data.access_token) {
+    setAccessToken(data.access_token)
+    if (data.refresh_token) sessionStorage.setItem('ts_refresh', data.refresh_token)
+  }
+  return data
+}
+
+export const verifyEmail = async (code) => {
+  const { data } = await client.post('/auth/verify-email', { code })
+  if (data.access_token) {
+    setAccessToken(data.access_token)
+    if (data.refresh_token) sessionStorage.setItem('ts_refresh', data.refresh_token)
+  }
+  return data
+}
+
+export const forgotPassword = async (email) => {
+  const { data } = await client.post('/auth/forgot-password', { email })
+  return data
+}
+
+export const resetPassword = async (code, newPassword) => {
+  const { data } = await client.post('/auth/reset-password', { code, new_password: newPassword })
+  return data
+}

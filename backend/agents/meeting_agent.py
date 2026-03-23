@@ -75,12 +75,17 @@ def add_meeting(data: dict, user_id: int) -> dict:
 
 
 def get_all_meetings(user_id: int, destination: str = None,
-                     meeting_date: str = None) -> list:
-    """Fetch meetings with optional filters."""
+                     meeting_date: str = None, role: str = "employee") -> list:
+    """Fetch meetings with optional filters. Admins/managers see all org meetings."""
     db = get_db()
     try:
-        query = "SELECT * FROM client_meetings WHERE user_id=?"
-        params = [user_id]
+        is_admin = role in ("admin", "manager")
+        if is_admin:
+            query = "SELECT * FROM client_meetings WHERE 1=1"
+            params = []
+        else:
+            query = "SELECT * FROM client_meetings WHERE user_id=?"
+            params = [user_id]
         if destination:
             query += " AND LOWER(destination) LIKE ?"
             params.append(f"%{destination.lower()}%")

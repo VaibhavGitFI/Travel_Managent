@@ -1,6 +1,6 @@
 """
 TravelSync Pro — Travel Mode Agent
-- Real flight search via Amadeus API
+- Real flight search via AviationStack API (falls back to curated data)
 - Distance-based mode recommendation (cab/bus/train/flight)
 - Team arrival synchronization for multi-origin groups
 - IRCTC, RedBus, Ola, Uber deep links
@@ -10,9 +10,9 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from datetime import datetime, timedelta
-from services.amadeus_service import amadeus
 from services.maps_service import maps
 from services.gemini_service import gemini
+from services.flights_service import flights as flights_svc, get_airport_code
 
 
 def recommend_travel_mode(trip_details: dict, model=None) -> dict:
@@ -49,24 +49,28 @@ def recommend_travel_mode(trip_details: dict, model=None) -> dict:
     }
 
     # ── Flights ──────────────────────────────────────────────
-    if distance_km > 400 or mode["primary"] == "flight":
-        origin_code = amadeus.get_airport_code(origin)
-        dest_code = amadeus.get_airport_code(destination)
-        flight_data = amadeus.search_flights(
+    if distance_km > 300 or mode["primary"] == "flight":
+        origin_code = get_airport_code(origin)
+        dest_code = get_airport_code(destination)
+        flight_data = flights_svc.search_flights(
             origin_code, dest_code, departure_date,
             adults=num_travelers, max_results=6
         )
-        result["modes"]["flight"] = {
-            "available": True,
-            "options": flight_data.get("flights", []),
-            "booking_platforms": [
-                {"name": "MakeMyTrip", "url": f"https://www.makemytrip.com/flights/results?from={origin_code}&to={dest_code}&date={departure_date}&adults={num_travelers}"},
-                {"name": "Cleartrip", "url": f"https://www.cleartrip.com/flights/results?from={origin_code}&to={dest_code}&date={departure_date}&adults={num_travelers}"},
-                {"name": "Goibibo", "url": f"https://www.goibibo.com/flights/"},
-                {"name": "EaseMyTrip", "url": "https://flight.easemytrip.com/"},
-            ],
-            "source": flight_data.get("source", "fallback"),
-        }
+        flight_options = flight_data.get("flights", [])
+        # Only show flights if the route actually has them
+        if flight_options:
+            search_q = f"{origin}+to+{destination}+flights".replace(' ', '+')
+            result["modes"]["flight"] = {
+                "available": True,
+                "options": flight_options,
+                "booking_platforms": [
+                    {"name": "Google Flights", "url": f"https://www.google.com/search?q={search_q}"},
+                ],
+                "source": flight_data.get("source", "curated"),
+            }
+        else:
+            reason = flight_data.get("reason", "No flights available on this route")
+            result["modes"]["flight"] = {"available": False, "reason": reason, "options": []}
 
     # ── Trains ───────────────────────────────────────────────
     if 100 < distance_km < 1500:

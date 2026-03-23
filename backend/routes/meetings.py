@@ -3,6 +3,7 @@ TravelSync Pro — Client Meetings Routes
 CRUD for client meetings plus AI schedule optimization and venue suggestions.
 Meetings can originate from any source: manual, email, WhatsApp, phone, calendar, LinkedIn.
 """
+import logging
 from flask import Blueprint, request, jsonify
 from auth import get_current_user
 from agents.meeting_agent import (
@@ -14,6 +15,8 @@ from agents.meeting_agent import (
     suggest_nearby_venues,
     parse_meeting_text,
 )
+
+logger = logging.getLogger(__name__)
 
 meetings_bp = Blueprint("meetings", __name__, url_prefix="/api/meetings")
 
@@ -35,7 +38,7 @@ def _normalize_meeting_payload(data: dict) -> dict:
 
 @meetings_bp.route("", methods=["GET"])
 def list_meetings():
-    """GET /api/meetings?trip_id=X — list meetings for the current user."""
+    """GET /api/meetings?trip_id=X&page=1&per_page=20&search=X — list meetings with pagination and search."""
     user = get_current_user()
     if not user:
         return jsonify({"success": False, "error": "Authentication required"}), 401
@@ -48,10 +51,44 @@ def list_meetings():
             user_id=user["id"],
             destination=destination or None,
             meeting_date=meeting_date or None,
+            role=user.get("role", "employee"),
         )
-        return jsonify({"success": True, "meetings": meetings, "total": len(meetings)}), 200
+
+        # Search filter
+        search = (request.args.get("search") or "").strip().lower()
+        if search:
+            meetings = [
+                m for m in meetings
+                if search in (m.get("client_name") or "").lower()
+                or search in (m.get("company") or "").lower()
+                or search in (m.get("location") or m.get("venue") or "").lower()
+            ]
+
+        total = len(meetings)
+
+        # Pagination
+        try:
+            page = max(1, int(request.args.get("page", 1)))
+            per_page = min(100, max(1, int(request.args.get("per_page", 20))))
+        except (ValueError, TypeError):
+            page, per_page = 1, 20
+
+        total_pages = max(1, -(-total // per_page))
+        start = (page - 1) * per_page
+        items = meetings[start:start + per_page]
+
+        return jsonify({
+            "success": True,
+            "meetings": items,
+            "items": items,
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+            "total_pages": total_pages,
+        }), 200
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        logger.exception("Failed to list meetings")
+        return jsonify({"success": False, "error": "Failed to load meetings"}), 500
 
 
 @meetings_bp.route("", methods=["POST"])
@@ -66,9 +103,16 @@ def create_meeting():
     try:
         result = add_meeting(data, user_id=user["id"])
         status = 201 if result.get("success") else 400
+        if result.get("success"):
+            try:
+                from extensions import socketio
+                socketio.emit("data_changed", {"entity": "meetings"}, namespace="/")
+            except Exception:
+                pass
         return jsonify(result), status
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        logger.exception("Failed to create meeting")
+        return jsonify({"success": False, "error": "Failed to create meeting"}), 500
 
 
 @meetings_bp.route("/<int:meeting_id>", methods=["PUT"])
@@ -83,9 +127,16 @@ def edit_meeting(meeting_id):
     try:
         result = update_meeting(meeting_id, data, user_id=user["id"])
         status = 200 if result.get("success") else 400
+        if result.get("success"):
+            try:
+                from extensions import socketio
+                socketio.emit("data_changed", {"entity": "meetings"}, namespace="/")
+            except Exception:
+                pass
         return jsonify(result), status
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        logger.exception("Failed to update meeting %s", meeting_id)
+        return jsonify({"success": False, "error": "Failed to update meeting"}), 500
 
 
 @meetings_bp.route("/<int:meeting_id>", methods=["DELETE"])
@@ -98,9 +149,16 @@ def remove_meeting(meeting_id):
     try:
         result = delete_meeting(meeting_id, user_id=user["id"])
         status = 200 if result.get("success") else 400
+        if result.get("success"):
+            try:
+                from extensions import socketio
+                socketio.emit("data_changed", {"entity": "meetings"}, namespace="/")
+            except Exception:
+                pass
         return jsonify(result), status
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        logger.exception("Failed to delete meeting %s", meeting_id)
+        return jsonify({"success": False, "error": "Failed to delete meeting"}), 500
 
 
 @meetings_bp.route("/suggest-schedule", methods=["POST"])
@@ -134,7 +192,8 @@ def suggest_schedule():
                     suggestions.append({"suggestion": f"{date_label}: {summary}"})
         return jsonify({"success": True, "schedule": result, "suggestions": suggestions}), 200
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        logger.exception("Failed to optimize meeting schedule")
+        return jsonify({"success": False, "error": "Failed to optimize meeting schedule"}), 500
 
 
 @meetings_bp.route("/parse-text", methods=["POST"])
@@ -160,7 +219,8 @@ def parse_text():
         status = 200 if result.get("success") else 422
         return jsonify(result), status
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        logger.exception("Failed to parse meeting text")
+        return jsonify({"success": False, "error": "Failed to parse meeting text"}), 500
 
 
 @meetings_bp.route("/nearby-venues", methods=["POST"])
@@ -186,4 +246,5 @@ def nearby_venues():
         result = suggest_nearby_venues(location, client_locations)
         return jsonify(result), 200
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        logger.exception("Failed to suggest nearby venues")
+        return jsonify({"success": False, "error": "Failed to suggest nearby venues"}), 500

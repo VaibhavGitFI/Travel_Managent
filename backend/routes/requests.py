@@ -3,6 +3,7 @@ TravelSync Pro — Travel Request Routes
 Create, list, and retrieve travel requests.
 Status flow: draft -> submitted -> pending_approval -> approved -> booked -> in_progress -> completed
 """
+import logging
 from datetime import datetime
 from flask import Blueprint, request, jsonify
 from auth import get_current_user
@@ -18,11 +19,12 @@ from agents.request_agent import (
 )
 from agents.budget_forecast_agent import forecast_budget
 
+logger = logging.getLogger(__name__)
+
 
 def _notify_manager_of_new_request(request_id: str, destination: str, requester_name: str) -> None:
-    """Emit a SocketIO notification to the assigned approver. Silent on failure."""
+    """Notify the assigned approver via all configured channels. Silent on failure."""
     try:
-        from extensions import socketio
         from database import get_db
         db = get_db()
         approval = db.execute(
@@ -31,17 +33,14 @@ def _notify_manager_of_new_request(request_id: str, destination: str, requester_
         ).fetchone()
         db.close()
         if approval and approval["approver_id"]:
-            socketio.emit(
-                "notification",
-                {
-                    "type": "approval_request",
-                    "title": "New Approval Request 📋",
-                    "message": f"{requester_name} requested a trip to {destination}. Awaiting your approval.",
-                    "request_id": request_id,
-                    "timestamp": datetime.now().isoformat(),
-                },
-                to=f"user_{approval['approver_id']}",
-                namespace="/",
+            from services.notification_service import notify
+            notify(
+                user_id=approval["approver_id"],
+                title="New Approval Request",
+                message=f"{requester_name} requested a trip to {destination}. Awaiting your approval.",
+                notification_type="approval_request",
+                request_id=request_id,
+                action_url="/approvals",
             )
     except Exception:
         pass
@@ -168,7 +167,8 @@ def budget_forecast():
         )
         return jsonify(result), 200
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        logger.exception("Failed to forecast budget")
+        return jsonify({"success": False, "error": "Failed to forecast budget"}), 500
 
 
 @requests_bp.route("/per-diem", methods=["GET"])
@@ -192,7 +192,7 @@ def per_diem():
 
 @requests_bp.route("", methods=["GET"])
 def list_requests():
-    """GET /api/requests — list requests filtered by user role."""
+    """GET /api/requests — list requests filtered by user role with optional pagination and search."""
     user = get_current_user()
     if not user:
         return jsonify({"success": False, "error": "Authentication required"}), 401
@@ -209,9 +209,42 @@ def list_requests():
             rows = get_requests(user_id=user["id"], status=status_filter)
 
         serialized = [_serialize_request(r) for r in rows]
-        return jsonify({"success": True, "requests": serialized, "total": len(serialized)}), 200
+
+        # Search filter
+        search = (request.args.get("search") or "").strip().lower()
+        if search:
+            serialized = [
+                r for r in serialized
+                if search in (r.get("from_city") or "").lower()
+                or search in (r.get("to_city") or "").lower()
+                or search in (r.get("purpose") or "").lower()
+            ]
+
+        total = len(serialized)
+
+        # Pagination
+        try:
+            page = max(1, int(request.args.get("page", 1)))
+            per_page = min(100, max(1, int(request.args.get("per_page", 20))))
+        except (ValueError, TypeError):
+            page, per_page = 1, 20
+
+        total_pages = max(1, -(-total // per_page))  # ceil division
+        start = (page - 1) * per_page
+        items = serialized[start:start + per_page]
+
+        return jsonify({
+            "success": True,
+            "requests": items,
+            "items": items,
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+            "total_pages": total_pages,
+        }), 200
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        logger.exception("Failed to list travel requests")
+        return jsonify({"success": False, "error": "Failed to load requests"}), 500
 
 
 @requests_bp.route("", methods=["POST"])
@@ -242,9 +275,18 @@ def create_travel_request():
                     user.get("full_name") or user.get("name") or user.get("username", "Someone"),
                 )
 
+        # Notify all tabs that requests data changed
+        try:
+            from extensions import socketio
+            socketio.emit("data_changed", {"entity": "requests"}, namespace="/")
+            socketio.emit("data_changed", {"entity": "approvals"}, namespace="/")
+        except Exception:
+            pass
+
         return jsonify(result), 201
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        logger.exception("Failed to create travel request")
+        return jsonify({"success": False, "error": "Failed to create request"}), 500
 
 
 @requests_bp.route("/<string:request_id>", methods=["GET"])
@@ -260,7 +302,8 @@ def get_single_request(request_id):
             return jsonify({"success": False, "error": "Request not found"}), 404
         return jsonify({"success": True, **detail}), 200
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        logger.exception("Failed to get request detail for %s", request_id)
+        return jsonify({"success": False, "error": "Failed to load request details"}), 500
 
 
 @requests_bp.route("/<string:request_id>", methods=["PUT"])
@@ -277,7 +320,8 @@ def edit_request(request_id):
         status = 200 if result.get("success") else 400
         return jsonify(result), status
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        logger.exception("Failed to update request %s", request_id)
+        return jsonify({"success": False, "error": "Failed to update request"}), 500
 
 
 @requests_bp.route("/<string:request_id>/status", methods=["PUT"])
@@ -301,9 +345,15 @@ def update_status(request_id):
             actor_role=user.get("role", "employee"),
         )
         if result.get("success"):
-            # Notify the requester of the status change
+            # Broadcast data_changed for real-time auto-refresh
             try:
                 from extensions import socketio
+                socketio.emit("data_changed", {"entity": "requests"}, namespace="/")
+                socketio.emit("data_changed", {"entity": "analytics"}, namespace="/")
+            except Exception:
+                pass
+            # Notify the requester of the status change
+            try:
                 from database import get_db
                 db = get_db()
                 req = db.execute(
@@ -312,24 +362,22 @@ def update_status(request_id):
                 ).fetchone()
                 db.close()
                 if req and req["user_id"] != user["id"]:
-                    socketio.emit(
-                        "notification",
-                        {
-                            "type": "status_update",
-                            "title": f"Trip Status: {new_status.replace('_', ' ').title()} 🔄",
-                            "message": f"Your trip to {req['destination']} is now {new_status.replace('_', ' ')}.",
-                            "request_id": request_id,
-                            "timestamp": datetime.now().isoformat(),
-                        },
-                        to=f"user_{req['user_id']}",
-                        namespace="/",
+                    from services.notification_service import notify
+                    notify(
+                        user_id=req["user_id"],
+                        title=f"Trip Status: {new_status.replace('_', ' ').title()}",
+                        message=f"Your trip to {req['destination']} is now {new_status.replace('_', ' ')}.",
+                        notification_type="status_update",
+                        request_id=request_id,
+                        action_url="/requests",
                     )
             except Exception:
                 pass
         status = 200 if result.get("success") else 400
         return jsonify(result), status
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        logger.exception("Failed to update status for request %s", request_id)
+        return jsonify({"success": False, "error": "Failed to update request status"}), 500
 
 
 @requests_bp.route("/<string:request_id>/report", methods=["GET"])
@@ -344,7 +392,8 @@ def get_trip_report(request_id):
         status = 200 if result.get("success") else 404
         return jsonify(result), status
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        logger.exception("Failed to generate trip report for %s", request_id)
+        return jsonify({"success": False, "error": "Failed to generate trip report"}), 500
 
 
 @requests_bp.route("/<string:request_id>/submit", methods=["POST"])
@@ -356,6 +405,13 @@ def submit_travel_request(request_id):
 
     try:
         result = submit_request(request_id, user_id=user["id"])
+        if result.get("success"):
+            try:
+                from extensions import socketio
+                socketio.emit("data_changed", {"entity": "requests"}, namespace="/")
+                socketio.emit("data_changed", {"entity": "approvals"}, namespace="/")
+            except Exception:
+                pass
         if result.get("success") and result.get("status") == "pending_approval":
             # Get destination for the notification
             try:
@@ -377,4 +433,5 @@ def submit_travel_request(request_id):
         status = 200 if result.get("success") else 400
         return jsonify(result), status
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        logger.exception("Failed to submit request %s for approval", request_id)
+        return jsonify({"success": False, "error": "Failed to submit request for approval"}), 500

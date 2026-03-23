@@ -11,6 +11,9 @@ eventlet==0.36.1
 # Rate Limiting
 flask-limiter==3.9.0
 
+# Anthropic Claude AI
+anthropic==0.40.0
+
 # Google APIs
 google-generativeai==0.8.3
 google-cloud-vision==3.8.0

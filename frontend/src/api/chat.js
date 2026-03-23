@@ -21,6 +21,11 @@ export const getChatHistory = async () => {
   return data
 }
 
+export const clearChatHistory = async () => {
+  const { data } = await client.delete('/chat/history')
+  return data
+}
+
 /**
  * Stream an AI response via SSE.
  * @param {string} message
@@ -29,12 +34,21 @@ export const getChatHistory = async () => {
  * @param {(meta: object) => void} onDone    — called with {action_cards, intent, ai_powered}
  */
 export const sendStreamingMessage = async (message, context = {}, onToken, onDone) => {
-  const baseURL = import.meta.env.DEV ? 'http://localhost:3399/api' : '/api'
+  const { getAccessToken } = await import('./auth')
+  const baseURL = '/api'
+  const headers = { 'Content-Type': 'application/json' }
+  const token = getAccessToken()
+  if (token) headers['Authorization'] = `Bearer ${token}`
+
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), 60000) // 60s max
+
   const response = await fetch(`${baseURL}/chat/stream`, {
     method: 'POST',
     credentials: 'include',
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     body: JSON.stringify({ message, context }),
+    signal: controller.signal,
   })
 
   if (response.status === 401) {
@@ -50,14 +64,7 @@ export const sendStreamingMessage = async (message, context = {}, onToken, onDon
   const decoder = new TextDecoder()
   let buffer = ''
 
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
-
-    buffer += decoder.decode(value, { stream: true })
-    const lines = buffer.split('\n')
-    buffer = lines.pop() // keep any incomplete trailing line
-
+  const processLines = (lines) => {
     for (const line of lines) {
       if (!line.startsWith('data: ')) continue
       const raw = line.slice(6).trim()
@@ -70,8 +77,26 @@ export const sendStreamingMessage = async (message, context = {}, onToken, onDon
           onToken?.(event.token)
         }
       } catch {
-        // malformed JSON chunk — skip
+        // partial JSON chunk — will be completed in next read
       }
     }
+  }
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split('\n')
+      buffer = lines.pop()
+      processLines(lines)
+    }
+    // Process any remaining data in buffer after stream ends
+    if (buffer.trim()) {
+      processLines([buffer])
+    }
+  } finally {
+    clearTimeout(timeout)
   }
 }

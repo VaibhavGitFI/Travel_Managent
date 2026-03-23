@@ -1,24 +1,26 @@
 import { useState, useEffect, useRef } from 'react'
-import { useLocation } from 'react-router-dom'
-import { Bell, ChevronRight, Check, Menu } from 'lucide-react'
-import clsx from 'clsx'
+import { useLocation, useNavigate } from 'react-router-dom'
+import { Bell, Check, Menu, Search, Command } from 'lucide-react'
+import { cn } from '../../lib/cn'
 import useStore from '../../store/useStore'
+import { markNotificationRead as apiMarkRead, markAllNotificationsRead as apiMarkAllRead } from '../../api/notifications'
 
 const routeMeta = {
-  '/dashboard':     { label: 'Dashboard',     crumbs: [], hideBreadcrumb: true },
-  '/planner':       { label: 'Trip Planner',  crumbs: [], hideBreadcrumb: true },
-  '/accommodation': { label: 'Accommodation', crumbs: [], hideBreadcrumb: true },
-  '/expenses':      { label: 'Expenses',      crumbs: [], hideBreadcrumb: true },
-  '/meetings':      { label: 'Meetings',      crumbs: [], hideBreadcrumb: true },
-  '/requests':      { label: 'Requests',      crumbs: [], hideBreadcrumb: true },
-  '/approvals':     { label: 'Approvals',     crumbs: [], hideBreadcrumb: true },
-  '/analytics':     { label: 'Analytics',     crumbs: [], hideBreadcrumb: true },
-  '/chat':          { label: 'Chat',          crumbs: [], hideBreadcrumb: true },
+  '/dashboard':     { label: 'Dashboard' },
+  '/planner':       { label: 'Trip Planner' },
+  '/accommodation': { label: 'Accommodation' },
+  '/expenses':      { label: 'Expenses' },
+  '/meetings':      { label: 'Meetings' },
+  '/requests':      { label: 'Requests' },
+  '/approvals':     { label: 'Approvals' },
+  '/analytics':     { label: 'Analytics' },
+  '/chat':          { label: 'AI Chat' },
 }
 
 export default function Topbar() {
-  const location   = useLocation()
-  const meta       = routeMeta[location.pathname] || { label: 'TravelSync', crumbs: ['Home'] }
+  const location = useLocation()
+  const navigate = useNavigate()
+  const meta = routeMeta[location.pathname] || { label: 'TravelSync' }
   const {
     auth,
     notifications,
@@ -32,8 +34,8 @@ export default function Topbar() {
 
   const [notifOpen, setNotifOpen] = useState(false)
   const notifRef = useRef(null)
-
   const unreadCount = notifications.filter((n) => !n.read).length
+  const user = auth.user
 
   // Close dropdown on outside click
   useEffect(() => {
@@ -46,13 +48,31 @@ export default function Topbar() {
     return () => document.removeEventListener('mousedown', handler)
   }, [])
 
-  // Health dot
-  const healthColor =
-    apiHealth.status === 'healthy'  ? 'online' :
-    apiHealth.status === 'degraded' ? 'warning' : 'offline'
+  // Cmd+K shortcut → navigate to chat
+  useEffect(() => {
+    const handler = (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+        e.preventDefault()
+        navigate('/chat')
+      }
+    }
+    document.addEventListener('keydown', handler)
+    return () => document.removeEventListener('keydown', handler)
+  }, [navigate])
 
-  const user = auth.user
-  const isDashboard = location.pathname === '/dashboard'
+  const handleMarkRead = (id) => {
+    markNotificationRead(id)
+    apiMarkRead(id).catch(() => {})
+  }
+
+  const handleMarkAllRead = () => {
+    markAllNotificationsRead()
+    apiMarkAllRead().catch(() => {})
+  }
+
+  const healthColor =
+    apiHealth.status === 'healthy'  ? 'bg-emerald-500' :
+    apiHealth.status === 'degraded' ? 'bg-amber-500' : 'bg-gray-400'
 
   const handleSidebarToggle = () => {
     if (window.innerWidth < 1024) {
@@ -63,66 +83,58 @@ export default function Topbar() {
   }
 
   return (
-    <header className="z-20 flex h-16 min-w-0 shrink-0 items-center gap-3 border-b border-gray-100 bg-white px-4 sm:gap-4 sm:px-6">
+    <header className="z-20 flex h-14 min-w-0 shrink-0 items-center gap-3 border-b border-surface-border bg-surface-raised px-4 sm:px-6">
+      {/* Mobile menu toggle */}
       <button
         type="button"
         onClick={handleSidebarToggle}
         aria-label="Toggle sidebar"
-        className="lg:hidden rounded-lg border border-gray-200 p-2 text-gray-600 transition-colors hover:bg-gray-100 hover:text-gray-800"
+        className="lg:hidden rounded-md p-1.5 text-gray-500 transition-colors hover:bg-gray-100 hover:text-gray-700"
       >
         <Menu size={18} />
       </button>
 
-      {/* ── Title + Breadcrumb ─────────────────────── */}
-      <div className="flex-1 min-w-0">
-        <h1
-          className={clsx(
-            'font-heading leading-tight truncate text-gray-900',
-            isDashboard ? 'text-2xl font-semibold tracking-tight' : 'text-xl font-bold'
-          )}
-        >
-          {meta.label}
-        </h1>
-        {!meta.hideBreadcrumb && (
-          <nav className="mt-0.5 hidden items-center gap-1 overflow-hidden whitespace-nowrap sm:flex" aria-label="Breadcrumb">
-            {meta.crumbs.map((crumb, i) => (
-              <span key={i} className="flex items-center gap-1">
-                <span className="truncate text-xs text-gray-400">{crumb}</span>
-                {i < meta.crumbs.length - 1 && (
-                  <ChevronRight size={10} className="text-gray-300" />
-                )}
-              </span>
-            ))}
-            <ChevronRight size={10} className="text-gray-300" />
-            <span className="truncate text-xs font-medium text-accent-600">{meta.label}</span>
-          </nav>
-        )}
-      </div>
+      {/* Page title */}
+      <h1 className="flex-1 min-w-0 truncate font-heading text-lg font-semibold text-gray-900">
+        {meta.label}
+      </h1>
 
-      {/* ── Right section ─────────────────────────── */}
-      <div className="flex items-center gap-2 shrink-0">
-        {/* API Health indicator */}
-        <div
-          className="flex items-center rounded-lg border border-gray-100 bg-gray-50 px-2.5 py-1.5 cursor-default"
-          title={`API ${apiHealth.status || 'status unknown'}`}
+      {/* Right section */}
+      <div className="flex items-center gap-1.5 shrink-0">
+        {/* Cmd+K search trigger */}
+        <button
+          type="button"
+          onClick={() => navigate('/chat')}
+          className="hidden sm:flex items-center gap-2 rounded-lg border border-surface-border bg-surface-sunken px-3 py-1.5 text-sm text-gray-400 transition-colors hover:border-gray-300 hover:text-gray-500"
         >
-          <span className={clsx('status-dot', healthColor)} />
-          <span className="sr-only">{`API ${apiHealth.status || 'status unknown'}`}</span>
+          <Search size={14} />
+          <span className="text-[13px]">Ask AI...</span>
+          <kbd className="ml-2 flex items-center gap-0.5 rounded border border-gray-200 bg-white px-1.5 py-0.5 text-[10px] font-medium text-gray-400">
+            <Command size={10} />K
+          </kbd>
+        </button>
+
+        {/* Health dot */}
+        <div
+          className="flex items-center justify-center rounded-md p-2 cursor-default"
+          title={`API: ${apiHealth.status || 'unknown'}`}
+        >
+          <span className={cn('h-2 w-2 rounded-full', healthColor)} />
         </div>
 
         {/* Notifications */}
         <div className="relative" ref={notifRef}>
           <button
             onClick={() => setNotifOpen((v) => !v)}
-            className={clsx(
-              'relative p-2 rounded-lg transition-colors',
+            className={cn(
+              'relative rounded-md p-2 transition-colors',
               notifOpen
                 ? 'bg-accent-50 text-accent-600'
-                : 'text-gray-500 hover:bg-gray-100 hover:text-gray-700'
+                : 'text-gray-400 hover:bg-gray-100 hover:text-gray-600'
             )}
             aria-label="Notifications"
           >
-            <Bell size={18} />
+            <Bell size={17} />
             {unreadCount > 0 && (
               <span className="absolute top-1 right-1 w-4 h-4 rounded-full bg-red-500 text-white text-[10px] font-bold flex items-center justify-center leading-none">
                 {unreadCount > 9 ? '9+' : unreadCount}
@@ -130,10 +142,9 @@ export default function Topbar() {
             )}
           </button>
 
-          {/* Notifications dropdown */}
           {notifOpen && (
-            <div className="absolute right-0 top-full z-50 mt-2 w-[min(22rem,calc(100vw-1rem))] rounded-xl border border-gray-100 bg-white shadow-card-lg animate-slide-down sm:w-80">
-              <div className="flex items-center justify-between px-4 py-3 border-b border-gray-100">
+            <div className="absolute right-0 top-full z-50 mt-2 w-[min(22rem,calc(100vw-1rem))] rounded-xl border border-surface-border bg-white shadow-card-lg animate-slide-down sm:w-80">
+              <div className="flex items-center justify-between px-4 py-3 border-b border-surface-border">
                 <div>
                   <h3 className="text-sm font-semibold text-gray-900">Notifications</h3>
                   {unreadCount > 0 && (
@@ -142,7 +153,7 @@ export default function Topbar() {
                 </div>
                 {unreadCount > 0 && (
                   <button
-                    onClick={markAllNotificationsRead}
+                    onClick={handleMarkAllRead}
                     className="text-xs text-accent-600 hover:text-accent-700 font-medium"
                   >
                     Mark all read
@@ -160,14 +171,14 @@ export default function Topbar() {
                   notifications.slice(0, 10).map((n) => (
                     <div
                       key={n.id}
-                      className={clsx(
+                      className={cn(
                         'flex items-start gap-3 px-4 py-3 transition-colors',
-                        !n.read ? 'bg-accent-50/50' : 'hover:bg-gray-50'
+                        !n.read ? 'bg-accent-50/40' : 'hover:bg-gray-50'
                       )}
                     >
                       <div
-                        className={clsx(
-                          'w-2 h-2 rounded-full mt-1.5 shrink-0',
+                        className={cn(
+                          'w-1.5 h-1.5 rounded-full mt-2 shrink-0',
                           !n.read ? 'bg-accent-500' : 'bg-gray-200'
                         )}
                       />
@@ -180,7 +191,7 @@ export default function Topbar() {
                       </div>
                       {!n.read && (
                         <button
-                          onClick={() => markNotificationRead(n.id)}
+                          onClick={() => handleMarkRead(n.id)}
                           className="shrink-0 p-0.5 rounded text-gray-400 hover:text-success-600 hover:bg-success-50 transition-colors"
                         >
                           <Check size={12} />
@@ -194,11 +205,14 @@ export default function Topbar() {
           )}
         </div>
 
-        {/* User avatar */}
-        <div className="flex items-center">
-          <div className="w-8 h-8 rounded-full gradient-accent flex items-center justify-center text-white text-sm font-bold shadow-sm">
+        {/* User */}
+        <div className="flex items-center gap-2 pl-1.5 border-l border-surface-border ml-1">
+          <div className="w-7 h-7 rounded-full bg-brand-dark flex items-center justify-center text-white text-xs font-bold">
             {user?.name?.charAt(0)?.toUpperCase() || 'U'}
           </div>
+          <span className="hidden md:block text-[13px] font-medium text-gray-700 max-w-[120px] truncate">
+            {user?.name || user?.username || 'User'}
+          </span>
         </div>
       </div>
     </header>

@@ -49,7 +49,8 @@ def upload_file():
             "size": size,
         }), 201
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        logger.exception("Failed to upload file")
+        return jsonify({"success": False, "error": "Failed to upload file"}), 500
 
 
 @uploads_bp.route("/parse-document", methods=["POST"])
@@ -105,7 +106,7 @@ def parse_document_endpoint():
 
     except Exception as exc:
         logger.exception("[DocumentParse] Unexpected error")
-        return jsonify({"success": False, "error": str(exc)}), 500
+        return jsonify({"success": False, "error": "Failed to parse document"}), 500
 
 
 @uploads_bp.route("/<path:filename>", methods=["GET"])
@@ -121,4 +122,5 @@ def serve_file(filename):
     try:
         return send_from_directory(Config.UPLOAD_FOLDER, safe)
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 404
+        logger.exception("Failed to serve file %s", filename)
+        return jsonify({"success": False, "error": "File not found"}), 404

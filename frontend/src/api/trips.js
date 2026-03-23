@@ -14,3 +14,8 @@ export const getTrip = async (id) => {
   const { data } = await client.get(`/trips/${id}`)
   return data
 }
+
+export const getTripRecommendations = async (destination, durationDays = 3) => {
+  const { data } = await client.post('/trips/recommendations', { destination, duration_days: durationDays })
+  return data
+}

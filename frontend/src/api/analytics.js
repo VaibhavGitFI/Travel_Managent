@@ -14,3 +14,8 @@ export const getComplianceScorecard = async () => {
   const { data } = await client.get('/analytics/compliance')
   return data
 }
+
+export const getAlerts = async () => {
+  const { data } = await client.get('/alerts')
+  return data
+}

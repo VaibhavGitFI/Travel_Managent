@@ -22,8 +22,12 @@ client.interceptors.response.use(
   (response) => response,
   (error) => {
     if (error.response?.status === 401) {
-      // Clear any local auth state and redirect to login
-      window.location.href = '/login'
+      // Only redirect if not already on login page and not a background check
+      const isLoginPage = window.location.pathname === '/login' || window.location.pathname === '/'
+      const isAuthCheck = error.config?.url?.includes('/auth/me') || error.config?.url?.includes('/auth/refresh')
+      if (!isLoginPage && !isAuthCheck) {
+        window.location.href = '/login'
+      }
     }
     if (error.response?.status === 429) {
       const retryAfter = error.response.headers?.['retry-after']

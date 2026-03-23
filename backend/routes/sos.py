@@ -2,36 +2,34 @@
 TravelSync Pro — SOS Emergency Routes
 Log SOS events, broadcast to manager, return local emergency numbers and nearby hospitals.
 """
+import logging
 from datetime import datetime
 from flask import Blueprint, request, jsonify
 from auth import get_current_user
 from agents.sos_agent import get_emergency_contacts, find_nearby_hospitals
 from database import get_db
 
+logger = logging.getLogger(__name__)
+
 sos_bp = Blueprint("sos", __name__, url_prefix="/api/sos")
 
 
 def _emit_sos_alert(user: dict, city: str, message: str) -> None:
-    """Broadcast SOS alert to all managers/admins via SocketIO. Silent on failure."""
+    """Broadcast SOS alert to all managers/admins via all configured channels. Silent on failure."""
     try:
-        from extensions import socketio
-        db = get_db()
-        managers = db.execute(
-            "SELECT id FROM users WHERE role IN ('manager','admin')"
-        ).fetchall()
-        db.close()
-
-        payload = {
-            "type": "sos_alert",
-            "title": f"🚨 SOS Alert from {user.get('full_name') or user.get('username')}",
-            "message": f"Location: {city or 'Unknown'}. {message or 'Needs immediate assistance.'}",
-            "user_id": user["id"],
-            "user_name": user.get("full_name") or user.get("username"),
-            "city": city,
-            "timestamp": datetime.now().isoformat(),
-        }
-        for mgr in managers:
-            socketio.emit("notification", payload, to=f"user_{mgr['id']}", namespace="/")
+        from services.notification_service import notify
+        notify(
+            user_id=None,
+            title=f"SOS Alert from {user.get('full_name') or user.get('username')}",
+            message=f"Location: {city or 'Unknown'}. {message or 'Needs immediate assistance.'}",
+            notification_type="sos_alert",
+            broadcast_to_role="manager",
+            extra={
+                "user_id": user["id"],
+                "user_name": user.get("full_name") or user.get("username"),
+                "city": city,
+            },
+        )
     except Exception:
         pass
 
@@ -104,4 +102,5 @@ def emergency_contacts():
         result["nearby_hospitals"] = hospitals
         return jsonify(result), 200
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        logger.exception("Failed to load emergency contacts")
+        return jsonify({"success": False, "error": "Failed to load emergency contacts"}), 500

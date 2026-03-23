@@ -1,7 +1,9 @@
 import client from './client'
 
-export const getMeetings = async (tripId) => {
-  const params = tripId ? { trip_id: tripId } : {}
+export const getMeetings = async (tripIdOrParams) => {
+  const params = typeof tripIdOrParams === 'object' && tripIdOrParams !== null
+    ? tripIdOrParams
+    : tripIdOrParams ? { trip_id: tripIdOrParams } : {}
   const { data } = await client.get('/meetings', { params })
   return data
 }

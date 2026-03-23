@@ -15,8 +15,10 @@ const SOCKET_URL = import.meta.env.DEV
 const socket = io(SOCKET_URL, {
   withCredentials: true,   // send session cookie so Flask can identify the user
   autoConnect: false,      // Layout controls when to connect
-  reconnectionAttempts: 5,
-  reconnectionDelay: 2000,
+  reconnectionAttempts: 15,
+  reconnectionDelay: 1000,
+  reconnectionDelayMax: 10000,
+  randomizationFactor: 0.3,
   transports: ['websocket', 'polling'],
 })
 

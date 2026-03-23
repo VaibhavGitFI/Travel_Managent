@@ -12,13 +12,15 @@ from auth import get_current_user
 from extensions import limiter
 from agents.chat_agent import (
     process_message,
-    SYSTEM_PROMPT,
+    build_system_prompt,
     _detect_intent,
     _extract_entities,
     _build_action_cards,
     _enrich_reply,
     _pattern_reply,
+    _get_recent_history,
 )
+from services.anthropic_service import claude
 from services.gemini_service import gemini
 from database import get_db
 from config import Config
@@ -160,7 +162,8 @@ def chat():
 
         return jsonify({"success": True, **result}), 200
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        logger.exception("[Chat] chat endpoint failed")
+        return jsonify({"success": False, "error": "Failed to process message"}), 500
 
 
 @chat_bp.route("/stream", methods=["POST"])
@@ -182,24 +185,65 @@ def chat_stream():
     entities = _extract_entities(message, context=context)
     action_cards = _build_action_cards(intent, entities)
 
-    user_context = f"User: {user.get('full_name') or user.get('name', '')} ({user.get('role', 'employee')}). "
-    prompt = f"{user_context}Query: {message}."
+    # Run orchestrator for plan_trip intent with destination (before streaming)
+    trip_results = None
+    if intent == "plan_trip" and entities.get("destination"):
+        try:
+            from agents.orchestrator import plan_trip
+            from agents.chat_agent import _summarize_trip_results
+            trip_input = {
+                "destination": entities["destination"],
+                "origin": entities.get("origin") or "",
+                "duration_days": 3,
+                "purpose": "business",
+                "user_id": user.get("id", 1),
+            }
+            raw = plan_trip(trip_input)
+            if raw.get("success"):
+                trip_results = _summarize_trip_results(raw)
+        except Exception as e:
+            logger.warning("[Chat Stream] Orchestrator call failed: %s", e)
+
+    full_system_prompt = build_system_prompt(user)
+
+    # Build multi-turn history (Anthropic format: role/content)
+    history = _get_recent_history(user["id"], limit=6) if user.get("id") else []
 
     accumulated = []
 
     def generate():
         ai_powered = False
+        model_used = None
 
-        if gemini.is_available:
-            for chunk in gemini.generate_stream(prompt, system_instruction=SYSTEM_PROMPT):
+        # ── 1. Stream via Claude (Anthropic) ──────────────────────
+        if claude.is_available:
+            from agents.chat_agent import _history_for_gemini  # noqa: reuse helper
+            for chunk in claude.stream(message, system=full_system_prompt, history=history):
                 accumulated.append(chunk)
                 yield f"data: {json.dumps({'token': chunk})}\n\n"
-            ai_powered = bool(accumulated)
+            if accumulated:
+                ai_powered = True
+                model_used = "claude-opus-4-6"
+
+        # ── 2. Fallback to Gemini ─────────────────────────────────
+        if not accumulated and gemini.is_available:
+            gemini_history = [
+                {"role": "model" if h["role"] == "assistant" else "user",
+                 "parts": [h["content"]]}
+                for h in history
+            ]
+            gemini_history.append({"role": "user", "parts": [message]})
+            for chunk in gemini.stream_with_history(full_system_prompt, gemini_history):
+                accumulated.append(chunk)
+                yield f"data: {json.dumps({'token': chunk})}\n\n"
+            if accumulated:
+                ai_powered = True
+                model_used = "gemini-2.0-flash"
 
         full_reply = "".join(accumulated)
 
         if not full_reply:
-            # Gemini unavailable or returned nothing — pattern fallback
+            # Both unavailable — pattern fallback
             full_reply = _pattern_reply(message, intent, entities)
             yield f"data: {json.dumps({'token': full_reply})}\n\n"
 
@@ -209,16 +253,22 @@ def chat_stream():
             yield f"data: {json.dumps({'token': extra})}\n\n"
 
         # Persist user message + assistant reply
+        db = None
         try:
             db = get_db()
             _insert_chat_message(db, user["id"], "user", message, intent)
             _insert_chat_message(db, user["id"], "assistant", enriched, intent, action_cards)
             db.commit()
-            db.close()
         except Exception as persist_err:
             logger.warning("[Chat Stream] Persist error: %s", persist_err)
+        finally:
+            if db:
+                db.close()
 
-        yield f"data: {json.dumps({'done': True, 'action_cards': action_cards, 'intent': intent, 'ai_powered': ai_powered})}\n\n"
+        done_event = {'done': True, 'action_cards': action_cards, 'intent': intent, 'ai_powered': ai_powered, 'model': model_used}
+        if trip_results:
+            done_event['trip_results'] = trip_results
+        yield f"data: {json.dumps(done_event)}\n\n"
 
     return Response(
         stream_with_context(generate()),
@@ -249,7 +299,7 @@ def history():
             f"""SELECT {', '.join(select_cols)}
                 FROM chat_messages
                 WHERE user_id = ?
-                ORDER BY created_at DESC
+                ORDER BY created_at DESC, id DESC
                 LIMIT ?""",
             (user["id"], limit),
         ).fetchall()
@@ -267,4 +317,22 @@ def history():
         db.close()
         return jsonify({"success": True, "messages": messages, "total": len(messages)}), 200
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        logger.exception("[Chat] history endpoint failed")
+        return jsonify({"success": False, "error": "Failed to load chat history"}), 500
+
+
+@chat_bp.route("/history", methods=["DELETE"])
+def clear_history():
+    """DELETE /api/chat/history — delete all chat messages for the current user."""
+    user = get_current_user()
+    if not user:
+        return jsonify({"success": False, "error": "Authentication required"}), 401
+    try:
+        db = get_db()
+        db.execute("DELETE FROM chat_messages WHERE user_id = ?", (user["id"],))
+        db.commit()
+        db.close()
+        return jsonify({"success": True}), 200
+    except Exception as e:
+        logger.exception("[Chat] clear history failed")
+        return jsonify({"success": False, "error": "Failed to clear history"}), 500

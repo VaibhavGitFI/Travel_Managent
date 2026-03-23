@@ -12,9 +12,9 @@ import time
 logger = logging.getLogger(__name__)
 
 GEMINI_MODELS = {
-    "flash": "gemini-2.0-flash",
-    "pro": "gemini-1.5-pro",
-    "vision": "gemini-1.5-flash",
+    "flash": "gemini-2.5-flash",
+    "pro": "gemini-2.5-pro",
+    "vision": "gemini-2.5-flash",
 }
 
 
@@ -115,6 +115,60 @@ class GeminiService:
             if self._is_quota_error(error_text):
                 self._enter_cooldown(error_text)
             logger.warning("[Gemini] Stream error: %s", e)
+            return
+
+    def generate_with_history(self, system_instruction: str, messages: list, model_type: str = "flash") -> str | None:
+        """
+        Generate a response using multi-turn chat history.
+        messages: list of {"role": "user"|"model", "parts": [str]}
+        """
+        if not self.configured or not self._genai:
+            return None
+        if self._cooldown_until > time.time():
+            return None
+        try:
+            model_name = GEMINI_MODELS.get(model_type, GEMINI_MODELS["flash"])
+            model = self._genai.GenerativeModel(model_name, system_instruction=system_instruction)
+            # Separate history from current message
+            history = messages[:-1] if len(messages) > 1 else []
+            current = messages[-1]["parts"][0] if messages else ""
+            chat = model.start_chat(history=history)
+            response = chat.send_message(current)
+            return response.text
+        except Exception as e:
+            error_text = str(e)
+            if self._is_quota_error(error_text):
+                self._enter_cooldown(error_text)
+                return None
+            logger.warning("[Gemini] Chat history error: %s", e)
+            return None
+
+    def stream_with_history(self, system_instruction: str, messages: list):
+        """
+        Stream response using multi-turn chat history.
+        Yields text chunks.
+        """
+        if not self.configured or not self._genai:
+            yield ""
+            return
+        if self._cooldown_until > time.time():
+            yield ""
+            return
+        try:
+            model_name = GEMINI_MODELS["flash"]
+            model = self._genai.GenerativeModel(model_name, system_instruction=system_instruction)
+            history = messages[:-1] if len(messages) > 1 else []
+            current = messages[-1]["parts"][0] if messages else ""
+            chat = model.start_chat(history=history)
+            response = chat.send_message(current, stream=True)
+            for chunk in response:
+                if chunk.text:
+                    yield chunk.text
+        except Exception as e:
+            error_text = str(e)
+            if self._is_quota_error(error_text):
+                self._enter_cooldown(error_text)
+            logger.warning("[Gemini] Stream history error: %s", e)
             return
 
     def generate_json(self, prompt: str, model_type: str = "flash") -> dict | None:
