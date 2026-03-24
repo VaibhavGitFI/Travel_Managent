@@ -18,7 +18,29 @@ EXPENSE_CATEGORIES = [
 
 
 def _table_columns(db, table: str) -> set[str]:
-    return {r[1] for r in db.execute(f"PRAGMA table_info({table})").fetchall()}
+    """Get column names — works with both SQLite and PostgreSQL."""
+    try:
+        rows = db.execute(f"PRAGMA table_info({table})").fetchall()
+        if rows:
+            return {r[1] if not isinstance(r, dict) else r.get("name", "") for r in rows}
+    except Exception:
+        try:
+            db.commit()  # Reset aborted transaction
+        except Exception:
+            pass
+    try:
+        rows = db.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = ?", (table,)
+        ).fetchall()
+        return {r["column_name"] if isinstance(r, dict) else r[0] for r in rows}
+    except Exception:
+        try:
+            db.commit()
+        except Exception:
+            pass
+    return {"id", "user_id", "request_id", "trip_id", "category", "description",
+            "invoice_amount", "date", "verification_status", "stage", "currency_code",
+            "ocr_extracted_amount", "ocr_confidence", "created_at"}
 
 
 def _safe_float(value, default=0.0):

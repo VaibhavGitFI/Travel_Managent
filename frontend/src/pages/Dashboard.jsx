@@ -72,8 +72,33 @@ export default function Dashboard() {
     <div className="mx-auto w-full max-w-7xl space-y-6">
 
       {/* ── Hero Banner ───────────────────────────────────────── */}
-      <section className="relative overflow-hidden rounded-2xl bg-gradient-to-br from-brand-dark via-brand-mid to-[#1a2744] shadow-navy">
-        <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_top_right,rgba(76,201,240,0.12),transparent_60%)]" />
+      <section className="relative overflow-hidden rounded-2xl bg-gradient-to-br from-[#0a1628] via-[#0d2a5e] to-[#1a4a8a] shadow-navy">
+        {/* Animated background layers */}
+        <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_top_right,rgba(76,201,240,0.15),transparent_50%)]" />
+        <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_bottom_left,rgba(139,92,246,0.08),transparent_50%)]" />
+        {/* Stars */}
+        <div className="absolute inset-0" style={{
+          backgroundImage: `radial-gradient(1px 1px at 10% 15%, rgba(255,255,255,0.7) 0%, transparent 100%),
+            radial-gradient(1px 1px at 25% 8%, rgba(255,255,255,0.5) 0%, transparent 100%),
+            radial-gradient(1.5px 1.5px at 40% 20%, rgba(255,255,255,0.6) 0%, transparent 100%),
+            radial-gradient(1px 1px at 55% 5%, rgba(255,255,255,0.4) 0%, transparent 100%),
+            radial-gradient(1px 1px at 70% 18%, rgba(255,255,255,0.5) 0%, transparent 100%),
+            radial-gradient(1px 1px at 85% 10%, rgba(255,255,255,0.6) 0%, transparent 100%),
+            radial-gradient(1px 1px at 15% 25%, rgba(255,255,255,0.3) 0%, transparent 100%),
+            radial-gradient(1px 1px at 90% 22%, rgba(255,255,255,0.4) 0%, transparent 100%)`,
+        }} />
+        {/* Plane trail SVG */}
+        <svg className="absolute right-6 top-4 w-32 h-32 opacity-[0.06] sm:w-48 sm:h-48" viewBox="0 0 200 200" fill="none">
+          <path d="M20 180 Q60 120 100 100 Q140 80 180 20" stroke="white" strokeWidth="1.5" strokeDasharray="6 4" />
+          <path d="M175 15 L180 20 L185 10 Z" fill="white" />
+          <circle cx="100" cy="100" r="3" fill="rgba(76,201,240,0.5)" />
+          <circle cx="60" cy="140" r="2" fill="rgba(76,201,240,0.3)" />
+          <circle cx="140" cy="60" r="2" fill="rgba(76,201,240,0.3)" />
+        </svg>
+        {/* Globe circle */}
+        <div className="absolute -right-10 -bottom-10 h-40 w-40 rounded-full border border-white/[0.04] sm:h-56 sm:w-56" />
+        <div className="absolute -right-5 -bottom-5 h-28 w-28 rounded-full border border-white/[0.03] sm:h-40 sm:w-40" />
+        {/* Bottom glow line */}
         <div className="absolute bottom-0 left-0 right-0 h-px bg-gradient-to-r from-transparent via-brand-cyan/30 to-transparent" />
 
         <div className="relative px-6 pt-6 pb-5 sm:px-8 sm:pt-8">

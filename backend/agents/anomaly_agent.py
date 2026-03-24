@@ -19,7 +19,17 @@ def detect_anomalies(user_id: int) -> dict:
 
     try:
         db = get_db()
-        cols = {r[1] for r in db.execute("PRAGMA table_info(expenses_db)").fetchall()}
+        try:
+            cols = {r[1] for r in db.execute("PRAGMA table_info(expenses_db)").fetchall()}
+        except Exception:
+            try: db.commit()
+            except Exception: pass
+            try:
+                cols = {r["column_name"] for r in db.execute("SELECT column_name FROM information_schema.columns WHERE table_name = 'expenses_db'").fetchall()}
+            except Exception:
+                try: db.commit()
+                except Exception: pass
+                cols = {"id", "user_id", "category", "description", "invoice_amount", "date", "verification_status", "created_at"}
 
         amount_col = "amount" if "amount" in cols else "invoice_amount"
         date_col = "expense_date" if "expense_date" in cols else "date" if "date" in cols else "created_at"

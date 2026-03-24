@@ -69,16 +69,30 @@ export default function Sidebar() {
       className={cn(
         'fixed inset-y-0 left-0 z-40 flex h-full shrink-0 flex-col select-none border-r border-brand-mid/60 text-brand-light lg:relative',
         'will-change-[transform,width] transition-[transform,width] duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] motion-reduce:transition-none',
-        'bg-brand-dark shadow-navy',
+        'bg-gradient-to-b from-[#0a1628] via-[#0d2a5e] to-[#0a1628] shadow-navy',
         collapsed
           ? 'w-[256px] -translate-x-full lg:w-[68px] lg:translate-x-0'
           : 'w-[256px] translate-x-0 lg:w-[240px]'
       )}
     >
+      {/* Background effects */}
+      <div className="pointer-events-none absolute inset-0 overflow-hidden">
+        <div className="absolute inset-0" style={{
+          backgroundImage: `radial-gradient(1px 1px at 15% 10%, rgba(255,255,255,0.4) 0%, transparent 100%),
+            radial-gradient(1px 1px at 35% 25%, rgba(255,255,255,0.3) 0%, transparent 100%),
+            radial-gradient(1px 1px at 55% 50%, rgba(255,255,255,0.2) 0%, transparent 100%),
+            radial-gradient(1px 1px at 75% 70%, rgba(255,255,255,0.3) 0%, transparent 100%),
+            radial-gradient(1px 1px at 25% 85%, rgba(255,255,255,0.2) 0%, transparent 100%),
+            radial-gradient(1px 1px at 85% 40%, rgba(255,255,255,0.3) 0%, transparent 100%)`,
+        }} />
+        <div className="absolute top-0 right-0 h-32 w-32 rounded-full bg-brand-cyan/[0.04] blur-2xl" />
+        <div className="absolute bottom-0 left-0 h-24 w-24 rounded-full bg-violet-500/[0.03] blur-2xl" />
+      </div>
+
       {/* Brand */}
       <div
         className={cn(
-          'flex h-14 shrink-0 items-center border-b border-white/[0.06]',
+          'relative flex h-14 shrink-0 items-center border-b border-white/[0.06]',
           collapsed ? 'justify-center px-0' : 'gap-2.5 px-4'
         )}
       >

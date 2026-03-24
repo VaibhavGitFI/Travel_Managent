@@ -59,11 +59,12 @@ def create_app() -> Flask:
     from routes.alerts    import alerts_bp
     from routes.notifications import notifications_bp
     from routes.whatsapp import whatsapp_bp
+    from routes.cliq_bot import cliq_bot_bp
 
     for bp in (auth_bp, trips_bp, weather_bp, currency_bp, meetings_bp,
                expenses_bp, accommodation_bp, requests_bp, approvals_bp, analytics_bp,
                chat_bp, uploads_bp, health_bp, sos_bp, alerts_bp, notifications_bp,
-               whatsapp_bp):
+               whatsapp_bp, cliq_bot_bp):
         app.register_blueprint(bp)
 
     # ── SocketIO Events ────────────────────────────────────────────────────────

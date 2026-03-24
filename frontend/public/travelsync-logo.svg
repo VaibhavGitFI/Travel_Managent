@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+  <!-- Background circle -->
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#0a1628"/>
+      <stop offset="50%" style="stop-color:#0d2a5e"/>
+      <stop offset="100%" style="stop-color:#1a4a8a"/>
+    </linearGradient>
+    <linearGradient id="cyan" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#4CC9F0"/>
+      <stop offset="100%" style="stop-color:#38b6db"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Main circle -->
+  <circle cx="256" cy="256" r="240" fill="url(#bg)"/>
+
+  <!-- Globe rings -->
+  <ellipse cx="256" cy="256" rx="140" ry="140" fill="none" stroke="rgba(76,201,240,0.12)" stroke-width="1.5"/>
+  <ellipse cx="256" cy="256" rx="100" ry="140" fill="none" stroke="rgba(76,201,240,0.08)" stroke-width="1"/>
+  <ellipse cx="256" cy="256" rx="140" ry="80" fill="none" stroke="rgba(76,201,240,0.08)" stroke-width="1"/>
+  <line x1="116" y1="256" x2="396" y2="256" stroke="rgba(76,201,240,0.06)" stroke-width="1"/>
+  <line x1="256" y1="116" x2="256" y2="396" stroke="rgba(76,201,240,0.06)" stroke-width="1"/>
+
+  <!-- Plane -->
+  <g transform="translate(256,220) rotate(-30)">
+    <path d="M0,-8 L60,-4 L60,4 L0,8 L-8,0 Z" fill="url(#cyan)"/>
+    <path d="M15,-20 L25,-4 L15,-4 Z" fill="url(#cyan)"/>
+    <path d="M15,20 L25,4 L15,4 Z" fill="url(#cyan)"/>
+    <path d="M-5,-10 L5,-4 L-5,-4 Z" fill="rgba(76,201,240,0.7)"/>
+    <path d="M-5,10 L5,4 L-5,4 Z" fill="rgba(76,201,240,0.7)"/>
+  </g>
+
+  <!-- Flight trail -->
+  <path d="M140 320 Q180 280 220 260" stroke="rgba(76,201,240,0.3)" stroke-width="2" stroke-dasharray="4 3" fill="none"/>
+
+  <!-- Location pin -->
+  <g transform="translate(340,300)">
+    <path d="M0,-20 C-12,-20 -20,-12 -20,0 C-20,14 0,28 0,28 C0,28 20,14 20,0 C20,-12 12,-20 0,-20 Z" fill="url(#cyan)" opacity="0.8"/>
+    <circle cx="0" cy="-2" r="6" fill="#0a1628"/>
+  </g>
+
+  <!-- Stars -->
+  <circle cx="130" cy="140" r="2" fill="rgba(255,255,255,0.6)"/>
+  <circle cx="380" cy="160" r="1.5" fill="rgba(255,255,255,0.5)"/>
+  <circle cx="170" cy="380" r="1.5" fill="rgba(255,255,255,0.4)"/>
+  <circle cx="400" cy="340" r="2" fill="rgba(255,255,255,0.5)"/>
+  <circle cx="320" cy="130" r="1" fill="rgba(255,255,255,0.6)"/>
+
+  <!-- Text: TS -->
+  <text x="256" y="275" text-anchor="middle" font-family="system-ui,-apple-system,sans-serif" font-weight="800" font-size="72" fill="white" letter-spacing="-2">TS</text>
+</svg>
