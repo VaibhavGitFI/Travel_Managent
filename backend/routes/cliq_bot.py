@@ -134,6 +134,61 @@ def _process_receipt(file_url: str, user: dict, caption: str = "") -> str:
         return "Error processing receipt. Please try again."
 
 
+def _process_voice_note(file_url: str, file_type: str, user: dict, phone_key: str) -> str:
+    """Download voice note from Cliq, transcribe via Gemini, process as text command."""
+    try:
+        import requests as http_requests
+
+        # Download audio
+        resp = http_requests.get(file_url, timeout=15)
+        if resp.status_code != 200:
+            return "Could not download the voice note. Please try again."
+
+        audio_bytes = resp.content
+        if len(audio_bytes) < 500:
+            return "Voice note too short. Please record a longer message."
+
+        # Determine MIME type
+        mime_map = {
+            "ogg": "audio/ogg", "mp3": "audio/mpeg", "wav": "audio/wav",
+            "m4a": "audio/mp4", "aac": "audio/aac", "opus": "audio/opus",
+            "webm": "audio/webm", "amr": "audio/amr",
+        }
+        mime = "audio/ogg"
+        if file_type and "/" in file_type:
+            mime = file_type
+        else:
+            ext = file_url.rsplit(".", 1)[-1].lower().split("?")[0] if "." in file_url else ""
+            mime = mime_map.get(ext, "audio/ogg")
+
+        # Transcribe using Gemini
+        from services.gemini_service import gemini
+        if not gemini.configured:
+            return (
+                "Voice notes require GEMINI_API_KEY to be configured.\n"
+                "Please type your message instead."
+            )
+
+        transcribed = gemini.transcribe_audio(audio_bytes, mime)
+        if not transcribed:
+            return (
+                "Could not understand the voice note. Please try:\n"
+                "- Speaking clearly and closer to the mic\n"
+                "- Reducing background noise\n"
+                "- Or type your message instead"
+            )
+
+        logger.info("[Cliq Bot] Voice transcribed: '%s'", transcribed[:100])
+
+        # Process transcribed text as a regular message
+        reply = _process_cliq_message(transcribed, user, phone_key)
+        return f"*Voice:* _{transcribed}_\n\n{reply}"
+
+    except Exception as exc:
+        logger.exception("[Cliq Bot] Voice processing failed: %s", exc)
+        return "Error processing voice note. Please type your message instead."
+
+
 def _find_user_by_email(email: str) -> dict | None:
     """Look up user by email address."""
     if not email:
@@ -185,6 +240,16 @@ def bot_handler():
 
     logger.info("[Cliq Bot] Raw data: %s", dict(data))
     logger.info("[Cliq Bot] Message from %s (%s): '%s', file=%s", user_name, user_email, message[:80], bool(file_url))
+
+    # Handle voice/audio attachments (transcribe → process as text)
+    audio_exts = ('.ogg', '.mp3', '.wav', '.m4a', '.aac', '.opus', '.webm', '.amr')
+    if file_url and ("audio" in file_type.lower() or file_name.lower().endswith(audio_exts)):
+        user = _find_user_by_email(user_email) or _find_user_by_name(user_name)
+        if not user:
+            return jsonify({"text": "Your account is not linked. Please contact your admin."})
+        reply = _process_voice_note(file_url, file_type, user, f"cliq_{user_email or user_name}")
+        buttons = _get_context_buttons(reply, user)
+        return jsonify({"text": reply, "suggestions": buttons})
 
     # Handle file/image attachments (receipt scanning)
     if file_url and ("image" in file_type.lower() or file_name.lower().endswith(('.jpg', '.jpeg', '.png', '.pdf'))):

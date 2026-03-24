@@ -72,7 +72,8 @@ class Config:
     REACT_BUILD = os.path.join(PROJECT_ROOT, "frontend", "dist")
     MAX_CONTENT_LENGTH = 20 * 1024 * 1024  # 20MB
     ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "pdf", "doc", "docx",
-                          "xls", "xlsx", "csv", "txt", "zip"}
+                          "xls", "xlsx", "csv", "txt", "zip",
+                          "ogg", "mp3", "wav", "m4a", "webm", "aac", "opus", "amr"}
 
     # AI & APIs — fetched from Secret Manager when running on GCP
     ANTHROPIC_API_KEY     = _get_env_or_secret("ANTHROPIC_API_KEY")

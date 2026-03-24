@@ -335,9 +335,19 @@ def _create_tables(c, pg=None):
     )""")
 
     c.execute(f"""
+    CREATE TABLE IF NOT EXISTS chat_sessions (
+        id          TEXT PRIMARY KEY,
+        user_id     INTEGER NOT NULL,
+        title       TEXT DEFAULT 'New Chat',
+        created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+
+    c.execute(f"""
     CREATE TABLE IF NOT EXISTS chat_messages (
         id               {pk},
         user_id          INTEGER,
+        session_id       TEXT,
         role             TEXT NOT NULL,
         content          TEXT NOT NULL,
         intent           TEXT,
@@ -392,7 +402,22 @@ def _apply_migrations_pg(db):
     _add_col("approvals", "decided_at", "TIMESTAMP")
     _add_col("expenses_db", "request_id", "TEXT")
     _add_col("chat_messages", "action_card_json", "TEXT")
+    _add_col("chat_messages", "session_id", "TEXT")
     _add_col("users", "email_verified", "INTEGER DEFAULT 1")
+
+    # chat_sessions table (for existing databases)
+    try:
+        db.execute("""
+        CREATE TABLE IF NOT EXISTS chat_sessions (
+            id          TEXT PRIMARY KEY,
+            user_id     INTEGER NOT NULL,
+            title       TEXT DEFAULT 'New Chat',
+            created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""")
+        db.commit()
+    except Exception:
+        pass
 
     # Sync full_name from name for existing users
     db.execute("UPDATE users SET full_name = name WHERE full_name IS NULL OR full_name = ''")
@@ -439,8 +464,23 @@ def _apply_migrations(db, c):
     # expenses_db — add request_id linkage
     _add_col("expenses_db", "request_id", "TEXT")
 
-    # chat_messages — add action_card_json
+    # chat_messages — add action_card_json + session_id
     _add_col("chat_messages", "action_card_json", "TEXT")
+    _add_col("chat_messages", "session_id", "TEXT")
+
+    # chat_sessions table (for existing databases)
+    try:
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS chat_sessions (
+            id          TEXT PRIMARY KEY,
+            user_id     INTEGER NOT NULL,
+            title       TEXT DEFAULT 'New Chat',
+            created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""")
+        db.commit()
+    except Exception:
+        pass
 
     # users — email verification flag (default 1 = verified for existing users)
     _add_col("users", "email_verified", "INTEGER DEFAULT 1")
@@ -476,24 +516,8 @@ def _exec_many(c, sql, rows):
 
 
 def _seed_users(c, db):
-    from werkzeug.security import generate_password_hash
-    if _count(c, "users") > 0:
-        return
-    users = [
-        ("vaibhav",   generate_password_hash("admin123"), "Vaibhav Sharma",  "Vaibhav Sharma",  "vaibhav@company.com",   "admin",    "Operations", "VS"),
-        ("rohit",     generate_password_hash("admin123"), "Rohit Mehta",     "Rohit Mehta",     "rohit@company.com",     "admin",    "Finance",    "RM"),
-        ("employee1", generate_password_hash("emp123"),   "Priya Patel",     "Priya Patel",     "priya@company.com",     "employee", "Sales",      "PP"),
-        ("employee2", generate_password_hash("emp123"),   "Arjun Kumar",     "Arjun Kumar",     "arjun@company.com",     "employee", "Engineering","AK"),
-        ("manager1",  generate_password_hash("mgr123"),   "Sunita Rao",      "Sunita Rao",      "sunita@company.com",    "manager",  "Sales",      "SR"),
-    ]
-    _exec_many(
-        c,
-        """INSERT INTO users
-           (username, password_hash, name, full_name, email, role, department, avatar_initials)
-           VALUES (?,?,?,?,?,?,?,?)""",
-        users
-    )
-    db.commit()
+    """No-op — demo users removed. Users register through the signup flow."""
+    pass
 
 
 def _seed_policy(c, db):

@@ -106,9 +106,6 @@ def login_required(f):
     def decorated(*args, **kwargs):
         user = get_current_user()
         if not user:
-            # Demo mode fallback: only allowed in non-GCP dev environments
-            if session.get("demo_mode") and not _is_production():
-                return f(*args, **kwargs)
             return jsonify({"success": False, "error": "Authentication required"}), 401
         return f(*args, **kwargs)
     return decorated
@@ -120,23 +117,11 @@ def admin_required(f):
     def decorated(*args, **kwargs):
         user = get_current_user()
         if not user:
-            if session.get("demo_mode") and not _is_production():
-                return f(*args, **kwargs)
             return jsonify({"success": False, "error": "Authentication required"}), 401
         if user["role"] not in ("admin", "manager"):
             return jsonify({"success": False, "error": "Admin access required"}), 403
         return f(*args, **kwargs)
     return decorated
-
-
-def _is_production() -> bool:
-    """Check if running in production (GCP or explicit production flag)."""
-    import os
-    return bool(
-        os.getenv("K_SERVICE")
-        or os.getenv("GAE_APPLICATION")
-        or os.getenv("PRODUCTION")
-    )
 
 
 def login_user(username, password):
@@ -155,7 +140,6 @@ def login_user(username, password):
             if not u.get("email_verified", 1):
                 return {"success": False, "error": "Email not verified. Please check your inbox for the verification code.", "needs_verification": True, "email": u.get("email", "")}
             session["user_id"] = user["id"]
-            session["demo_mode"] = False
             u = dict(user)
             name = u.get("name") or u.get("full_name") or u["username"]
             tokens = generate_tokens(u["id"])
@@ -177,57 +161,6 @@ def login_user(username, password):
     except Exception as e:
         logger.exception("[Auth] login_user failed for %s", username)
         return {"success": False, "error": "Login failed. Please try again."}
-
-
-def demo_login():
-    """Auto-login as admin for demo mode."""
-    try:
-        db = get_db()
-        user = db.execute("SELECT * FROM users WHERE role = 'admin' LIMIT 1").fetchone()
-        db.close()
-
-        if user:
-            session["user_id"] = user["id"]
-            session["demo_mode"] = True
-            u = dict(user)
-            name = u.get("name") or u.get("full_name") or u["username"]
-            return {
-                "success": True,
-                "user": {
-                    "id": u["id"],
-                    "username": u["username"],
-                    "name": name,
-                    "full_name": name,
-                    "email": u.get("email", ""),
-                    "role": u.get("role", "admin"),
-                    "department": u.get("department", "General"),
-                    "avatar_initials": "".join(w[0].upper() for w in name.split()[:2]),
-                }
-            }
-        # Fallback if no users exist
-        session["user_id"] = 1
-        session["demo_mode"] = True
-        return {
-            "success": True,
-            "user": {
-                "id": 1, "username": "admin", "name": "Demo Admin",
-                "full_name": "Demo Admin", "email": "admin@demo.com",
-                "role": "admin", "department": "Management",
-                "avatar_initials": "DA"
-            }
-        }
-    except Exception:
-        session["user_id"] = 1
-        session["demo_mode"] = True
-        return {
-            "success": True,
-            "user": {
-                "id": 1, "username": "admin", "name": "Demo Admin",
-                "full_name": "Demo Admin", "email": "admin@demo.com",
-                "role": "admin", "department": "Management",
-                "avatar_initials": "DA"
-            }
-        }
 
 
 def logout_user():

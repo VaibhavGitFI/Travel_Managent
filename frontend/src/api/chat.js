@@ -1,39 +1,66 @@
 import client from './client'
 
-export const sendMessage = async (message, context = {}, file = null) => {
+// ── Session CRUD ──────────────────────────────────────────────────────────────
+
+export const listSessions = async () => {
+  const { data } = await client.get('/chat/sessions')
+  return data
+}
+
+export const createSession = async (title = 'New Chat') => {
+  const { data } = await client.post('/chat/sessions', { title })
+  return data
+}
+
+export const renameSession = async (sessionId, title) => {
+  const { data } = await client.patch(`/chat/sessions/${sessionId}`, { title })
+  return data
+}
+
+export const deleteSession = async (sessionId) => {
+  const { data } = await client.delete(`/chat/sessions/${sessionId}`)
+  return data
+}
+
+// ── Messages ──────────────────────────────────────────────────────────────────
+
+export const sendMessage = async (message, context = {}, file = null, sessionId = null) => {
   if (file) {
     const formData = new FormData()
     formData.append('message', message || '')
     formData.append('context', JSON.stringify(context || {}))
     formData.append('file', file)
+    if (sessionId) formData.append('session_id', sessionId)
     const { data } = await client.post('/chat', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
     })
     return data
   }
 
-  const { data } = await client.post('/chat', { message, context })
+  const { data } = await client.post('/chat', { message, context, session_id: sessionId })
   return data
 }
 
-export const getChatHistory = async () => {
-  const { data } = await client.get('/chat/history')
+export const getChatHistory = async (sessionId = null) => {
+  const params = {}
+  if (sessionId) params.session_id = sessionId
+  const { data } = await client.get('/chat/history', { params })
   return data
 }
 
-export const clearChatHistory = async () => {
-  const { data } = await client.delete('/chat/history')
+export const transcribeAudio = async (audioBlob) => {
+  const formData = new FormData()
+  formData.append('audio', audioBlob, 'voice.webm')
+  const { data } = await client.post('/chat/transcribe', formData, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+  })
   return data
 }
 
 /**
  * Stream an AI response via SSE.
- * @param {string} message
- * @param {object} context
- * @param {(token: string) => void} onToken  — called for each text chunk
- * @param {(meta: object) => void} onDone    — called with {action_cards, intent, ai_powered}
  */
-export const sendStreamingMessage = async (message, context = {}, onToken, onDone) => {
+export const sendStreamingMessage = async (message, context = {}, onToken, onDone, sessionId = null) => {
   const { getAccessToken } = await import('./auth')
   const baseURL = '/api'
   const headers = { 'Content-Type': 'application/json' }
@@ -41,13 +68,13 @@ export const sendStreamingMessage = async (message, context = {}, onToken, onDon
   if (token) headers['Authorization'] = `Bearer ${token}`
 
   const controller = new AbortController()
-  const timeout = setTimeout(() => controller.abort(), 60000) // 60s max
+  const timeout = setTimeout(() => controller.abort(), 90000)
 
   const response = await fetch(`${baseURL}/chat/stream`, {
     method: 'POST',
     credentials: 'include',
     headers,
-    body: JSON.stringify({ message, context }),
+    body: JSON.stringify({ message, context, session_id: sessionId }),
     signal: controller.signal,
   })
 
@@ -77,7 +104,7 @@ export const sendStreamingMessage = async (message, context = {}, onToken, onDon
           onToken?.(event.token)
         }
       } catch {
-        // partial JSON chunk — will be completed in next read
+        // partial JSON chunk
       }
     }
   }
@@ -86,16 +113,12 @@ export const sendStreamingMessage = async (message, context = {}, onToken, onDon
     while (true) {
       const { done, value } = await reader.read()
       if (done) break
-
       buffer += decoder.decode(value, { stream: true })
       const lines = buffer.split('\n')
       buffer = lines.pop()
       processLines(lines)
     }
-    // Process any remaining data in buffer after stream ends
-    if (buffer.trim()) {
-      processLines([buffer])
-    }
+    if (buffer.trim()) processLines([buffer])
   } finally {
     clearTimeout(timeout)
   }

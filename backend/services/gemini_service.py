@@ -225,6 +225,33 @@ Return JSON with keys:
 """
         return self.generate_json(prompt, "pro")
 
+    def transcribe_audio(self, audio_bytes: bytes, mime_type: str = "audio/ogg") -> str | None:
+        """Transcribe audio bytes using Gemini multimodal. Returns transcribed text or None."""
+        if not self.configured or not self._genai:
+            return None
+        if self._cooldown_until > time.time():
+            return None
+        try:
+            model = self._genai.GenerativeModel(GEMINI_MODELS["flash"])
+            audio_part = {"mime_type": mime_type, "data": audio_bytes}
+            prompt = (
+                "Transcribe this audio accurately. Return ONLY the spoken text, "
+                "nothing else. If the audio is in Hindi or another Indian language, "
+                "transliterate to English. If the audio is unclear or empty, return: [unclear]"
+            )
+            response = model.generate_content([prompt, audio_part])
+            text = (response.text or "").strip()
+            if not text or text == "[unclear]":
+                return None
+            return text
+        except Exception as e:
+            error_text = str(e)
+            if self._is_quota_error(error_text):
+                self._enter_cooldown(error_text)
+                return None
+            logger.warning("[Gemini] Audio transcription error: %s", e)
+            return None
+
     @property
     def is_available(self) -> bool:
         return self.configured

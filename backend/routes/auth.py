@@ -7,7 +7,7 @@ import secrets
 import time
 from flask import Blueprint, request, jsonify, session
 from werkzeug.security import generate_password_hash
-from auth import login_user, logout_user, get_current_user, demo_login, verify_token, generate_tokens, _get_user_by_id
+from auth import login_user, logout_user, get_current_user, verify_token, generate_tokens, _get_user_by_id
 from database import get_db
 from extensions import limiter
 
@@ -27,11 +27,6 @@ def login():
     data = request.get_json(silent=True) or {}
     username = data.get("username", "").strip()
     password = data.get("password", "")
-
-    if not username and not password:
-        # Demo mode: auto-login as admin
-        result = demo_login()
-        return jsonify(result), 200 if result.get("success") else 401
 
     if not username or not password:
         return jsonify({"success": False, "error": "Username and password are required"}), 400

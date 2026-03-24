@@ -20,12 +20,22 @@ const NOTIF_ICONS = {
 }
 
 export default function Layout() {
-  const { auth, addNotification, setNotifications, setApiHealth, setSidebarCollapsed, sidebar, markStale } = useStore()
+  const { auth, addNotification, setNotifications, setApiHealth, setSidebarCollapsed, sidebar, markStale, theme } = useStore()
   const [sosOpen,    setSosOpen]    = useState(false)
   const [sosCity,    setSosCity]    = useState('')
   const [sosMsg,     setSosMsg]     = useState('')
   const [sosLoading, setSosLoading] = useState(false)
   const [sosData,    setSosData]    = useState(null)
+
+  // ── Sync dark mode class on <html> ──────────────────────────────────────────
+  useEffect(() => {
+    const root = document.documentElement
+    if (theme === 'dark') {
+      root.classList.add('dark')
+    } else {
+      root.classList.remove('dark')
+    }
+  }, [theme])
 
   // ── Load persistent notifications from DB on login ──────────────────────────
   useEffect(() => {
@@ -183,7 +193,7 @@ export default function Layout() {
   }
 
   return (
-    <div className="relative flex h-dvh min-h-screen w-full overflow-hidden bg-gray-50">
+    <div className={cn('relative flex h-dvh min-h-screen w-full overflow-hidden transition-colors duration-200', theme === 'dark' ? 'bg-navy-900' : 'bg-gray-50')}>
       <Sidebar />
 
       <button
@@ -200,7 +210,7 @@ export default function Layout() {
       <div className="flex flex-1 min-h-0 min-w-0 flex-col overflow-hidden">
         <Topbar />
 
-        <main className="flex-1 min-h-0 overflow-x-hidden overflow-y-auto bg-surface">
+        <main className={cn('flex-1 min-h-0 overflow-x-hidden overflow-y-auto transition-colors duration-200', theme === 'dark' ? 'bg-navy-900' : 'bg-surface')}>
           <div className="page-enter min-h-full px-4 py-5 sm:px-6 sm:py-6">
             <Outlet />
           </div>
@@ -226,7 +236,7 @@ export default function Layout() {
             className="absolute inset-0 bg-black/60 backdrop-blur-sm"
             onClick={() => setSosOpen(false)}
           />
-          <div className="relative w-full max-w-md rounded-2xl border border-red-200 bg-white shadow-2xl">
+          <div className={cn('relative w-full max-w-md rounded-2xl border shadow-2xl', theme === 'dark' ? 'border-red-800 bg-navy-800' : 'border-red-200 bg-white')}>
             {/* Header */}
             <div className="flex items-center gap-3 rounded-t-2xl bg-red-600 px-5 py-4 text-white">
               <AlertTriangle size={20} />

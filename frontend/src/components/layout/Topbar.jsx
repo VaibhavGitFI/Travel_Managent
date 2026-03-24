@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
-import { Bell, Check, Menu, Search, Command } from 'lucide-react'
+import { Bell, Check, Menu, Search, Command, Sun, Moon } from 'lucide-react'
 import { cn } from '../../lib/cn'
 import useStore from '../../store/useStore'
 import { markNotificationRead as apiMarkRead, markAllNotificationsRead as apiMarkAllRead } from '../../api/notifications'
@@ -30,6 +30,8 @@ export default function Topbar() {
     sidebar,
     toggleSidebar,
     setSidebarCollapsed,
+    theme,
+    toggleTheme,
   } = useStore()
 
   const [notifOpen, setNotifOpen] = useState(false)
@@ -82,20 +84,25 @@ export default function Topbar() {
     toggleSidebar()
   }
 
+  const isDark = theme === 'dark'
+
   return (
-    <header className="z-20 flex h-14 min-w-0 shrink-0 items-center gap-3 border-b border-surface-border bg-surface-raised px-4 sm:px-6">
+    <header className={cn('z-20 flex h-14 min-w-0 shrink-0 items-center gap-3 border-b px-4 sm:px-6 transition-colors duration-200',
+      isDark ? 'border-navy-700/50 bg-navy-800' : 'border-surface-border bg-surface-raised')}>
       {/* Mobile menu toggle */}
       <button
         type="button"
         onClick={handleSidebarToggle}
         aria-label="Toggle sidebar"
-        className="lg:hidden rounded-md p-1.5 text-gray-500 transition-colors hover:bg-gray-100 hover:text-gray-700"
+        className={cn('lg:hidden rounded-md p-1.5 transition-colors',
+          isDark ? 'text-brand-muted hover:bg-navy-700 hover:text-brand-light' : 'text-gray-500 hover:bg-gray-100 hover:text-gray-700')}
       >
         <Menu size={18} />
       </button>
 
       {/* Page title */}
-      <h1 className="flex-1 min-w-0 truncate font-heading text-lg font-semibold text-gray-900">
+      <h1 className={cn('flex-1 min-w-0 truncate font-heading text-lg font-semibold',
+        isDark ? 'text-brand-light' : 'text-gray-900')}>
         {meta.label}
       </h1>
 
@@ -105,13 +112,28 @@ export default function Topbar() {
         <button
           type="button"
           onClick={() => navigate('/chat')}
-          className="hidden sm:flex items-center gap-2 rounded-lg border border-surface-border bg-surface-sunken px-3 py-1.5 text-sm text-gray-400 transition-colors hover:border-gray-300 hover:text-gray-500"
+          className={cn('hidden sm:flex items-center gap-2 rounded-lg border px-3 py-1.5 text-sm transition-colors',
+            isDark
+              ? 'border-navy-600 bg-navy-700 text-brand-muted hover:border-navy-500 hover:text-brand-light'
+              : 'border-surface-border bg-surface-sunken text-gray-400 hover:border-gray-300 hover:text-gray-500')}
         >
           <Search size={14} />
           <span className="text-[13px]">Ask AI...</span>
-          <kbd className="ml-2 flex items-center gap-0.5 rounded border border-gray-200 bg-white px-1.5 py-0.5 text-[10px] font-medium text-gray-400">
+          <kbd className={cn('ml-2 flex items-center gap-0.5 rounded border px-1.5 py-0.5 text-[10px] font-medium',
+            isDark ? 'border-navy-600 bg-navy-800 text-brand-muted' : 'border-gray-200 bg-white text-gray-400')}>
             <Command size={10} />K
           </kbd>
+        </button>
+
+        {/* Theme toggle */}
+        <button
+          type="button"
+          onClick={toggleTheme}
+          className={cn('rounded-md p-2 transition-colors',
+            isDark ? 'text-brand-muted hover:bg-navy-700 hover:text-brand-cyan' : 'text-gray-400 hover:bg-gray-100 hover:text-gray-600')}
+          title={isDark ? 'Switch to light mode' : 'Switch to dark mode'}
+        >
+          {isDark ? <Sun size={17} /> : <Moon size={17} />}
         </button>
 
         {/* Health dot */}
@@ -129,8 +151,8 @@ export default function Topbar() {
             className={cn(
               'relative rounded-md p-2 transition-colors',
               notifOpen
-                ? 'bg-accent-50 text-accent-600'
-                : 'text-gray-400 hover:bg-gray-100 hover:text-gray-600'
+                ? isDark ? 'bg-navy-700 text-brand-cyan' : 'bg-accent-50 text-accent-600'
+                : isDark ? 'text-brand-muted hover:bg-navy-700 hover:text-brand-light' : 'text-gray-400 hover:bg-gray-100 hover:text-gray-600'
             )}
             aria-label="Notifications"
           >
@@ -143,12 +165,14 @@ export default function Topbar() {
           </button>
 
           {notifOpen && (
-            <div className="absolute right-0 top-full z-50 mt-2 w-[min(22rem,calc(100vw-1rem))] rounded-xl border border-surface-border bg-white shadow-card-lg animate-slide-down sm:w-80">
-              <div className="flex items-center justify-between px-4 py-3 border-b border-surface-border">
+            <div className={cn('absolute right-0 top-full z-50 mt-2 w-[min(22rem,calc(100vw-1rem))] rounded-xl border shadow-card-lg animate-slide-down sm:w-80',
+              isDark ? 'border-navy-700 bg-navy-800' : 'border-surface-border bg-white')}>
+              <div className={cn('flex items-center justify-between px-4 py-3 border-b',
+                isDark ? 'border-navy-700' : 'border-surface-border')}>
                 <div>
-                  <h3 className="text-sm font-semibold text-gray-900">Notifications</h3>
+                  <h3 className={cn('text-sm font-semibold', isDark ? 'text-brand-light' : 'text-gray-900')}>Notifications</h3>
                   {unreadCount > 0 && (
-                    <p className="text-xs text-gray-400">{unreadCount} unread</p>
+                    <p className={cn('text-xs', isDark ? 'text-brand-muted' : 'text-gray-400')}>{unreadCount} unread</p>
                   )}
                 </div>
                 {unreadCount > 0 && (
@@ -161,11 +185,11 @@ export default function Topbar() {
                 )}
               </div>
 
-              <div className="max-h-72 overflow-y-auto divide-y divide-gray-50">
+              <div className={cn('max-h-72 overflow-y-auto divide-y', isDark ? 'divide-navy-700/50' : 'divide-gray-50')}>
                 {notifications.length === 0 ? (
                   <div className="py-8 text-center">
-                    <Bell size={24} className="mx-auto text-gray-300 mb-2" />
-                    <p className="text-sm text-gray-400">No notifications</p>
+                    <Bell size={24} className={cn('mx-auto mb-2', isDark ? 'text-navy-600' : 'text-gray-300')} />
+                    <p className={cn('text-sm', isDark ? 'text-brand-muted' : 'text-gray-400')}>No notifications</p>
                   </div>
                 ) : (
                   notifications.slice(0, 10).map((n) => (
@@ -173,20 +197,22 @@ export default function Topbar() {
                       key={n.id}
                       className={cn(
                         'flex items-start gap-3 px-4 py-3 transition-colors',
-                        !n.read ? 'bg-accent-50/40' : 'hover:bg-gray-50'
+                        !n.read
+                          ? isDark ? 'bg-navy-700/40' : 'bg-accent-50/40'
+                          : isDark ? 'hover:bg-navy-700/30' : 'hover:bg-gray-50'
                       )}
                     >
                       <div
                         className={cn(
                           'w-1.5 h-1.5 rounded-full mt-2 shrink-0',
-                          !n.read ? 'bg-accent-500' : 'bg-gray-200'
+                          !n.read ? 'bg-accent-500' : isDark ? 'bg-navy-600' : 'bg-gray-200'
                         )}
                       />
                       <div className="flex-1 min-w-0">
-                        <p className="text-sm text-gray-800 font-medium">{n.title}</p>
-                        <p className="text-xs text-gray-500 mt-0.5 line-clamp-2">{n.message}</p>
+                        <p className={cn('text-sm font-medium', isDark ? 'text-brand-light' : 'text-gray-800')}>{n.title}</p>
+                        <p className={cn('text-xs mt-0.5 line-clamp-2', isDark ? 'text-brand-muted' : 'text-gray-500')}>{n.message}</p>
                         {n.time && (
-                          <p className="text-[10px] text-gray-400 mt-1">{n.time}</p>
+                          <p className={cn('text-[10px] mt-1', isDark ? 'text-navy-400' : 'text-gray-400')}>{n.time}</p>
                         )}
                       </div>
                       {!n.read && (
@@ -206,11 +232,12 @@ export default function Topbar() {
         </div>
 
         {/* User */}
-        <div className="flex items-center gap-2 pl-1.5 border-l border-surface-border ml-1">
+        <div className={cn('flex items-center gap-2 pl-1.5 border-l ml-1', isDark ? 'border-navy-700' : 'border-surface-border')}>
           <div className="w-7 h-7 rounded-full bg-brand-dark flex items-center justify-center text-white text-xs font-bold">
             {user?.name?.charAt(0)?.toUpperCase() || 'U'}
           </div>
-          <span className="hidden md:block text-[13px] font-medium text-gray-700 max-w-[120px] truncate">
+          <span className={cn('hidden md:block text-[13px] font-medium max-w-[120px] truncate',
+            isDark ? 'text-brand-light' : 'text-gray-700')}>
             {user?.name || user?.username || 'User'}
           </span>
         </div>

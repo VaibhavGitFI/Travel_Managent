@@ -32,9 +32,17 @@ def create_app() -> Flask:
     ]
     CORS(app, supports_credentials=True, origins=allowed_origins)
 
-    socketio.init_app(app, cors_allowed_origins=allowed_origins, async_mode="eventlet",
-                      logger=False, engineio_logger=False)
+    # socketio.init_app(app, cors_allowed_origins=allowed_origins, async_mode="eventlet",
+    #                   logger=False, engineio_logger=False)
 
+
+    socketio.init_app(
+        app,
+        cors_allowed_origins=allowed_origins,
+        logger=True,
+        engineio_logger=True,
+    )
+    
     # Rate limiter
     limiter.init_app(app)
 

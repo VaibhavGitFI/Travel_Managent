@@ -26,6 +26,16 @@ const useStore = create(
           auth: { user: null, isLoggedIn: false, loading: false },
         }),
 
+      // ── Theme ───────────────────────────────────────────
+      theme: 'light', // 'light' | 'dark'
+
+      toggleTheme: () =>
+        set((state) => ({
+          theme: state.theme === 'dark' ? 'light' : 'dark',
+        })),
+
+      setTheme: (theme) => set({ theme }),
+
       // ── Sidebar ──────────────────────────────────────────
       sidebar: {
         collapsed: false,
@@ -97,6 +107,7 @@ const useStore = create(
       partialize: (state) => ({
         auth: state.auth,
         sidebar: state.sidebar,
+        theme: state.theme,
       }),
     }
   )
