@@ -1,18 +1,51 @@
 """
 TravelSync Pro — Hotel & Accommodation Agent
-- Real hotels via Amadeus API (falls back to curated data)
-- PG / Serviced Apartments for stays ≥ 5 days
+- Real hotels via Google Places API
+- PG / Serviced Apartments for stays >= 5 days via Google Places
 - Google Maps proximity filtering for rural client sites
 - Gemini AI for personalized recommendations
 """
 import sys
 import os
+import random
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from datetime import datetime, timedelta
-from services.amadeus_service import amadeus
 from services.maps_service import maps
 from services.gemini_service import gemini
+
+
+# ── Curated fallback data (used only when Google Maps API key not set) ────────
+
+_FALLBACK_HOTELS = [
+    {"name": "Taj Hotels", "rating": 4.7, "price_per_night": 12000, "amenities": ["WiFi", "Pool", "Spa", "Restaurant", "AC"]},
+    {"name": "Oberoi Hotels", "rating": 4.8, "price_per_night": 15000, "amenities": ["WiFi", "Pool", "Gym", "Restaurant", "AC"]},
+    {"name": "ITC Hotels", "rating": 4.6, "price_per_night": 10000, "amenities": ["WiFi", "Restaurant", "Gym", "AC"]},
+    {"name": "Marriott Hotel", "rating": 4.5, "price_per_night": 9000, "amenities": ["WiFi", "Pool", "Restaurant", "AC", "Room Service"]},
+    {"name": "Hyatt Regency", "rating": 4.5, "price_per_night": 8500, "amenities": ["WiFi", "Pool", "Gym", "Restaurant", "AC"]},
+    {"name": "Novotel", "rating": 4.3, "price_per_night": 7000, "amenities": ["WiFi", "Restaurant", "Gym", "AC"]},
+    {"name": "Lemon Tree Hotel", "rating": 4.1, "price_per_night": 4500, "amenities": ["WiFi", "Restaurant", "AC"]},
+    {"name": "Ibis Hotel", "rating": 4.0, "price_per_night": 3500, "amenities": ["WiFi", "Restaurant", "AC"]},
+    {"name": "OYO Rooms Premium", "rating": 3.8, "price_per_night": 2000, "amenities": ["WiFi", "AC"]},
+]
+
+_FALLBACK_PG = [
+    {"name": "Stanza Living", "type": "Coliving", "monthly_rent": 18000, "amenities": ["WiFi", "Meals", "AC", "Laundry", "Security"]},
+    {"name": "NestAway Homes", "type": "Managed PG", "monthly_rent": 14000, "amenities": ["WiFi", "AC", "Security"]},
+    {"name": "OYO Life", "type": "Managed PG", "monthly_rent": 12000, "amenities": ["WiFi", "AC", "Meals"]},
+    {"name": "CoHo Coliving", "type": "Coliving", "monthly_rent": 20000, "amenities": ["WiFi", "Meals", "AC", "Gym", "Community"]},
+    {"name": "Colive Spaces", "type": "Coliving", "monthly_rent": 16000, "amenities": ["WiFi", "AC", "Laundry", "Security"]},
+    {"name": "Zolo Stays", "type": "Managed PG", "monthly_rent": 11000, "amenities": ["WiFi", "AC", "Meals"]},
+]
+
+_PG_BOOKING_URLS = {
+    "Stanza Living": "https://www.stanzaliving.com",
+    "NestAway Homes": "https://www.nestaway.com",
+    "OYO Life": "https://www.oyorooms.com/long-term-stays",
+    "CoHo Coliving": "https://www.coho.in",
+    "Colive Spaces": "https://www.colive.com",
+    "Zolo Stays": "https://www.zolostays.com",
+}
 
 
 def search_hotels(data: dict) -> dict:
@@ -42,17 +75,22 @@ def search_hotels(data: dict) -> dict:
     BUDGET_CAPS = {"budget": 4000, "moderate": 10000, "premium": 25000, "luxury": None}
     budget_max = BUDGET_CAPS.get(budget)
 
-    city_code = amadeus.get_airport_code(destination)
-    hotels = amadeus.search_hotels(city_code, check_in_str, check_out_str,
-                                    adults=num_travelers, budget_max=budget_max)
+    # Use Google Places for live hotel data; fall back to curated list
+    if maps.configured:
+        hotels = maps.search_hotels(destination, budget_max=budget_max, limit=8)
+    else:
+        hotels = []
+
+    if not hotels:
+        hotels = _fallback_hotels(destination, budget_max, limit=8)
 
     # Proximity filter for rural trips
     if is_rural and client_address and maps.configured:
         hotels = _filter_by_proximity(hotels, client_address, max_km=2.0)
     elif is_rural and client_address:
         for h in hotels:
-            h["rural_note"] = ("Hotels near client site preferred (2km radius). "
-                               "Configure GOOGLE_MAPS_API_KEY for precise filtering.")
+            h["rural_note"] = ("Hotels near client site preferred (2 km radius). "
+                               "Set GOOGLE_MAPS_API_KEY for precise filtering.")
 
     # Vegetarian filter
     if require_veg:
@@ -71,7 +109,6 @@ def search_hotels(data: dict) -> dict:
     if duration_days >= 5:
         pg_options = search_pg_options({
             "destination": destination,
-            "city_code": city_code,
             "duration_days": duration_days,
             "budget": budget,
         })
@@ -98,19 +135,58 @@ def search_hotels(data: dict) -> dict:
 
 def search_pg_options(data: dict) -> list:
     """Search PG / serviced apartment options for long stays."""
-    city_code = data.get("city_code") or amadeus.get_airport_code(data.get("destination", ""))
+    destination = data.get("destination", "")
     duration_days = int(data.get("duration_days", 7))
-
     budget = data.get("budget", "moderate")
+
     MONTHLY_BUDGET_CAPS = {"budget": 15000, "moderate": 30000, "premium": 60000, "luxury": None}
     budget_monthly = MONTHLY_BUDGET_CAPS.get(budget)
 
-    options = amadeus.search_pg_options(city_code, duration_days, budget_monthly)
+    # Try real data via Google Places first
+    options = []
+    if maps.configured:
+        options = maps.search_pg_options(destination, budget_monthly=budget_monthly, limit=6)
+
+    # Fall back to curated list
+    if not options:
+        options = _fallback_pg_options(destination, budget_monthly)
 
     for opt in options:
         opt["type_label"] = _pg_type_label(opt.get("type", ""))
-        opt["booking_url"] = _pg_booking_url(opt.get("platform", ""), data.get("destination", ""))
+        if not opt.get("booking_url"):
+            name = opt.get("name", "")
+            opt["booking_url"] = _PG_BOOKING_URLS.get(name, _pg_booking_url_by_type(opt.get("type", ""), destination))
+        opt.setdefault("amenities", ["WiFi", "AC", "Security"])
 
+    return options
+
+
+# ── Internal helpers ──────────────────────────────────────────────────────────
+
+def _fallback_hotels(destination: str, budget_max: int, limit: int = 8) -> list:
+    """Return curated hotel list for when Google Places is unavailable."""
+    hotels = []
+    for h in _FALLBACK_HOTELS:
+        if budget_max and h["price_per_night"] > budget_max:
+            continue
+        hotels.append({
+            **h,
+            "area": destination,
+            "price": h["price_per_night"],
+            "currency": "INR",
+            "source": "fallback",
+        })
+    random.shuffle(hotels)
+    return hotels[:limit]
+
+
+def _fallback_pg_options(destination: str, budget_monthly: int) -> list:
+    """Return curated PG list for when Google Places is unavailable."""
+    options = []
+    for pg in _FALLBACK_PG:
+        if budget_monthly and pg["monthly_rent"] > budget_monthly:
+            continue
+        options.append({**pg, "area": destination, "source": "fallback"})
     return options
 
 
@@ -122,7 +198,7 @@ def _filter_by_proximity(hotels: list, client_address: str, max_km: float = 2.0)
 
     filtered = []
     for hotel in hotels:
-        hotel_loc = f"{hotel.get('name', '')}, {hotel.get('city', client_address)}"
+        hotel_loc = f"{hotel.get('name', '')}, {hotel.get('area', client_address)}"
         try:
             dist = maps.get_distance_km(
                 f"{client_coords['lat']},{client_coords['lng']}", hotel_loc)
@@ -166,7 +242,7 @@ def _get_ai_recommendation(destination: str, budget: str, duration: int,
     veg_note = " Guest requires vegetarian meals." if veg else ""
     prompt = (f"Corporate travel hotel recommendation for {destination}. "
               f"Budget: {budget}. Duration: {duration} days.{veg_note} "
-              f"Top options: {hotel_names}. Give a 2-sentence recommendation.")
+              f"Top options: {hotel_names}. Give a 2-sentence recommendation without emojis.")
     return gemini.generate(prompt) or ""
 
 
@@ -180,21 +256,18 @@ def _build_booking_link(hotel_name: str, destination: str,
 
 def _pg_type_label(pg_type: str) -> str:
     labels = {
-        "Managed PG": "🏠 Managed PG",
-        "Serviced Apartment": "🏢 Serviced Apartment",
-        "Coliving": "👥 Co-living Space",
-        "Guest House": "🏡 Guest House",
+        "Managed PG": "Managed PG",
+        "Serviced Apartment": "Serviced Apartment",
+        "Coliving": "Co-living Space",
+        "Guest House": "Guest House",
     }
     return labels.get(pg_type, pg_type)
 
 
-def _pg_booking_url(platform: str, destination: str) -> str:
+def _pg_booking_url_by_type(pg_type: str, destination: str) -> str:
     dest_enc = destination.replace(" ", "-").lower()
-    urls = {
-        "Stanza Living": f"https://www.stanzaliving.com/{dest_enc}",
-        "NestAway": "https://www.nestaway.com",
-        "OYO Life": f"https://www.oyorooms.com/long-term-stays/{dest_enc}/",
-        "CoHo": "https://www.coho.in",
-        "Colive": "https://www.colive.com",
-    }
-    return urls.get(platform, "https://www.nestaway.com")
+    if pg_type == "Coliving":
+        return f"https://www.stanzaliving.com/{dest_enc}"
+    if pg_type == "Serviced Apartment":
+        return "https://www.nestaway.com"
+    return f"https://www.oyorooms.com/long-term-stays/{dest_enc}/"

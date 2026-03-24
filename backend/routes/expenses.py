@@ -3,6 +3,7 @@ TravelSync Pro — Expense Routes
 3-stage verification: invoice upload -> payment proof -> amount match.
 Supports Vision OCR for automatic receipt extraction.
 """
+import logging
 import os
 from flask import Blueprint, request, jsonify
 from werkzeug.utils import secure_filename
@@ -13,13 +14,16 @@ from agents.expense_agent import (
     get_expenses,
     upload_and_extract,
 )
+from agents.anomaly_agent import detect_anomalies
+
+logger = logging.getLogger(__name__)
 
 expenses_bp = Blueprint("expenses", __name__, url_prefix="/api")
 
 
 @expenses_bp.route("/expenses", methods=["GET"])
 def list_expenses():
-    """GET /api/expenses?trip_id=X — list expenses for current user (optionally by trip)."""
+    """GET /api/expenses?trip_id=X&page=1&per_page=20&search=X — list expenses with pagination and search."""
     user = get_current_user()
     if not user:
         return jsonify({"success": False, "error": "Authentication required"}), 401
@@ -28,9 +32,44 @@ def list_expenses():
 
     try:
         result = get_expenses(trip_id or None, user_id=user["id"])
-        return jsonify(result), 200
+        expenses = result.get("expenses", []) if isinstance(result, dict) else result
+
+        # Search filter
+        search = (request.args.get("search") or "").strip().lower()
+        if search:
+            expenses = [
+                e for e in expenses
+                if search in (e.get("description") or "").lower()
+                or search in (e.get("vendor") or "").lower()
+                or search in (e.get("category") or "").lower()
+            ]
+
+        total = len(expenses)
+
+        # Pagination
+        try:
+            page = max(1, int(request.args.get("page", 1)))
+            per_page = min(100, max(1, int(request.args.get("per_page", 20))))
+        except (ValueError, TypeError):
+            page, per_page = 1, 20
+
+        total_pages = max(1, -(-total // per_page))
+        start = (page - 1) * per_page
+        items = expenses[start:start + per_page]
+
+        out = result if isinstance(result, dict) else {"success": True}
+        out.update({
+            "expenses": items,
+            "items": items,
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+            "total_pages": total_pages,
+        })
+        return jsonify(out), 200
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        logger.exception("Failed to list expenses")
+        return jsonify({"success": False, "error": "Failed to load expenses"}), 500
 
 
 @expenses_bp.route("/expenses", methods=["POST"])
@@ -48,9 +87,17 @@ def submit_expense():
         status = 201 if result.get("success") and not data.get("expense_id") else 200
         if not result.get("success"):
             status = 400
+        if result.get("success"):
+            try:
+                from extensions import socketio
+                socketio.emit("data_changed", {"entity": "expenses"}, namespace="/")
+                socketio.emit("data_changed", {"entity": "analytics"}, namespace="/")
+            except Exception:
+                pass
         return jsonify(result), status
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        logger.exception("Failed to submit expense")
+        return jsonify({"success": False, "error": "Failed to submit expense"}), 500
 
 
 @expenses_bp.route("/expenses/summary", methods=["GET"])
@@ -75,7 +122,8 @@ def expense_summary():
             "summary": result.get("summary", {}),
         }), 200
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        logger.exception("Failed to load expense summary")
+        return jsonify({"success": False, "error": "Failed to load expense summary"}), 500
 
 
 @expenses_bp.route("/expense/upload-and-extract", methods=["POST"])
@@ -111,4 +159,20 @@ def upload_and_extract_route():
         result["size"] = os.path.getsize(file_path)
         return jsonify(result), 200
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        logger.exception("Failed to upload and extract receipt")
+        return jsonify({"success": False, "error": "Failed to process uploaded receipt"}), 500
+
+
+@expenses_bp.route("/expenses/anomalies", methods=["GET"])
+def expense_anomalies():
+    """GET /api/expenses/anomalies — AI-powered anomaly detection on user's expenses."""
+    user = get_current_user()
+    if not user:
+        return jsonify({"success": False, "error": "Authentication required"}), 401
+
+    try:
+        result = detect_anomalies(user["id"])
+        return jsonify(result), 200
+    except Exception as e:
+        logger.exception("Failed to detect expense anomalies")
+        return jsonify({"success": False, "error": "Anomaly detection failed", "anomalies": []}), 500

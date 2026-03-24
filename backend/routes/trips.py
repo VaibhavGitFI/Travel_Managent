@@ -2,11 +2,42 @@
 TravelSync Pro — Trip Planning Routes
 Orchestrates all agents in parallel to produce a complete trip plan.
 """
+import logging
 from datetime import datetime
 from flask import Blueprint, request, jsonify
 from auth import get_current_user
 from agents.orchestrator import plan_trip
+from agents.recommendation_agent import get_recommendations
 from database import get_db
+from extensions import limiter
+from services.task_queue import task_queue
+
+
+logger = logging.getLogger(__name__)
+
+
+def _emit_trip_update(user_id: int, destination: str, result: dict) -> None:
+    """Notify user that their trip plan is ready via all configured channels. Silent on failure."""
+    try:
+        hotel_count = len(result.get("hotels", {}).get("results", []))
+        mode_count = len(result.get("travel", {}).get("modes", {}).get("available", []))
+        detail = []
+        if hotel_count:
+            detail.append(f"{hotel_count} hotel{'s' if hotel_count > 1 else ''}")
+        if mode_count:
+            detail.append(f"{mode_count} travel option{'s' if mode_count > 1 else ''}")
+        summary = (", ".join(detail) + " found") if detail else "Plan is ready"
+
+        from services.notification_service import notify
+        notify(
+            user_id=user_id,
+            title=f"Trip Plan Ready — {destination}",
+            message=summary,
+            notification_type="trip_plan_ready",
+            extra={"destination": destination},
+        )
+    except Exception:
+        pass
 
 trips_bp = Blueprint("trips", __name__, url_prefix="/api")
 
@@ -89,6 +120,7 @@ def _serialize_trip(row: dict) -> dict:
 
 @trips_bp.route("/plan-trip", methods=["POST"])
 @trips_bp.route("/trips/plan", methods=["POST"])
+@limiter.limit("10 per minute")
 def plan_trip_route():
     """POST /api/plan-trip and /api/trips/plan — run the A2A orchestrator."""
     user = get_current_user()
@@ -111,9 +143,11 @@ def plan_trip_route():
             or result.get("hotels", {}).get("data_source")
             or "live"
         )
+        _emit_trip_update(user["id"], trip_input["destination"], result)
         return jsonify(result), 200
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        logger.exception("Failed to plan trip")
+        return jsonify({"success": False, "error": "Failed to plan trip"}), 500
 
 
 @trips_bp.route("/trips", methods=["GET"])
@@ -140,7 +174,8 @@ def list_trips():
         trips = [_serialize_trip(dict(r)) for r in rows]
         return jsonify({"success": True, "trips": trips, "total": len(trips)}), 200
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        logger.exception("Failed to list trips")
+        return jsonify({"success": False, "error": "Failed to load trips"}), 500
     finally:
         db.close()
 
@@ -168,6 +203,94 @@ def get_trip(trip_id: str):
 
         return jsonify({"success": True, "trip": _serialize_trip(trip)}), 200
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        logger.exception("Failed to get trip %s", trip_id)
+        return jsonify({"success": False, "error": "Failed to load trip details"}), 500
     finally:
         db.close()
+
+
+@trips_bp.route("/trips/recommendations", methods=["POST"])
+def trip_recommendations():
+    """POST /api/trips/recommendations — smart suggestions based on past trips + policy."""
+    user = get_current_user()
+    if not user:
+        return jsonify({"success": False, "error": "Authentication required"}), 401
+
+    data = request.get_json(silent=True) or {}
+    destination = (data.get("destination") or "").strip()
+    if not destination:
+        return jsonify({"success": False, "error": "destination is required"}), 400
+
+    duration_days = _safe_int(data.get("duration_days"), 3)
+
+    try:
+        result = get_recommendations(user["id"], destination, duration_days)
+        return jsonify(result), 200
+    except Exception as e:
+        logger.exception("Failed to get recommendations")
+        return jsonify({"success": False, "error": "Failed to generate recommendations"}), 500
+
+
+@trips_bp.route("/trips/plan-async", methods=["POST"])
+@limiter.limit("10 per minute")
+def plan_trip_async():
+    """POST /api/trips/plan-async — submit trip planning as background task."""
+    user = get_current_user()
+    if not user:
+        return jsonify({"success": False, "error": "Authentication required"}), 401
+
+    data = request.get_json(silent=True) or {}
+    trip_input = _normalize_trip_input(data, user)
+
+    if not trip_input["origin"] or not trip_input["destination"]:
+        return jsonify({"success": False, "error": "origin and destination are required"}), 400
+
+    task_id = task_queue.submit(
+        fn=plan_trip,
+        args=(trip_input,),
+        user_id=user["id"],
+        task_type="plan_trip",
+    )
+
+    return jsonify({
+        "success": True,
+        "task_id": task_id,
+        "message": f"Trip planning started for {trip_input['destination']}",
+    }), 202
+
+
+@trips_bp.route("/tasks/<string:task_id>", methods=["GET"])
+def get_task_status(task_id):
+    """GET /api/tasks/<id> — check status of a background task."""
+    user = get_current_user()
+    if not user:
+        return jsonify({"success": False, "error": "Authentication required"}), 401
+
+    status = task_queue.get_status(task_id)
+    if status["status"] == "not_found":
+        return jsonify({"success": False, "error": "Task not found"}), 404
+
+    return jsonify({"success": True, **status}), 200
+
+
+@trips_bp.route("/tasks/<string:task_id>/result", methods=["GET"])
+def get_task_result(task_id):
+    """GET /api/tasks/<id>/result — get result of a completed task."""
+    user = get_current_user()
+    if not user:
+        return jsonify({"success": False, "error": "Authentication required"}), 401
+
+    result = task_queue.get_result(task_id)
+    status_code = 200 if result.get("success") else (202 if result.get("status") in ("pending", "running") else 500)
+    return jsonify(result), status_code
+
+
+@trips_bp.route("/tasks", methods=["GET"])
+def list_tasks():
+    """GET /api/tasks — list recent background tasks for current user."""
+    user = get_current_user()
+    if not user:
+        return jsonify({"success": False, "error": "Authentication required"}), 401
+
+    tasks = task_queue.list_tasks(user_id=user["id"])
+    return jsonify({"success": True, "tasks": tasks, "total": len(tasks)}), 200

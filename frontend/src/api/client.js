@@ -17,13 +17,25 @@ client.interceptors.request.use(
   (error) => Promise.reject(error)
 )
 
-// Response interceptor — handle 401 globally
+// Response interceptor — handle 401 and 429 globally
 client.interceptors.response.use(
   (response) => response,
   (error) => {
     if (error.response?.status === 401) {
-      // Clear any local auth state and redirect to login
-      window.location.href = '/login'
+      // Only redirect if not already on login page and not a background check
+      const isLoginPage = window.location.pathname === '/login' || window.location.pathname === '/'
+      const isAuthCheck = error.config?.url?.includes('/auth/me') || error.config?.url?.includes('/auth/refresh')
+      if (!isLoginPage && !isAuthCheck) {
+        window.location.href = '/login'
+      }
+    }
+    if (error.response?.status === 429) {
+      const retryAfter = error.response.headers?.['retry-after']
+      const msg = retryAfter
+        ? `Too many requests. Please wait ${retryAfter}s before trying again.`
+        : 'Too many requests. Please slow down and try again.'
+      // Dynamically import toast to avoid circular dep
+      import('react-hot-toast').then(({ default: toast }) => toast.error(msg))
     }
     return Promise.reject(error)
   }

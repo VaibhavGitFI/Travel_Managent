@@ -42,11 +42,13 @@ const useStore = create(
       // ── Notifications ────────────────────────────────────
       notifications: [],
 
+      setNotifications: (notifications) => set({ notifications }),
+
       addNotification: (notification) =>
         set((state) => ({
           notifications: [
             { id: Date.now(), read: false, ...notification },
-            ...state.notifications,
+            ...state.notifications.filter((n) => n.id !== notification.id),
           ],
         })),
 
@@ -70,6 +72,25 @@ const useStore = create(
       },
 
       setApiHealth: (health) => set({ apiHealth: health }),
+
+      // ── Stale Data (for real-time refresh) ─────────────
+      staleData: {
+        requests: false,
+        meetings: false,
+        expenses: false,
+        approvals: false,
+        analytics: false,
+      },
+
+      markStale: (key) =>
+        set((state) => ({
+          staleData: { ...state.staleData, [key]: true },
+        })),
+
+      clearStale: (key) =>
+        set((state) => ({
+          staleData: { ...state.staleData, [key]: false },
+        })),
     }),
     {
       name: 'travelsync-store',

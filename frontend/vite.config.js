@@ -6,7 +6,7 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      '/api': { target: 'http://localhost:3399', changeOrigin: true, credentials: true },
+      '/api': { target: 'http://localhost:3399', changeOrigin: true },
       '/socket.io': { target: 'http://localhost:3399', ws: true }
     }
   }

@@ -1,0 +1,534 @@
+"""
+TravelSync Pro — Zoho Cliq Bot Handler
+Handles incoming messages from the TravelSync Pro bot in Zoho Cliq.
+Reuses the same logic as the WhatsApp bot for consistency.
+"""
+import logging
+from flask import Blueprint, request, jsonify
+from database import get_db
+
+logger = logging.getLogger(__name__)
+
+cliq_bot_bp = Blueprint("cliq_bot", __name__, url_prefix="/api/cliq")
+
+
+# Guided expense flow state per user: {phone_key: {"step": "amount|category|description|confirm", ...}}
+_expense_flow: dict[str, dict] = {}
+
+CATEGORY_BUTTONS = [
+    {"text": "Flight"}, {"text": "Hotel"}, {"text": "Food & Meals"},
+    {"text": "Local Transport"}, {"text": "Visa / Docs"}, {"text": "Communication"}, {"text": "Other"},
+]
+
+CATEGORY_MAP = {
+    "flight": "flight", "hotel": "hotel", "food & meals": "food", "food": "food",
+    "local transport": "transport", "transport": "transport", "visa / docs": "visa", "visa": "visa",
+    "communication": "communication", "other": "other",
+}
+
+
+def _process_receipt(file_url: str, user: dict, caption: str = "") -> str:
+    """Download image from Cliq, run OCR, categorize, and save expense. Same as WhatsApp flow."""
+    try:
+        import requests as http_requests
+        from routes.whatsapp import (
+            _ai_categorize_receipt, _save_expense, _categorize_text,
+            _pending_expenses,
+        )
+
+        # Download image
+        resp = http_requests.get(file_url, timeout=15)
+        if resp.status_code != 200:
+            return "Could not download the image. Please try again."
+
+        image_bytes = resp.content
+
+        # Run Google Vision OCR
+        raw_text = ""
+        ocr_data = None
+        try:
+            from services.vision_service import vision
+            if vision.configured:
+                ocr_data = vision.extract_from_bytes(image_bytes)
+                raw_text = ocr_data.get("raw_text", "")
+                logger.info("[Cliq Bot] OCR extracted %d chars", len(raw_text))
+        except Exception as exc:
+            logger.warning("[Cliq Bot] Vision OCR failed: %s", exc)
+
+        if not raw_text and not (ocr_data and ocr_data.get("extracted")):
+            return (
+                "*Receipt Processing*\n\n"
+                "Could not read text from this image. Please ensure:\n"
+                "- The receipt is clearly visible\n"
+                "- The image is not blurry\n\n"
+                "Or type: expense 500 description"
+            )
+
+        # Use OCR-parsed fields
+        extracted = ocr_data.get("extracted", {}) if ocr_data else {}
+        amount = extracted.get("amount")
+        vendor = extracted.get("vendor")
+        date = extracted.get("date")
+        gst = (extracted.get("cgst", 0) or 0) + (extracted.get("sgst", 0) or 0) + (extracted.get("igst", 0) or 0)
+        if gst == 0:
+            gst = None
+        payment_method = extracted.get("payment_method", "")
+
+        # AI categorization using real OCR text
+        ai_result = _ai_categorize_receipt(raw_text, caption, extracted)
+        category = ai_result.get("category", "other")
+        description = ai_result.get("description") or caption or f"Receipt from {vendor or 'unknown'}"
+
+        if not amount and ai_result.get("amount"):
+            amount = ai_result["amount"]
+        if not vendor and ai_result.get("vendor"):
+            vendor = ai_result["vendor"]
+
+        cat_labels = {
+            "flight": "Flight", "hotel": "Hotel", "food": "Food & Meals",
+            "transport": "Local Transport", "visa": "Visa / Docs",
+            "communication": "Communication", "other": "Other",
+        }
+        confident_categories = {"flight", "hotel", "food", "transport", "visa", "communication"}
+
+        # Build response
+        lines = ["*Receipt Scanned*\n"]
+        if amount:
+            lines.append(f"*Amount:* Rs. {float(amount):,.2f}")
+        if vendor:
+            lines.append(f"*Vendor:* {vendor}")
+        if date:
+            lines.append(f"*Date:* {date}")
+        if gst:
+            lines.append(f"*GST:* Rs. {float(gst):,.2f}")
+        if payment_method:
+            lines.append(f"*Payment:* {payment_method}")
+        if description:
+            lines.append(f"*Description:* {description}")
+
+        # Auto-save if confident
+        phone_key = f"cliq_{user.get('email', '')}"
+        if category in confident_categories and amount:
+            lines.append(f"\n*Category:* {cat_labels.get(category, category)} (auto-detected)")
+            saved = _save_expense(user["id"], category, description, amount, vendor or "", date or "")
+            lines.append("")
+            if saved:
+                lines.append("Expense saved to your account.")
+            else:
+                lines.append("Could not save. Please submit on the app.")
+        elif amount:
+            # Ask for category
+            _pending_expenses[phone_key] = {
+                "amount": amount, "vendor": vendor or "", "date": date or "",
+                "description": description, "user_id": user["id"],
+            }
+            lines.append("\nSelect the category:")
+            lines.append("\n1 - Flight\n2 - Hotel\n3 - Food & Meals\n4 - Local Transport\n5 - Visa / Docs\n6 - Communication\n7 - Other")
+        else:
+            lines.append("\nCould not extract amount. Type: expense 500 description")
+
+        return "\n".join(lines)
+
+    except Exception as exc:
+        logger.exception("[Cliq Bot] Receipt processing failed: %s", exc)
+        return "Error processing receipt. Please try again."
+
+
+def _find_user_by_email(email: str) -> dict | None:
+    """Look up user by email address."""
+    if not email:
+        return None
+    try:
+        db = get_db()
+        user = db.execute("SELECT * FROM users WHERE email = ?", (email.lower().strip(),)).fetchone()
+        db.close()
+        return dict(user) if user else None
+    except Exception:
+        return None
+
+
+def _find_user_by_name(name: str) -> dict | None:
+    """Look up user by full name (fallback)."""
+    if not name:
+        return None
+    try:
+        db = get_db()
+        user = db.execute("SELECT * FROM users WHERE full_name = ? OR name = ?", (name, name)).fetchone()
+        db.close()
+        return dict(user) if user else None
+    except Exception:
+        return None
+
+
+@cliq_bot_bp.route("/bot", methods=["POST"])
+def bot_handler():
+    """POST /api/cliq/bot — handle messages from Zoho Cliq bot."""
+    # Cliq sends data as form-encoded OR JSON depending on invokeurl config
+    data = request.get_json(silent=True)
+    if not data:
+        data = request.form.to_dict()
+    if not data:
+        # Try raw body
+        try:
+            import json
+            data = json.loads(request.data.decode('utf-8'))
+        except Exception:
+            data = {}
+
+    message = (data.get("message") or "").strip()
+    user_name = data.get("user_name", "")
+    user_email = data.get("user_email", "")
+    chat_id = data.get("chat_id", "")
+    file_url = data.get("file_url", "")
+    file_name = data.get("file_name", "")
+    file_type = data.get("file_type", "")
+
+    logger.info("[Cliq Bot] Raw data: %s", dict(data))
+    logger.info("[Cliq Bot] Message from %s (%s): '%s', file=%s", user_name, user_email, message[:80], bool(file_url))
+
+    # Handle file/image attachments (receipt scanning)
+    if file_url and ("image" in file_type.lower() or file_name.lower().endswith(('.jpg', '.jpeg', '.png', '.pdf'))):
+        user = _find_user_by_email(user_email) or _find_user_by_name(user_name)
+        if not user:
+            return jsonify({"text": "Your account is not linked. Please contact your admin to scan receipts."})
+        reply = _process_receipt(file_url, user, message)
+        buttons = [{"text": "Submit Expense"}, {"text": "My Trips"}, {"text": "Expenses"}, {"text": "Help"}]
+        return jsonify({"text": reply, "suggestions": buttons})
+
+    if not message:
+        return jsonify({
+            "text": "Send me a message or type *help* to see what I can do.",
+            "suggestions": [
+                {"text": "My Trips"}, {"text": "Approvals"}, {"text": "Expenses"},
+                {"text": "Meetings"}, {"text": "Help"}
+            ]
+        })
+
+    # Find user in our DB
+    user = _find_user_by_email(user_email) or _find_user_by_name(user_name)
+
+    try:
+        phone_key = f"cliq_{user_email or user_name}"
+        reply = _process_cliq_message(message, user, phone_key)
+
+        # Build response with contextual buttons
+        response = {"text": reply}
+        buttons = _get_context_buttons(message, user)
+        if buttons:
+            response["suggestions"] = buttons
+
+        return jsonify(response)
+
+    except Exception as e:
+        logger.exception("[Cliq Bot] Error processing message")
+        return jsonify({"text": "Something went wrong. Please try again."})
+
+
+def _get_context_buttons(message: str, user: dict | None) -> list:
+    """Return contextual quick-reply buttons based on the message."""
+    text = message.strip().lower()
+
+    # Greetings / help → show main menu
+    if text in ("hi", "hello", "hey", "help", "menu", "start", "hii", "?"):
+        buttons = [
+            {"text": "My Trips"}, {"text": "Approvals"}, {"text": "Expenses"},
+            {"text": "Meetings"}, {"text": "Weather Mumbai"}, {"text": "Help"},
+        ]
+        if user and user.get("role") in ("admin", "manager"):
+            buttons.insert(1, {"text": "Pending Approvals"})
+        return buttons
+
+    # After trips → offer related actions
+    if text in ("1", "trips", "my trips", "2", "status", "trip status"):
+        return [
+            {"text": "Plan New Trip"}, {"text": "Approvals"}, {"text": "Expenses"}, {"text": "Help"},
+        ]
+
+    # After approvals
+    if text in ("3", "approvals", "pending", "pending approvals"):
+        return [
+            {"text": "My Trips"}, {"text": "Expenses"}, {"text": "Meetings"}, {"text": "Help"},
+        ]
+
+    # After expenses
+    if text in ("4", "expenses", "expense"):
+        return [
+            {"text": "Upload Receipt"}, {"text": "Start Expense"}, {"text": "My Trips"}, {"text": "Help"},
+        ]
+
+    # After add expense prompt
+    if "add" in text and "expense" in text or "submit" in text and "expense" in text or text in ("submit expense", "add expense", "upload receipt"):
+        return [
+            {"text": "Start Expense"}, {"text": "My Trips"}, {"text": "Help"},
+        ]
+
+    # After meetings
+    if text in ("5", "meetings", "meeting"):
+        return [
+            {"text": "My Trips"}, {"text": "Expenses"}, {"text": "Weather Mumbai"}, {"text": "Help"},
+        ]
+
+    # After weather
+    if text.startswith("weather") or text.startswith("6"):
+        return [
+            {"text": "Weather Delhi"}, {"text": "Weather Bangalore"}, {"text": "My Trips"}, {"text": "Help"},
+        ]
+
+    # Expense category selection
+    if text in ("upload receipt",):
+        return [
+            {"text": "Expense 500 Uber cab"}, {"text": "Expense 1200 Hotel stay"}, {"text": "Expense 350 Lunch"}, {"text": "Help"},
+        ]
+
+    # After plan trip
+    if "plan" in text and "trip" in text:
+        return [
+            {"text": "My Trips"}, {"text": "Expenses"}, {"text": "Meetings"}, {"text": "Help"},
+        ]
+
+    # Expense flow — show category buttons or confirm buttons
+    phone_key = f"cliq_{user.get('email', '') if user else ''}"
+    if phone_key in _expense_flow:
+        step = _expense_flow[phone_key].get("step")
+        if step == "category":
+            return CATEGORY_BUTTONS
+        if step == "confirm":
+            return [{"text": "Yes"}, {"text": "No"}, {"text": "Cancel"}]
+        if step == "amount":
+            return [{"text": "Cancel"}]
+        if step == "description":
+            return [{"text": "Cancel"}]
+
+    # Default — always show basic navigation
+    return [
+        {"text": "My Trips"}, {"text": "Expenses"}, {"text": "Submit Expense"}, {"text": "Help"},
+    ]
+
+
+def _process_cliq_message(body: str, user: dict | None, phone_key: str) -> str:
+    """Process a Cliq bot message — similar to WhatsApp but adapted for Cliq."""
+    from routes.whatsapp import (
+        HELP_TEXT, WELCOME_TEXT,
+        _get_user_trips, _get_pending_approvals, _get_expense_summary,
+        _get_upcoming_meetings, _get_weather, _handle_approve_reject,
+        _ai_chat, _handle_quick_expense,
+        _add_to_history, _get_history, _clear_history,
+        _pending_expenses, _categorize_text, _save_expense,
+    )
+
+    text = body.strip().lower()
+
+    # Greetings
+    greetings = ("hi", "hello", "hey", "start", "hii", "hiii", "yo", "sup")
+    if text in greetings or text.startswith("hi ") or text.startswith("hello "):
+        _clear_history(phone_key)
+        if user:
+            return f"Hello {user.get('full_name', 'there')}.\n\n" + HELP_TEXT
+        return WELCOME_TEXT + "\n\nNote: Your account is not linked. Please contact your admin."
+
+    if text in ("help", "menu", "?"):
+        return HELP_TEXT
+
+    if text in ("clear", "reset", "new", "new chat"):
+        _clear_history(phone_key)
+        _expense_flow.pop(phone_key, None)
+        return "Conversation cleared. How can I help you?"
+
+    # Cancel expense flow
+    if text == "cancel" and phone_key in _expense_flow:
+        _expense_flow.pop(phone_key)
+        return "Expense submission cancelled."
+
+    if not user:
+        return (
+            "*Account Not Linked*\n\n"
+            "Your Cliq account is not connected to TravelSync Pro. "
+            "Please ask your admin to add your email in the system."
+        )
+
+    # Check pending expense category
+    if phone_key in _pending_expenses:
+        cat_map = {"1": "flight", "2": "hotel", "3": "food", "4": "transport", "5": "visa", "6": "communication", "7": "other"}
+        if text in cat_map:
+            pending = _pending_expenses.pop(phone_key)
+            category = cat_map[text]
+            cat_labels = {"flight": "Flight", "hotel": "Hotel", "food": "Food & Meals", "transport": "Local Transport", "visa": "Visa / Docs", "communication": "Communication", "other": "Other"}
+            saved = _save_expense(pending["user_id"], category, pending.get("description", ""), pending.get("amount"), pending.get("vendor", ""), pending.get("date", ""))
+            if saved:
+                return f"*Expense Saved*\n\n*Amount:* Rs. {float(pending.get('amount', 0)):,.2f}\n*Category:* {cat_labels.get(category, category)}\n\nExpense added to your TravelSync account."
+            return "Could not save. Please try on the web app."
+        elif text in ("cancel", "skip"):
+            _pending_expenses.pop(phone_key)
+            return "Expense cancelled."
+
+    # Guided expense submission flow
+    if phone_key in _expense_flow:
+        return _handle_expense_flow(phone_key, text, body, user)
+
+    # Start guided expense flow — catch all expense-related intents
+    expense_triggers = (
+        "submit expense", "add expense", "new expense", "upload receipt",
+        "log expense", "i want to add expense", "add an expense",
+        "submit receipt", "scan receipt", "expense entry", "record expense",
+    )
+    if text in expense_triggers or (("expense" in text or "receipt" in text) and ("add" in text or "submit" in text or "log" in text or "upload" in text or "scan" in text or "want" in text)):
+        return (
+            "*Add New Expense*\n\n"
+            "Choose how you'd like to add:\n\n"
+            "*Option 1:* Upload a receipt image — I'll auto-extract amount, vendor, category and save it.\n\n"
+            "*Option 2:* Type the details directly:\n"
+            "Example: expense 500 Uber cab to airport\n\n"
+            "*Option 3:* Guided step-by-step — type *start expense*"
+        )
+
+    # Start step-by-step guided flow
+    if text == "start expense":
+        _expense_flow[phone_key] = {"step": "amount", "user_id": user["id"]}
+        return "Enter the expense amount in Rs:\n\nExample: 500"
+
+    # Commands
+    if text in ("1", "trips", "my trips"):
+        return _get_user_trips(user["id"])
+
+    if text in ("2", "status", "trip status"):
+        return _get_user_trips(user["id"], limit=3) + "\n\nReply with a trip ID for details."
+
+    if text in ("3", "approvals", "pending"):
+        return _get_pending_approvals(user["id"], user.get("role", "employee"))
+
+    if text in ("4", "expenses", "expense"):
+        return _get_expense_summary(user["id"])
+
+    if text in ("5", "meetings", "meeting"):
+        return _get_upcoming_meetings(user["id"])
+
+    if text.startswith("6") or text.startswith("weather"):
+        city = text.replace("6", "").replace("weather", "").strip()
+        if not city:
+            return "Please specify a city. Example: weather Mumbai"
+        return _get_weather(city)
+
+    if text in ("7", "sos", "emergency"):
+        return (
+            "*Emergency Contacts*\n\n"
+            "112 - General Emergency\n"
+            "108 - Ambulance\n"
+            "100 - Police\n"
+            "101 - Fire\n\n"
+            "To send an SOS alert, use the TravelSync Pro app."
+        )
+
+    # Quick expense
+    if text.startswith("expense ") or text.startswith("exp "):
+        return _handle_quick_expense(user, body, phone_key)
+
+    # Approve / reject
+    if text.startswith("approve ") or text.startswith("reject "):
+        parts = text.split(maxsplit=1)
+        cmd = parts[0]
+        rid = parts[1].strip().upper() if len(parts) > 1 else ""
+        if not rid:
+            return f"Usage: {cmd} TR-2026-XXXXXXX"
+        return _handle_approve_reject(user, cmd, rid)
+
+    # AI chat with memory
+    _add_to_history(phone_key, "user", body)
+    reply = _ai_chat(user, body, phone_key)
+    _add_to_history(phone_key, "assistant", reply)
+    return reply
+
+
+def _handle_expense_flow(phone_key: str, text: str, raw: str, user: dict) -> str:
+    """Handle the step-by-step expense submission flow."""
+    import time
+    from routes.whatsapp import _save_expense, _categorize_text
+
+    flow = _expense_flow[phone_key]
+    step = flow.get("step")
+
+    if text == "cancel":
+        _expense_flow.pop(phone_key, None)
+        return "Expense submission cancelled."
+
+    # Step 1: Amount
+    if step == "amount":
+        cleaned = "".join(c for c in raw.strip() if c.isdigit() or c == ".")
+        try:
+            amount = float(cleaned)
+            if amount <= 0 or amount > 1000000:
+                return "Please enter a valid amount between 1 and 10,00,000.\n\nExample: 500"
+            flow["amount"] = amount
+            flow["step"] = "description"
+            return f"Amount: *Rs. {amount:,.2f}*\n\nNow describe the expense:\n\nExample: Uber cab to airport"
+        except (ValueError, TypeError):
+            return "Invalid amount. Please enter a number.\n\nExample: 500"
+
+    # Step 2: Description
+    if step == "description":
+        if len(raw.strip()) < 2:
+            return "Please enter a brief description.\n\nExample: Uber cab to airport"
+        flow["description"] = raw.strip()
+        # Auto-detect category
+        auto_cat = _categorize_text(raw.strip())
+        if auto_cat and auto_cat != "other":
+            flow["category"] = auto_cat
+            flow["step"] = "confirm"
+            cat_labels = {"flight": "Flight", "hotel": "Hotel", "food": "Food & Meals", "transport": "Local Transport", "visa": "Visa / Docs", "communication": "Communication"}
+            return (
+                f"*Expense Summary*\n\n"
+                f"*Amount:* Rs. {flow['amount']:,.2f}\n"
+                f"*Description:* {flow['description']}\n"
+                f"*Category:* {cat_labels.get(auto_cat, auto_cat)} (auto-detected)\n"
+                f"*Date:* {time.strftime('%Y-%m-%d')}\n\n"
+                f"Confirm and save?"
+            )
+        else:
+            flow["step"] = "category"
+            return (
+                f"*Amount:* Rs. {flow['amount']:,.2f}\n"
+                f"*Description:* {flow['description']}\n\n"
+                f"Select the category:"
+            )
+
+    # Step 3: Category (manual selection)
+    if step == "category":
+        cat = CATEGORY_MAP.get(text.lower())
+        if not cat:
+            return "Please select a valid category:\n\nFlight | Hotel | Food & Meals | Local Transport | Visa / Docs | Communication | Other"
+        flow["category"] = cat
+        flow["step"] = "confirm"
+        cat_labels = {"flight": "Flight", "hotel": "Hotel", "food": "Food & Meals", "transport": "Local Transport", "visa": "Visa / Docs", "communication": "Communication", "other": "Other"}
+        return (
+            f"*Expense Summary*\n\n"
+            f"*Amount:* Rs. {flow['amount']:,.2f}\n"
+            f"*Description:* {flow['description']}\n"
+            f"*Category:* {cat_labels.get(cat, cat)}\n"
+            f"*Date:* {time.strftime('%Y-%m-%d')}\n\n"
+            f"Confirm and save?"
+        )
+
+    # Step 4: Confirm
+    if step == "confirm":
+        if text in ("yes", "confirm", "save", "ok", "y", "submit"):
+            saved = _save_expense(
+                flow["user_id"], flow["category"], flow["description"],
+                flow["amount"], "", time.strftime("%Y-%m-%d"),
+            )
+            _expense_flow.pop(phone_key, None)
+            if saved:
+                return (
+                    f"*Expense Saved*\n\n"
+                    f"*Amount:* Rs. {flow['amount']:,.2f}\n"
+                    f"*Description:* {flow['description']}\n\n"
+                    f"Expense has been added to your TravelSync account."
+                )
+            return "Failed to save expense. Please try on the web app."
+        elif text in ("no", "cancel", "edit", "n"):
+            _expense_flow.pop(phone_key, None)
+            return "Expense cancelled. Type *submit expense* to start again."
+        else:
+            return "Reply *yes* to save or *no* to cancel."
+
+    # Unknown step — reset
+    _expense_flow.pop(phone_key, None)
+    return "Something went wrong. Type *submit expense* to start again."

@@ -98,6 +98,46 @@ HOTEL_DATA = {
         {"name": "Novotel Goa Resort", "rating": 4.0, "area": "Candolim", "price_range": (6000, 15000)},
         {"name": "Aloft North Goa", "rating": 4.0, "area": "Candolim", "price_range": (5000, 12000)},
     ],
+    "PNQ": [
+        {"name": "JW Marriott Pune", "rating": 5.0, "area": "Senapati Bapat Road", "price_range": (8000, 22000)},
+        {"name": "Hyatt Regency Pune", "rating": 5.0, "area": "Viman Nagar", "price_range": (7000, 18000)},
+        {"name": "The Westin Pune", "rating": 5.0, "area": "Koregaon Park", "price_range": (8000, 20000)},
+        {"name": "Novotel Pune Nagar Road", "rating": 4.0, "area": "Nagar Road", "price_range": (5000, 12000)},
+        {"name": "Lemon Tree Hotel Pune", "rating": 4.0, "area": "Wakad", "price_range": (3500, 8000)},
+        {"name": "Ibis Pune Hinjewadi", "rating": 3.5, "area": "Hinjewadi", "price_range": (2800, 5500)},
+    ],
+    "JAI": [
+        {"name": "Rambagh Palace", "rating": 5.0, "area": "Bhawani Singh Road", "price_range": (20000, 60000)},
+        {"name": "ITC Rajputana", "rating": 5.0, "area": "Palace Road", "price_range": (8000, 22000)},
+        {"name": "Fairmont Jaipur", "rating": 5.0, "area": "Kukas", "price_range": (10000, 28000)},
+        {"name": "Novotel Jaipur Convention Centre", "rating": 4.0, "area": "Kukas", "price_range": (5000, 12000)},
+        {"name": "Lemon Tree Hotel Jaipur", "rating": 4.0, "area": "Malviya Nagar", "price_range": (3500, 8000)},
+    ],
+    "CCU": [
+        {"name": "ITC Royal Bengal", "rating": 5.0, "area": "New Town", "price_range": (9000, 25000)},
+        {"name": "The Oberoi Grand", "rating": 5.0, "area": "Jawaharlal Nehru Road", "price_range": (10000, 28000)},
+        {"name": "Taj Bengal", "rating": 5.0, "area": "Alipore", "price_range": (8000, 22000)},
+        {"name": "Novotel Kolkata Hotel & Residences", "rating": 4.0, "area": "New Town", "price_range": (5000, 12000)},
+        {"name": "Ibis Kolkata Rajarhat", "rating": 3.5, "area": "Rajarhat", "price_range": (3000, 6000)},
+    ],
+    "COK": [
+        {"name": "Taj Malabar Resort & Spa", "rating": 5.0, "area": "Willingdon Island", "price_range": (8000, 22000)},
+        {"name": "Le Meridien Kochi", "rating": 5.0, "area": "Maradu", "price_range": (7000, 18000)},
+        {"name": "Novotel Kochi Infopark", "rating": 4.0, "area": "Infopark", "price_range": (5000, 11000)},
+        {"name": "Lemon Tree Hotel Kochi", "rating": 4.0, "area": "Edapally", "price_range": (3500, 7500)},
+    ],
+    "AMD": [
+        {"name": "Hyatt Regency Ahmedabad", "rating": 5.0, "area": "Ashram Road", "price_range": (7000, 18000)},
+        {"name": "Courtyard by Marriott Ahmedabad", "rating": 4.0, "area": "SG Highway", "price_range": (5000, 12000)},
+        {"name": "Novotel Ahmedabad", "rating": 4.0, "area": "SG Highway", "price_range": (4500, 10000)},
+        {"name": "Lemon Tree Hotel Ahmedabad", "rating": 4.0, "area": "Prahlad Nagar", "price_range": (3500, 7500)},
+    ],
+    "LKO": [
+        {"name": "Renaissance Lucknow Hotel", "rating": 5.0, "area": "Gomti Nagar", "price_range": (6000, 16000)},
+        {"name": "Taj Hotel & Convention Centre Lucknow", "rating": 5.0, "area": "Vipin Khand", "price_range": (7000, 18000)},
+        {"name": "Lemon Tree Hotel Lucknow", "rating": 4.0, "area": "Sushant Golf City", "price_range": (3500, 7500)},
+        {"name": "Ibis Lucknow", "rating": 3.5, "area": "Gomti Nagar", "price_range": (2800, 5500)},
+    ],
 }
 
 PG_DATA = {
@@ -121,6 +161,16 @@ PG_DATA = {
     "HYD": [
         {"name": "Stanza Living - HITEC City", "type": "Managed PG", "rent_monthly": 14000, "area": "HITEC City", "platform": "Stanza Living", "amenities": ["WiFi", "AC", "Meals"], "contact": "+91-1800-102-8282"},
         {"name": "NestAway Gachibowli", "type": "Serviced Apartment", "rent_monthly": 28000, "area": "Gachibowli", "platform": "NestAway", "amenities": ["WiFi", "Fully Furnished", "AC"], "contact": "+91-80-46110000"},
+    ],
+    "PNQ": [
+        {"name": "Stanza Living - Hinjewadi", "type": "Managed PG", "rent_monthly": 13000, "area": "Hinjewadi Phase 1", "platform": "Stanza Living", "amenities": ["WiFi", "AC", "Meals", "Laundry"], "contact": "+91-1800-102-8282"},
+        {"name": "NestAway Koregaon Park", "type": "Serviced Apartment", "rent_monthly": 30000, "area": "Koregaon Park", "platform": "NestAway", "amenities": ["WiFi", "AC", "Fully Furnished", "Housekeeping"], "contact": "+91-80-46110000"},
+        {"name": "OYO Life - Baner", "type": "Managed PG", "rent_monthly": 11000, "area": "Baner", "platform": "OYO Life", "amenities": ["WiFi", "AC", "Meals"], "contact": "+91-9313931393"},
+        {"name": "CoHo Wakad", "type": "Coliving", "rent_monthly": 16000, "area": "Wakad", "platform": "CoHo", "amenities": ["WiFi", "Gym", "Community Kitchen", "Events"], "contact": "+91-7406000600"},
+    ],
+    "JAI": [
+        {"name": "Stanza Living - Malviya Nagar", "type": "Managed PG", "rent_monthly": 12000, "area": "Malviya Nagar", "platform": "Stanza Living", "amenities": ["WiFi", "AC", "Meals"], "contact": "+91-1800-102-8282"},
+        {"name": "OYO Life - C-Scheme", "type": "Managed PG", "rent_monthly": 10000, "area": "C-Scheme", "platform": "OYO Life", "amenities": ["WiFi", "AC", "Meals"], "contact": "+91-9313931393"},
     ],
 }
 
@@ -453,9 +503,10 @@ class AmadeusService:
     def _mock_hotels(self, city_code: str, budget_max: int = None) -> list:
         """Curated mock hotel data with real hotel names."""
         city_hotels = HOTEL_DATA.get(city_code, [
-            {"name": "Hotel Grand", "rating": 4.0, "area": "City Centre", "price_range": (3000, 8000)},
-            {"name": "Business Inn", "rating": 3.5, "area": "Business District", "price_range": (2000, 5000)},
-            {"name": "City Plaza Hotel", "rating": 4.5, "area": "Main Market", "price_range": (4000, 10000)},
+            {"name": f"Lemon Tree Hotel {city_code}", "rating": 4.0, "area": "City Centre", "price_range": (3500, 8000)},
+            {"name": f"Ibis {city_code}", "rating": 3.5, "area": "Business District", "price_range": (2500, 5500)},
+            {"name": f"Courtyard by Marriott {city_code}", "rating": 4.5, "area": "Commercial Zone", "price_range": (5000, 12000)},
+            {"name": f"Novotel {city_code}", "rating": 4.0, "area": "City Centre", "price_range": (4500, 10000)},
         ])
         result = []
         for h in city_hotels:
@@ -470,7 +521,6 @@ class AmadeusService:
                 "price": price,
                 "currency": "INR",
                 "amenities": ["WiFi", "Restaurant", "AC", "Room Service"],
-                "booking_link": f"https://www.makemytrip.com/hotels/hotel-listing/?checkin=checkin_date&checkout=checkout_date&city={city_code}",
                 "source": "fallback",
             })
         return result

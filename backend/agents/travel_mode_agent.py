@@ -1,6 +1,6 @@
 """
 TravelSync Pro — Travel Mode Agent
-- Real flight search via Amadeus API
+- Real flight search via AviationStack API (falls back to curated data)
 - Distance-based mode recommendation (cab/bus/train/flight)
 - Team arrival synchronization for multi-origin groups
 - IRCTC, RedBus, Ola, Uber deep links
@@ -10,9 +10,9 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from datetime import datetime, timedelta
-from services.amadeus_service import amadeus
 from services.maps_service import maps
 from services.gemini_service import gemini
+from services.flights_service import flights as flights_svc, get_airport_code
 
 
 def recommend_travel_mode(trip_details: dict, model=None) -> dict:
@@ -49,24 +49,28 @@ def recommend_travel_mode(trip_details: dict, model=None) -> dict:
     }
 
     # ── Flights ──────────────────────────────────────────────
-    if distance_km > 400 or mode["primary"] == "flight":
-        origin_code = amadeus.get_airport_code(origin)
-        dest_code = amadeus.get_airport_code(destination)
-        flight_data = amadeus.search_flights(
+    if distance_km > 300 or mode["primary"] == "flight":
+        origin_code = get_airport_code(origin)
+        dest_code = get_airport_code(destination)
+        flight_data = flights_svc.search_flights(
             origin_code, dest_code, departure_date,
             adults=num_travelers, max_results=6
         )
-        result["modes"]["flight"] = {
-            "available": True,
-            "options": flight_data.get("flights", []),
-            "booking_platforms": [
-                {"name": "MakeMyTrip", "url": f"https://www.makemytrip.com/flights/results?from={origin_code}&to={dest_code}&date={departure_date}&adults={num_travelers}"},
-                {"name": "Cleartrip", "url": f"https://www.cleartrip.com/flights/results?from={origin_code}&to={dest_code}&date={departure_date}&adults={num_travelers}"},
-                {"name": "Goibibo", "url": f"https://www.goibibo.com/flights/"},
-                {"name": "EaseMyTrip", "url": "https://flight.easemytrip.com/"},
-            ],
-            "source": flight_data.get("source", "fallback"),
-        }
+        flight_options = flight_data.get("flights", [])
+        # Only show flights if the route actually has them
+        if flight_options:
+            search_q = f"{origin}+to+{destination}+flights".replace(' ', '+')
+            result["modes"]["flight"] = {
+                "available": True,
+                "options": flight_options,
+                "booking_platforms": [
+                    {"name": "Google Flights", "url": f"https://www.google.com/search?q={search_q}"},
+                ],
+                "source": flight_data.get("source", "curated"),
+            }
+        else:
+            reason = flight_data.get("reason", "No flights available on this route")
+            result["modes"]["flight"] = {"available": False, "reason": reason, "options": []}
 
     # ── Trains ───────────────────────────────────────────────
     if 100 < distance_km < 1500:
@@ -372,6 +376,75 @@ def _estimate_cab_fare(distance_km: float, region: str) -> str:
     if region == "americas":
         return f"${int(distance_km * 1.1)}-${int(distance_km * 1.8)}"
     return f"${int(distance_km * 1.0)}-${int(distance_km * 1.6)}"
+
+
+# ── Carbon Footprint Calculations ─────────────────────────────────────────────
+
+# kg CO₂ per km per passenger — based on DEFRA/ICAO 2023 emission factors
+_CO2_FACTORS = {
+    "flight_short":  0.255,   # <1500 km (includes radiative forcing)
+    "flight_long":   0.195,   # >=1500 km
+    "train":         0.041,
+    "bus":           0.089,
+    "cab":           0.170,   # petrol / CNG average
+    "ev_cab":        0.068,   # electric cab estimate
+}
+
+# Greener alternatives map
+_GREENER_ALTS = {
+    "flight_short": "train",
+    "flight_long": None,       # no practical alternative for >1500 km intercontinental
+    "cab":  "bus",
+    "bus":  "train",
+}
+
+
+def calculate_carbon(distance_km: float, mode: str, num_travelers: int = 1) -> dict:
+    """
+    Calculate CO₂ emissions for a trip segment.
+
+    Returns:
+        {
+          co2_kg: float,        # total CO₂ for all travelers
+          co2_per_person: float,
+          mode: str,
+          distance_km: float,
+          greener_alt: str | None,  # suggested greener mode
+          greener_saving_kg: float | None,
+        }
+    """
+    n = max(1, int(num_travelers))
+    d = max(0.0, float(distance_km))
+
+    if mode == "flight":
+        factor_key = "flight_long" if d >= 1500 else "flight_short"
+    elif mode in _CO2_FACTORS:
+        factor_key = mode
+    else:
+        factor_key = "cab"
+
+    factor = _CO2_FACTORS[factor_key]
+    co2_per_person = round(d * factor, 2)
+    co2_total = round(co2_per_person * n, 2)
+
+    # Greener alternative savings
+    alt_mode = _GREENER_ALTS.get(factor_key)
+    greener_saving = None
+    if alt_mode and alt_mode in _CO2_FACTORS:
+        alt_co2 = round(d * _CO2_FACTORS[alt_mode] * n, 2)
+        greener_saving = round(co2_total - alt_co2, 2)
+
+    return {
+        "co2_kg": co2_total,
+        "co2_per_person": co2_per_person,
+        "mode": mode,
+        "distance_km": round(d, 1),
+        "factor_used": factor,
+        "num_travelers": n,
+        "greener_alt": alt_mode,
+        "greener_saving_kg": greener_saving,
+        "trees_equivalent": round(co2_total / 21.77, 2),  # avg tree absorbs 21.77 kg CO₂/year
+    }
 
 
 def _booking_tip(mode: str, origin: str, dest: str, date: str) -> str:

@@ -2,10 +2,13 @@
 TravelSync Pro — Accommodation Routes
 Hotel search and long-stay PG/serviced options.
 """
+import logging
 from datetime import datetime
 from flask import Blueprint, request, jsonify
 from auth import get_current_user
 from agents.hotel_agent import search_hotels, search_pg_options
+
+logger = logging.getLogger(__name__)
 
 accommodation_bp = Blueprint("accommodation", __name__, url_prefix="/api/accommodation")
 
@@ -63,7 +66,8 @@ def search():
         result = search_hotels(payload)
         return jsonify(result), 200
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        logger.exception("[Accommodation] search failed for %s", destination)
+        return jsonify({"success": False, "error": "Hotel search failed"}), 500
 
 
 @accommodation_bp.route("/pg-options", methods=["POST"])
@@ -93,4 +97,5 @@ def pg_options():
             "source": options[0].get("source", "fallback") if options else "fallback",
         }), 200
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        logger.exception("[Accommodation] pg_options failed for %s", destination)
+        return jsonify({"success": False, "error": "PG search failed"}), 500

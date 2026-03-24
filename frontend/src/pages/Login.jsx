@@ -1,8 +1,8 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Eye, EyeOff, Layers, Lock, Play, Star, User, Users } from 'lucide-react'
+import { Eye, EyeOff, Layers, Lock, Mail, Play, Star, User, Users, ArrowLeft, Building } from 'lucide-react'
 import toast from 'react-hot-toast'
-import { login } from '../api/auth'
+import { login, register, verifyEmail, forgotPassword, resetPassword } from '../api/auth'
 import useStore from '../store/useStore'
 
 const demoUsers = [
@@ -30,41 +30,172 @@ const roleIcons = {
   employee: User,
 }
 
+// Input component — defined outside Login to prevent re-creation on every render
+function FormInput({ id, label, icon: Icon, type = 'text', value, onChange, placeholder, error, autoComplete, autoFocus, showToggle, showPwState, setShowPwState }) {
+  return (
+    <div className="mb-3">
+      <label htmlFor={id} className="mb-[5px] block text-[0.73rem] font-semibold text-gray-700">
+        {label || id.replace(/([A-Z])/g, ' $1').replace(/^./, s => s.toUpperCase())}
+      </label>
+      <div className={`relative flex items-center rounded-lg border-[1.5px] ${error ? 'border-red-300' : 'border-gray-200'} bg-gray-50 focus-within:border-blue-600 focus-within:bg-white focus-within:shadow-[0_0_0_3px_rgba(26,86,219,0.1)]`}>
+        <Icon size={14} className="pointer-events-none absolute left-3 text-gray-400" />
+        <input
+          id={id}
+          type={showToggle ? (showPwState ? 'text' : 'password') : type}
+          value={value}
+          onChange={onChange}
+          placeholder={placeholder}
+          autoComplete={autoComplete}
+          autoFocus={autoFocus}
+          className="h-[41px] w-full rounded-lg border-0 bg-transparent pl-[38px] pr-10 text-[0.83rem] text-gray-900 outline-none placeholder:text-gray-400"
+        />
+        {showToggle && (
+          <button type="button" onClick={() => setShowPwState(v => !v)} className="absolute right-[11px] p-1 text-gray-400 transition-colors hover:text-gray-600">
+            {showPwState ? <EyeOff size={14} /> : <Eye size={14} />}
+          </button>
+        )}
+      </div>
+      {error && <p className="mt-1 text-[0.72rem] text-red-600">{error}</p>}
+    </div>
+  )
+}
+
 export default function Login() {
   const navigate = useNavigate()
   const { setUser } = useStore()
 
+  // View: 'login' | 'register' | 'verify' | 'forgot' | 'reset'
+  const [view, setView] = useState('login')
+  const [verifyCode, setVerifyCode] = useState('')
+
+  // Login form
   const [form, setForm] = useState({ username: '', password: '' })
   const [showPw, setShowPw] = useState(false)
   const [rememberMe, setRememberMe] = useState(false)
   const [loading, setLoading] = useState(false)
   const [errors, setErrors] = useState({})
 
-  const validate = () => {
-    const nextErrors = {}
-    if (!form.username.trim()) nextErrors.username = 'Username is required'
-    if (!form.password) nextErrors.password = 'Password is required'
-    return nextErrors
-  }
+  // Register form
+  const [regForm, setRegForm] = useState({ fullName: '', email: '', password: '', department: '' })
+  const [regShowPw, setRegShowPw] = useState(false)
 
-  const handleSubmit = async (event) => {
+  // Forgot password
+  const [forgotEmail, setForgotEmail] = useState('')
+
+  // Reset password
+  const [resetForm, setResetForm] = useState({ code: '', newPassword: '' })
+
+  const handleLogin = async (event) => {
     event.preventDefault()
-    const nextErrors = validate()
-    if (Object.keys(nextErrors).length) {
-      setErrors(nextErrors)
-      return
-    }
+    const nextErrors = {}
+    if (!form.username.trim()) nextErrors.username = 'Email or username is required'
+    if (!form.password) nextErrors.password = 'Password is required'
+    if (Object.keys(nextErrors).length) { setErrors(nextErrors); return }
 
     setErrors({})
     setLoading(true)
-
     try {
       const data = await login(form.username.trim(), form.password)
-      setUser(data.user || { username: form.username, name: form.username, role: 'employee' })
+      if (data.needs_verification) {
+        toast('Please verify your email first', { icon: '📧' })
+        setView('verify')
+        return
+      }
+      const u = data.user || { id: 0, username: form.username, name: form.username, role: 'employee' }
+      if (!u.name && u.full_name) u.name = u.full_name
+      setUser(u)
       toast.success(`Welcome back, ${data.user?.name || form.username}!`)
       navigate('/dashboard', { replace: true })
     } catch (error) {
-      const message = error.response?.data?.error || error.response?.data?.message || 'Invalid credentials'
+      const resp = error.response?.data
+      if (resp?.needs_verification) {
+        toast('Please verify your email first', { icon: '📧' })
+        setView('verify')
+        return
+      }
+      const message = resp?.error || 'Invalid credentials'
+      toast.error(message)
+      setErrors({ form: message })
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleRegister = async (event) => {
+    event.preventDefault()
+    const nextErrors = {}
+    if (!regForm.fullName.trim()) nextErrors.fullName = 'Full name is required'
+    if (!regForm.email.trim()) nextErrors.email = 'Email is required'
+    if (!regForm.email.includes('@')) nextErrors.email = 'Invalid email'
+    if (!regForm.password) nextErrors.password = 'Password is required'
+    if (regForm.password.length < 6) nextErrors.password = 'Min 6 characters'
+    if (Object.keys(nextErrors).length) { setErrors(nextErrors); return }
+
+    setErrors({})
+    setLoading(true)
+    try {
+      const data = await register(regForm.fullName.trim(), regForm.email.trim(), regForm.password, regForm.department.trim())
+      if (data.success && data.needs_verification) {
+        toast.success('Verification code sent to your email!')
+        setView('verify')
+      } else if (data.success && data.user) {
+        const u = data.user
+        if (!u.name && u.full_name) u.name = u.full_name
+        setUser(u)
+        toast.success(`Welcome, ${u.name}!`)
+        navigate('/dashboard', { replace: true })
+      } else {
+        toast.error(data.error || 'Registration failed')
+        setErrors({ form: data.error })
+      }
+    } catch (error) {
+      const message = error.response?.data?.error || 'Registration failed'
+      toast.error(message)
+      setErrors({ form: message })
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleForgotPassword = async (event) => {
+    event.preventDefault()
+    if (!forgotEmail.trim()) { setErrors({ email: 'Email is required' }); return }
+
+    setErrors({})
+    setLoading(true)
+    try {
+      await forgotPassword(forgotEmail.trim())
+      toast.success('Reset code sent to your email!')
+      setView('reset')
+    } catch (error) {
+      toast.error(error.response?.data?.error || 'Failed to send reset code')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleResetPassword = async (event) => {
+    event.preventDefault()
+    const nextErrors = {}
+    if (!resetForm.code.trim()) nextErrors.code = 'Reset code is required'
+    if (!resetForm.newPassword) nextErrors.newPassword = 'New password is required'
+    if (resetForm.newPassword.length < 6) nextErrors.newPassword = 'Min 6 characters'
+    if (Object.keys(nextErrors).length) { setErrors(nextErrors); return }
+
+    setErrors({})
+    setLoading(true)
+    try {
+      const data = await resetPassword(resetForm.code.trim(), resetForm.newPassword)
+      if (data.success) {
+        toast.success('Password reset! You can now sign in.')
+        setView('login')
+        setResetForm({ code: '', newPassword: '' })
+      } else {
+        toast.error(data.error || 'Reset failed')
+        setErrors({ form: data.error })
+      }
+    } catch (error) {
+      const message = error.response?.data?.error || 'Reset failed'
       toast.error(message)
       setErrors({ form: message })
     } finally {
@@ -75,16 +206,15 @@ export default function Login() {
   const fillDemo = (user) => {
     setForm({ username: user.username, password: user.password })
     setErrors({})
+    setView('login')
   }
 
-  const quickDemoFill = () => {
-    fillDemo(demoUsers[0])
-    toast.success('Demo credentials filled')
-  }
+  const switchView = (v) => { setView(v); setErrors({}) }
 
   return (
-    <div className="flex w-full min-h-screen items-start justify-center overflow-y-auto bg-[linear-gradient(135deg,#0f7a5a_0%,#0f6e9e_50%,#1a3fa8_100%)] p-0 sm:p-5 md:items-center">
-      <div className="flex h-auto w-[min(980px,97vw)] overflow-hidden rounded-none border border-white/10 bg-transparent shadow-[0_40px_90px_rgba(0,0,0,0.4),0_0_0_1px_rgba(255,255,255,0.1)] sm:rounded-[22px] md:h-[min(620px,94vh)]">
+    <div className="flex w-full min-h-screen items-start justify-center overflow-y-auto bg-gradient-to-br from-brand-dark via-navy-800 to-brand-dark p-0 sm:p-5 md:items-center">
+      <div className="flex h-auto w-[min(980px,97vw)] overflow-hidden rounded-none border border-white/10 bg-transparent shadow-[0_40px_90px_rgba(0,0,0,0.4)] sm:rounded-2xl md:h-[min(660px,94vh)]">
+        {/* Left artwork panel */}
         <section
           className="relative hidden flex-[1.15] overflow-hidden md:block"
           style={{
@@ -107,7 +237,6 @@ export default function Login() {
               `,
             }}
           />
-
           <div className="absolute right-[18%] top-[12%] h-[42px] w-[42px] rounded-full bg-[radial-gradient(circle_at_38%_38%,#fff8e1,#ffd54f)] shadow-[0_0_20px_6px_rgba(255,220,80,0.3),0_0_60px_20px_rgba(255,200,50,0.1)]" />
           <div className="absolute bottom-[28%] left-1/2 h-[60px] w-[200px] -translate-x-1/2 rounded-full bg-[radial-gradient(ellipse,rgba(255,140,50,.6)_0%,rgba(255,100,20,.3)_40%,transparent_70%)] blur-[8px]" />
 
@@ -116,7 +245,6 @@ export default function Login() {
             <line x1="0" y1="172" x2="520" y2="172" stroke="rgba(255,255,255,0.06)" strokeWidth="1" />
             <line x1="0" y1="182" x2="520" y2="182" stroke="rgba(255,255,255,0.04)" strokeWidth="1" />
             <line x1="0" y1="194" x2="520" y2="194" stroke="rgba(255,255,255,0.05)" strokeWidth="1" />
-
             <rect x="0" y="120" width="18" height="40" fill="#0a1628" />
             <rect x="20" y="105" width="22" height="55" fill="#0c1e3a" />
             <rect x="44" y="115" width="14" height="45" fill="#0a1628" />
@@ -148,9 +276,7 @@ export default function Login() {
 
           <div className="absolute left-[26px] right-[26px] top-[26px] z-10">
             <h2 className="font-heading text-[1.3rem] font-bold leading-[1.25] text-white">
-              Welcome Back,
-              <br />
-              Adventurer.
+              Welcome Back,<br />Adventurer.
             </h2>
             <p className="mt-1 text-[0.78rem] text-white/75">Your next business journey awaits.</p>
           </div>
@@ -162,10 +288,7 @@ export default function Login() {
             </p>
             <div className="mt-2.5 flex flex-wrap gap-1.5">
               {['Amadeus API', 'Gemini AI', 'OCR Receipts', 'Live Weather'].map((item) => (
-                <span
-                  key={item}
-                  className="rounded-full border border-white/20 bg-white/15 px-2.5 py-1 text-[0.68rem] font-semibold tracking-[0.03em] text-white"
-                >
+                <span key={item} className="rounded-full border border-white/20 bg-white/15 px-2.5 py-1 text-[0.68rem] font-semibold tracking-[0.03em] text-white">
                   {item}
                 </span>
               ))}
@@ -173,8 +296,10 @@ export default function Login() {
           </div>
         </section>
 
-        <section className="w-full overflow-y-auto bg-[#fff] p-6 sm:p-7 md:w-[380px] md:min-w-[380px] md:p-[34px_36px]">
-          <div className="mb-5 flex items-center gap-[10px]">
+        {/* Right form panel */}
+        <section className="w-full overflow-y-auto bg-[#fff] p-6 sm:p-7 md:w-[400px] md:min-w-[400px] md:p-[28px_36px]">
+          {/* Logo */}
+          <div className="mb-4 flex items-center gap-[10px]">
             <div className="flex h-10 w-10 items-center justify-center rounded-[10px] bg-[linear-gradient(135deg,#1a56db,#0891b2)] text-white shadow-md">
               <Layers size={18} />
             </div>
@@ -184,125 +309,248 @@ export default function Login() {
             </div>
           </div>
 
-          <h1 className="text-[1.35rem] font-bold leading-tight tracking-[-0.01em] text-gray-900">
-            Sign in to your account
-          </h1>
-          <p className="mt-1 text-[0.79rem] text-gray-500">Welcome back - enter your credentials below</p>
+          {/* ── LOGIN VIEW ── */}
+          {view === 'login' && (
+            <>
+              <h1 className="text-[1.25rem] font-bold leading-tight text-gray-900">Sign in to your account</h1>
+              <p className="mt-1 text-[0.79rem] text-gray-500">Enter your email or username below</p>
 
-          {!!errors.form && (
-            <div className="mt-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-[0.76rem] text-red-700">
-              {errors.form}
-            </div>
-          )}
+              {errors.form && (
+                <div className="mt-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-[0.76rem] text-red-700">{errors.form}</div>
+              )}
 
-          <form onSubmit={handleSubmit} className="mt-4">
-            <div className="mb-3">
-              <label htmlFor="username" className="mb-[5px] block text-[0.73rem] font-semibold text-gray-700">
-                Username
-              </label>
-              <div className={`relative flex items-center rounded-lg border-[1.5px] ${errors.username ? 'border-red-300' : 'border-gray-200'} bg-gray-50 focus-within:border-blue-600 focus-within:bg-white focus-within:shadow-[0_0_0_3px_rgba(26,86,219,0.1)]`}>
-                <User size={14} className="pointer-events-none absolute left-3 text-gray-400" />
-                <input
-                  id="username"
-                  type="text"
-                  value={form.username}
-                  onChange={(event) => setForm((prev) => ({ ...prev, username: event.target.value }))}
-                  placeholder="Enter username"
-                  autoComplete="username"
-                  autoFocus
-                  className="h-[41px] w-full rounded-lg border-0 bg-transparent pl-[38px] pr-3 text-[0.83rem] text-gray-900 outline-none placeholder:text-[#b0bac5]"
-                />
-              </div>
-              {!!errors.username && <p className="mt-1 text-[0.72rem] text-red-600">{errors.username}</p>}
-            </div>
+              <form onSubmit={handleLogin} className="mt-4">
+                <FormInput id="username" label="Email or Username" icon={Mail} value={form.username}
+                  onChange={e => setForm(p => ({ ...p, username: e.target.value }))}
+                  placeholder="Email or username" error={errors.username} autoComplete="username" autoFocus />
 
-            <div className="mb-3">
-              <label htmlFor="password" className="mb-[5px] block text-[0.73rem] font-semibold text-gray-700">
-                Password
-              </label>
-              <div className={`relative flex items-center rounded-lg border-[1.5px] ${errors.password ? 'border-red-300' : 'border-gray-200'} bg-gray-50 focus-within:border-blue-600 focus-within:bg-white focus-within:shadow-[0_0_0_3px_rgba(26,86,219,0.1)]`}>
-                <Lock size={14} className="pointer-events-none absolute left-3 text-gray-400" />
-                <input
-                  id="password"
-                  type={showPw ? 'text' : 'password'}
-                  value={form.password}
-                  onChange={(event) => setForm((prev) => ({ ...prev, password: event.target.value }))}
-                  placeholder="Enter password"
-                  autoComplete="current-password"
-                  className="h-[41px] w-full rounded-lg border-0 bg-transparent pl-[38px] pr-10 text-[0.83rem] text-gray-900 outline-none placeholder:text-[#b0bac5]"
-                />
-                <button
-                  type="button"
-                  onClick={() => setShowPw((current) => !current)}
-                  className="absolute right-[11px] p-1 text-gray-400 transition-colors hover:text-gray-600"
-                  aria-label={showPw ? 'Hide password' : 'Show password'}
-                >
-                  {showPw ? <EyeOff size={14} /> : <Eye size={14} />}
+                <FormInput id="password" icon={Lock} value={form.password}
+                  onChange={e => setForm(p => ({ ...p, password: e.target.value }))}
+                  placeholder="Enter password" error={errors.password} autoComplete="current-password"
+                  showToggle showPwState={showPw} setShowPwState={setShowPw} />
+
+                <div className="mb-4 mt-1 flex items-center justify-between">
+                  <label className="flex cursor-pointer items-center gap-2 text-[0.75rem] text-gray-500">
+                    <input type="checkbox" checked={rememberMe} onChange={e => setRememberMe(e.target.checked)}
+                      className="h-[14px] w-[14px] rounded border-gray-300 text-blue-600 focus:ring-blue-500" />
+                    Remember me
+                  </label>
+                  <button type="button" onClick={() => switchView('forgot')}
+                    className="text-[0.75rem] font-semibold text-blue-700 hover:text-blue-800">
+                    Forgot password?
+                  </button>
+                </div>
+
+                <button type="submit" disabled={loading}
+                  className="h-[43px] w-full rounded-lg bg-brand-dark text-[0.875rem] font-semibold text-white transition-all hover:bg-brand-mid disabled:cursor-not-allowed disabled:opacity-60">
+                  {loading ? 'Signing in...' : 'Sign In'}
+                </button>
+              </form>
+
+              <div className="mt-3 text-center">
+                <span className="text-[0.79rem] text-gray-500">Don't have an account? </span>
+                <button type="button" onClick={() => switchView('register')}
+                  className="text-[0.79rem] font-semibold text-blue-700 hover:text-blue-800">
+                  Create account
                 </button>
               </div>
-              {!!errors.password && <p className="mt-1 text-[0.72rem] text-red-600">{errors.password}</p>}
-            </div>
 
-            <div className="mb-4 mt-1 flex items-center justify-between">
-              <label className="flex cursor-pointer items-center gap-2 text-[0.75rem] text-gray-500">
-                <input
-                  type="checkbox"
-                  checked={rememberMe}
-                  onChange={(event) => setRememberMe(event.target.checked)}
-                  className="h-[14px] w-[14px] rounded border-gray-300 text-blue-600 focus:ring-blue-500"
-                />
-                Remember me
-              </label>
-              <button type="button" className="text-[0.75rem] font-semibold text-blue-700 hover:text-blue-800">
-                Forgot password?
+              <div className="relative my-4">
+                <div className="absolute inset-0 flex items-center"><div className="w-full border-t border-gray-200" /></div>
+                <div className="relative flex justify-center"><span className="bg-white px-3 text-[0.7rem] text-gray-400">or use demo</span></div>
+              </div>
+
+              <button type="button" onClick={() => { fillDemo(demoUsers[0]); }}
+                className="flex h-[38px] w-full items-center justify-center gap-2 rounded-lg border-[1.5px] border-gray-200 bg-gray-50 text-[0.78rem] font-semibold text-gray-700 transition-all hover:border-blue-600 hover:bg-blue-50 hover:text-blue-700">
+                <Play size={14} /> Quick Demo Login
               </button>
-            </div>
 
-            <button
-              type="submit"
-              disabled={loading}
-              className="h-[43px] w-full rounded-lg bg-[#111827] text-[0.875rem] font-semibold text-white transition-all hover:bg-gray-800 disabled:cursor-not-allowed disabled:opacity-60"
-            >
-              {loading ? 'Signing in…' : 'Sign In'}
-            </button>
-          </form>
-
-          <button
-            type="button"
-            onClick={quickDemoFill}
-            className="mt-[9px] flex h-[38px] w-full items-center justify-center gap-2 rounded-lg border-[1.5px] border-gray-200 bg-gray-50 text-[0.78rem] font-semibold text-gray-700 transition-all hover:border-blue-600 hover:bg-blue-50 hover:text-blue-700"
-          >
-            <Play size={14} />
-            Quick Demo Login
-          </button>
-
-          <div className="mt-[10px] overflow-hidden rounded-[10px] border border-gray-200">
-            <div className="border-b border-gray-200 bg-gray-50 px-3 py-2 text-[0.62rem] font-bold uppercase tracking-[0.09em] text-gray-400">
-              Demo credentials - click to fill
-            </div>
-            {demoUsers.map((user, index) => (
-              <button
-                key={user.username}
-                type="button"
-                onClick={() => fillDemo(user)}
-                className={`flex w-full items-center gap-2.5 px-3 py-2 text-left transition-colors hover:bg-gray-100 ${index < demoUsers.length - 1 ? 'border-b border-gray-200' : ''}`}
-              >
-                <div className={`flex h-6 w-6 items-center justify-center rounded-md ${roleAvatarStyles[user.role]}`}>
-                  {(() => {
-                    const Icon = roleIcons[user.role]
-                    return <Icon size={12} />
-                  })()}
+              <div className="mt-[10px] overflow-hidden rounded-[10px] border border-gray-200">
+                <div className="border-b border-gray-200 bg-gray-50 px-3 py-2 text-[0.62rem] font-bold uppercase tracking-[0.09em] text-gray-400">
+                  Demo credentials - click to fill
                 </div>
-                <div className="min-w-0 flex-1">
-                  <div className="truncate text-[0.76rem] font-semibold text-gray-900">{user.username}</div>
-                  <div className="truncate text-[0.67rem] text-gray-500">{user.password}</div>
-                </div>
-                <span className={`rounded-full border px-2 py-[2px] text-[0.58rem] font-bold uppercase tracking-[0.04em] ${roleBadgeStyles[user.role]}`}>
-                  {user.role}
-                </span>
+                {demoUsers.map((user, index) => (
+                  <button key={user.username} type="button" onClick={() => fillDemo(user)}
+                    className={`flex w-full items-center gap-2.5 px-3 py-2 text-left transition-colors hover:bg-gray-100 ${index < demoUsers.length - 1 ? 'border-b border-gray-200' : ''}`}>
+                    <div className={`flex h-6 w-6 items-center justify-center rounded-md ${roleAvatarStyles[user.role]}`}>
+                      {(() => { const Icon = roleIcons[user.role]; return Icon ? <Icon size={12} /> : null })()}
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <div className="truncate text-[0.76rem] font-semibold text-gray-900">{user.username}</div>
+                      <div className="truncate text-[0.67rem] text-gray-500">{user.password}</div>
+                    </div>
+                    <span className={`rounded-full border px-2 py-[2px] text-[0.58rem] font-bold uppercase tracking-[0.04em] ${roleBadgeStyles[user.role]}`}>
+                      {user.role}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            </>
+          )}
+
+          {/* ── REGISTER VIEW ── */}
+          {view === 'register' && (
+            <>
+              <button type="button" onClick={() => switchView('login')}
+                className="mb-3 flex items-center gap-1 text-[0.79rem] text-gray-500 hover:text-gray-700">
+                <ArrowLeft size={14} /> Back to sign in
               </button>
-            ))}
-          </div>
+
+              <h1 className="text-[1.25rem] font-bold leading-tight text-gray-900">Create your account</h1>
+              <p className="mt-1 text-[0.79rem] text-gray-500">Join TravelSync Pro to manage your business travel</p>
+
+              {errors.form && (
+                <div className="mt-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-[0.76rem] text-red-700">{errors.form}</div>
+              )}
+
+              <form onSubmit={handleRegister} className="mt-4">
+                <FormInput id="fullName" label="Full Name" icon={User} value={regForm.fullName}
+                  onChange={e => setRegForm(p => ({ ...p, fullName: e.target.value }))}
+                  placeholder="John Doe" error={errors.fullName} autoComplete="name" autoFocus />
+
+                <FormInput id="regEmail" label="Email" icon={Mail} type="email" value={regForm.email}
+                  onChange={e => setRegForm(p => ({ ...p, email: e.target.value }))}
+                  placeholder="john@company.com" error={errors.email} autoComplete="email" />
+
+                <FormInput id="department" label="Department" icon={Building} value={regForm.department}
+                  onChange={e => setRegForm(p => ({ ...p, department: e.target.value }))}
+                  placeholder="e.g. Sales, Engineering (optional)" error={errors.department} />
+
+                <FormInput id="regPassword" label="Password" icon={Lock} value={regForm.password}
+                  onChange={e => setRegForm(p => ({ ...p, password: e.target.value }))}
+                  placeholder="Min 6 characters" error={errors.password} autoComplete="new-password"
+                  showToggle showPwState={regShowPw} setShowPwState={setRegShowPw} />
+
+                <button type="submit" disabled={loading}
+                  className="mt-1 h-[43px] w-full rounded-lg bg-brand-dark text-[0.875rem] font-semibold text-white transition-all hover:bg-brand-mid disabled:cursor-not-allowed disabled:opacity-60">
+                  {loading ? 'Creating account...' : 'Create Account'}
+                </button>
+              </form>
+
+              <div className="mt-3 text-center">
+                <span className="text-[0.79rem] text-gray-500">Already have an account? </span>
+                <button type="button" onClick={() => switchView('login')}
+                  className="text-[0.79rem] font-semibold text-blue-700 hover:text-blue-800">
+                  Sign in
+                </button>
+              </div>
+            </>
+          )}
+
+          {/* ── FORGOT PASSWORD VIEW ── */}
+          {view === 'forgot' && (
+            <>
+              <button type="button" onClick={() => switchView('login')}
+                className="mb-3 flex items-center gap-1 text-[0.79rem] text-gray-500 hover:text-gray-700">
+                <ArrowLeft size={14} /> Back to sign in
+              </button>
+
+              <h1 className="text-[1.25rem] font-bold leading-tight text-gray-900">Reset your password</h1>
+              <p className="mt-1 text-[0.79rem] text-gray-500">Enter your email and we'll send a reset code</p>
+
+              <form onSubmit={handleForgotPassword} className="mt-4">
+                <FormInput id="email" icon={Mail} type="email" value={forgotEmail}
+                  onChange={e => setForgotEmail(e.target.value)}
+                  placeholder="Enter your email" error={errors.email} autoComplete="email" autoFocus />
+
+                <button type="submit" disabled={loading}
+                  className="mt-1 h-[43px] w-full rounded-lg bg-brand-dark text-[0.875rem] font-semibold text-white transition-all hover:bg-brand-mid disabled:cursor-not-allowed disabled:opacity-60">
+                  {loading ? 'Sending...' : 'Send Reset Code'}
+                </button>
+              </form>
+            </>
+          )}
+
+          {/* ── VERIFY EMAIL VIEW ── */}
+          {view === 'verify' && (
+            <>
+              <button type="button" onClick={() => switchView('login')}
+                className="mb-3 flex items-center gap-1 text-[0.79rem] text-gray-500 hover:text-gray-700">
+                <ArrowLeft size={14} /> Back to sign in
+              </button>
+
+              <h1 className="text-[1.25rem] font-bold leading-tight text-gray-900">Verify your email</h1>
+              <p className="mt-1 text-[0.79rem] text-gray-500">
+                We sent a 6-digit code to <strong>{regForm.email || 'your email'}</strong>. Enter it below.
+              </p>
+
+              {errors.form && (
+                <div className="mt-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-[0.76rem] text-red-700">{errors.form}</div>
+              )}
+
+              <form onSubmit={async (e) => {
+                e.preventDefault()
+                if (!verifyCode.trim()) { setErrors({ code: 'Enter the 6-digit code' }); return }
+                setErrors({})
+                setLoading(true)
+                try {
+                  const data = await verifyEmail(verifyCode.trim())
+                  if (data.success && data.user) {
+                    const u = data.user
+                    if (!u.name && u.full_name) u.name = u.full_name
+                    setUser(u)
+                    toast.success(`Email verified! Welcome, ${u.name}!`)
+                    navigate('/dashboard', { replace: true })
+                  } else {
+                    toast.error(data.error || 'Verification failed')
+                    setErrors({ form: data.error })
+                  }
+                } catch (error) {
+                  const message = error.response?.data?.error || 'Invalid code'
+                  toast.error(message)
+                  setErrors({ form: message })
+                } finally {
+                  setLoading(false)
+                }
+              }} className="mt-4">
+                <FormInput id="verifyCode" label="Verification Code" icon={Mail} value={verifyCode}
+                  onChange={e => setVerifyCode(e.target.value)}
+                  placeholder="Enter 6-digit code" error={errors.code} autoFocus />
+
+                <button type="submit" disabled={loading}
+                  className="mt-1 h-[43px] w-full rounded-lg bg-brand-dark text-[0.875rem] font-semibold text-white transition-all hover:bg-brand-mid disabled:cursor-not-allowed disabled:opacity-60">
+                  {loading ? 'Verifying...' : 'Verify & Sign In'}
+                </button>
+              </form>
+
+              <p className="mt-3 text-center text-[0.75rem] text-gray-400">
+                Didn't receive the code? Check spam or <button type="button" onClick={() => switchView('register')} className="text-blue-600 hover:text-blue-700 font-medium">try again</button>
+              </p>
+            </>
+          )}
+
+          {/* ── RESET PASSWORD VIEW ── */}
+          {view === 'reset' && (
+            <>
+              <button type="button" onClick={() => switchView('forgot')}
+                className="mb-3 flex items-center gap-1 text-[0.79rem] text-gray-500 hover:text-gray-700">
+                <ArrowLeft size={14} /> Back
+              </button>
+
+              <h1 className="text-[1.25rem] font-bold leading-tight text-gray-900">Enter reset code</h1>
+              <p className="mt-1 text-[0.79rem] text-gray-500">Check your email for the 6-digit code</p>
+
+              {errors.form && (
+                <div className="mt-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-[0.76rem] text-red-700">{errors.form}</div>
+              )}
+
+              <form onSubmit={handleResetPassword} className="mt-4">
+                <FormInput id="code" icon={Mail} value={resetForm.code}
+                  onChange={e => setResetForm(p => ({ ...p, code: e.target.value }))}
+                  placeholder="6-digit code" error={errors.code} autoFocus />
+
+                <FormInput id="newPassword" icon={Lock} value={resetForm.newPassword}
+                  onChange={e => setResetForm(p => ({ ...p, newPassword: e.target.value }))}
+                  placeholder="New password (min 6 chars)" error={errors.newPassword} autoComplete="new-password"
+                  showToggle showPwState={showPw} setShowPwState={setShowPw} />
+
+                <button type="submit" disabled={loading}
+                  className="mt-1 h-[43px] w-full rounded-lg bg-brand-dark text-[0.875rem] font-semibold text-white transition-all hover:bg-brand-mid disabled:cursor-not-allowed disabled:opacity-60">
+                  {loading ? 'Resetting...' : 'Reset Password'}
+                </button>
+              </form>
+            </>
+          )}
         </section>
       </div>
     </div>

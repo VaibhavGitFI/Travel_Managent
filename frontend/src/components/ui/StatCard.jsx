@@ -1,4 +1,4 @@
-import clsx from 'clsx'
+import { cn } from '../../lib/cn'
 import { TrendingUp, TrendingDown, Minus } from 'lucide-react'
 
 export default function StatCard({
@@ -18,7 +18,7 @@ export default function StatCard({
     orange: { bg: 'bg-warning-50',  icon: 'text-warning-600', border: 'border-warning-100' },
     red:    { bg: 'bg-red-50',      icon: 'text-red-600',     border: 'border-red-100' },
     purple: { bg: 'bg-purple-50',   icon: 'text-purple-600',  border: 'border-purple-100' },
-    corporate: { bg: 'bg-[#eef8fd]', icon: 'text-[#1B263B]', border: 'border-[#d2e4ef]' },
+    corporate: { bg: 'bg-surface-sunken', icon: 'text-brand-dark', border: 'border-surface-border' },
   }
 
   const accent = accentMap[accentColor] || accentMap.blue
@@ -33,7 +33,7 @@ export default function StatCard({
 
   return (
     <div
-      className={clsx(
+      className={cn(
         'bg-white rounded-xl border border-gray-100 shadow-card p-5 card-hover',
         className
       )}
@@ -49,14 +49,14 @@ export default function StatCard({
           {/* Icon */}
           {icon && (
             <div
-              className={clsx(
+              className={cn(
                 'inline-flex items-center justify-center w-11 h-11 rounded-xl mb-4',
                 accent.bg,
                 'border',
                 accent.border
               )}
             >
-              <span className={clsx('w-5 h-5', accent.icon)}>{icon}</span>
+              <span className={cn('w-5 h-5', accent.icon)}>{icon}</span>
             </div>
           )}
 
@@ -71,7 +71,7 @@ export default function StatCard({
           {/* Trend */}
           {(trend !== undefined && trend !== null) && (
             <div
-              className={clsx(
+              className={cn(
                 'flex items-center gap-1 mt-3 text-xs font-medium',
                 isPositive && 'text-success-600',
                 isNegative && 'text-red-600',

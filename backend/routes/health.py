@@ -14,6 +14,14 @@ def health():
     """GET /api/health — service status for all configured APIs."""
     try:
         status = Config.services_status()
+
+        # Include cache status
+        try:
+            from services.cache_service import get_cache_status
+            status["cache"] = get_cache_status()
+        except Exception:
+            pass
+
         status.update({
             "status": "ok",
             "version": "3.0.0",

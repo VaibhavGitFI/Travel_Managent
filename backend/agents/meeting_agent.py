@@ -75,12 +75,17 @@ def add_meeting(data: dict, user_id: int) -> dict:
 
 
 def get_all_meetings(user_id: int, destination: str = None,
-                     meeting_date: str = None) -> list:
-    """Fetch meetings with optional filters."""
+                     meeting_date: str = None, role: str = "employee") -> list:
+    """Fetch meetings with optional filters. Admins/managers see all org meetings."""
     db = get_db()
     try:
-        query = "SELECT * FROM client_meetings WHERE user_id=?"
-        params = [user_id]
+        is_admin = role in ("admin", "manager")
+        if is_admin:
+            query = "SELECT * FROM client_meetings WHERE 1=1"
+            params = []
+        else:
+            query = "SELECT * FROM client_meetings WHERE user_id=?"
+            params = [user_id]
         if destination:
             query += " AND LOWER(destination) LIKE ?"
             params.append(f"%{destination.lower()}%")
@@ -266,6 +271,160 @@ Return JSON:
 }}
 """
     return gemini.generate_json(prompt)
+
+
+def parse_meeting_text(text: str, source_hint: str = "email") -> dict:
+    """
+    Use Gemini to extract meeting details from raw email or WhatsApp text.
+    Falls back to regex extraction when Gemini is unavailable.
+    """
+    if not text or not text.strip():
+        return {"success": False, "error": "No text provided"}
+
+    if gemini.is_available:
+        prompt = f"""Extract meeting details from the following text. Return ONLY a valid JSON object with exactly these fields (use null for missing values):
+
+{{
+  "client_name": "<full name of the person>",
+  "company": "<company or organization name>",
+  "meeting_date": "<date in YYYY-MM-DD format>",
+  "meeting_time": "<time in HH:MM 24h format>",
+  "location": "<meeting venue, office address, or 'Virtual'>",
+  "agenda": "<meeting purpose or key topics>",
+  "contact_info": "<phone number or email address>",
+  "notes": "<any other relevant context>"
+}}
+
+Text:
+\"\"\"
+{text[:3000]}
+\"\"\"
+"""
+        result = gemini.generate_json(prompt)
+        if result and isinstance(result, dict) and any(result.values()):
+            cleaned = {
+                k: str(v).strip() for k, v in result.items()
+                if v and str(v).strip().lower() not in ("null", "none", "n/a", "")
+            }
+            if cleaned.get("meeting_date"):
+                cleaned["meeting_date"] = _normalize_date(cleaned["meeting_date"])
+            if cleaned.get("meeting_time"):
+                cleaned["meeting_time"] = _normalize_time(cleaned["meeting_time"])
+
+            return {
+                "success": True,
+                "extracted": cleaned,
+                "source_type": source_hint,
+                "ai_source": "gemini",
+                "confidence": "high",
+            }
+
+        return {
+            "success": False,
+            "error": "Gemini could not extract meeting details. Try rephrasing or check GEMINI_API_KEY.",
+            "ai_source": "gemini",
+        }
+
+    # Regex fallback — best-effort extraction without AI
+    extracted = _regex_extract_meeting(text)
+    if extracted:
+        return {
+            "success": True,
+            "extracted": extracted,
+            "source_type": source_hint,
+            "ai_source": "regex_fallback",
+            "confidence": "low",
+            "note": "Set GEMINI_API_KEY for higher-accuracy extraction",
+        }
+
+    return {
+        "success": False,
+        "error": "Could not extract meeting details. Set GEMINI_API_KEY for AI-powered parsing.",
+        "ai_source": "regex_fallback",
+    }
+
+
+def _normalize_date(date_str: str) -> str:
+    """Convert various date formats to YYYY-MM-DD. Returns original if unparseable."""
+    import re
+    from datetime import datetime, date
+
+    date_str = date_str.strip()
+
+    # Already YYYY-MM-DD
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", date_str):
+        return date_str
+
+    formats = [
+        "%d/%m/%Y", "%d-%m-%Y", "%m/%d/%Y",
+        "%d %B %Y", "%B %d, %Y", "%d %b %Y", "%b %d, %Y",
+        "%d/%m/%y", "%m/%d/%y",
+    ]
+    for fmt in formats:
+        try:
+            return datetime.strptime(date_str, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+
+    return date_str
+
+
+def _normalize_time(time_str: str) -> str:
+    """Convert time strings to HH:MM 24h format. Returns original if unparseable."""
+    import re
+    from datetime import datetime
+
+    time_str = time_str.strip()
+
+    # Already HH:MM or HH:MM:SS
+    if re.match(r"^\d{1,2}:\d{2}(:\d{2})?$", time_str):
+        try:
+            h, m = time_str.split(":")[:2]
+            return f"{int(h):02d}:{int(m):02d}"
+        except ValueError:
+            return time_str
+
+    # 12h format
+    for fmt in ("%I:%M %p", "%I:%M%p", "%I %p"):
+        try:
+            return datetime.strptime(time_str.upper(), fmt).strftime("%H:%M")
+        except ValueError:
+            continue
+
+    return time_str
+
+
+def _regex_extract_meeting(text: str) -> dict:
+    """Best-effort regex extraction of meeting fields from free-form text."""
+    import re
+
+    result = {}
+
+    # Date patterns
+    date_match = re.search(
+        r"\b(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}-\d{2}-\d{2}|"
+        r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2},?\s+\d{4})\b",
+        text, re.IGNORECASE
+    )
+    if date_match:
+        result["meeting_date"] = _normalize_date(date_match.group(1))
+
+    # Time patterns
+    time_match = re.search(r"\b(\d{1,2}:\d{2}\s*(?:AM|PM)?|\d{1,2}\s*(?:AM|PM))\b", text, re.IGNORECASE)
+    if time_match:
+        result["meeting_time"] = _normalize_time(time_match.group(1))
+
+    # Email
+    email_match = re.search(r"[\w.+-]+@[\w-]+\.[a-z]{2,}", text, re.IGNORECASE)
+    if email_match:
+        result["contact_info"] = email_match.group(0)
+
+    # Phone (Indian format: +91 or 10-digit)
+    phone_match = re.search(r"(?:\+91[-\s]?)?[6-9]\d{9}", text)
+    if phone_match and not result.get("contact_info"):
+        result["contact_info"] = phone_match.group(0)
+
+    return result
 
 
 def _get_source_breakdown(meetings: list) -> dict:

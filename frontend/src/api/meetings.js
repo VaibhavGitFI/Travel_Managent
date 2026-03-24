@@ -1,7 +1,9 @@
 import client from './client'
 
-export const getMeetings = async (tripId) => {
-  const params = tripId ? { trip_id: tripId } : {}
+export const getMeetings = async (tripIdOrParams) => {
+  const params = typeof tripIdOrParams === 'object' && tripIdOrParams !== null
+    ? tripIdOrParams
+    : tripIdOrParams ? { trip_id: tripIdOrParams } : {}
   const { data } = await client.get('/meetings', { params })
   return data
 }
@@ -28,5 +30,10 @@ export const suggestSchedule = async (scheduleData) => {
 
 export const getNearbyVenues = async (venueData) => {
   const { data } = await client.post('/meetings/nearby-venues', venueData)
+  return data
+}
+
+export const parseMeetingText = async (text, sourceType = 'email') => {
+  const { data } = await client.post('/meetings/parse-text', { text, source_type: sourceType })
   return data
 }

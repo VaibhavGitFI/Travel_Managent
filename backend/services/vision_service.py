@@ -170,6 +170,32 @@ class VisionService:
 
         return result
 
+    def extract_from_bytes(self, image_bytes: bytes) -> dict:
+        """Extract receipt data directly from image bytes (for WhatsApp/Cliq)."""
+        if not self.configured:
+            return {"raw_text": "", "extracted": {}, "confidence": 0.0, "source": "unconfigured"}
+        try:
+            image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+            payload = {
+                "requests": [{
+                    "image": {"content": image_b64},
+                    "features": [{"type": "DOCUMENT_TEXT_DETECTION", "maxResults": 1}],
+                }]
+            }
+            resp = requests.post(f"{self.ANNOTATE_URL}?key={self.api_key}", json=payload, timeout=20)
+            if resp.status_code == 200:
+                annotation = resp.json()["responses"][0].get("fullTextAnnotation", {})
+                text = annotation.get("text", "")
+                if text:
+                    result = self.parse_receipt_text(text)
+                    result["source"] = "google_vision"
+                    return result
+            else:
+                logger.warning("[Vision] API error %s: %s", resp.status_code, resp.text[:200])
+        except Exception as e:
+            logger.warning("[Vision] extract_from_bytes error: %s", e)
+        return {"raw_text": "", "extracted": {}, "confidence": 0.0, "source": "error"}
+
     def _mock_extraction(self, file_path: str) -> dict:
         return {
             "raw_text": "",
