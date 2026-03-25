@@ -531,3 +531,4 @@ def delete_session(session_id):
     except Exception:
         logger.exception("[Chat] delete session failed")
         return jsonify({"success": False, "error": "Failed to delete session"}), 500
+

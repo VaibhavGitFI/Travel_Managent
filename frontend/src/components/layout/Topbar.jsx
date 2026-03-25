@@ -15,6 +15,8 @@ const routeMeta = {
   '/approvals':     { label: 'Approvals' },
   '/analytics':     { label: 'Analytics' },
   '/chat':          { label: 'AI Chat' },
+  '/profile':       { label: 'Profile' },
+  '/user-management': { label: 'User Management' },
 }
 
 export default function Topbar() {
@@ -231,10 +233,17 @@ export default function Topbar() {
           )}
         </div>
 
-        {/* User */}
-        <div className={cn('flex items-center gap-2 pl-1.5 border-l ml-1', isDark ? 'border-navy-700' : 'border-surface-border')}>
-          <div className="w-7 h-7 rounded-full bg-brand-dark flex items-center justify-center text-white text-xs font-bold">
-            {user?.name?.charAt(0)?.toUpperCase() || 'U'}
+        {/* User — clickable to profile */}
+        <div
+          onClick={() => navigate('/profile')}
+          className={cn('flex items-center gap-2 pl-1.5 border-l ml-1 cursor-pointer rounded-lg px-1.5 py-1 -mr-1.5 transition-colors',
+            isDark ? 'border-navy-700 hover:bg-navy-700/50' : 'border-surface-border hover:bg-gray-50')}
+        >
+          <div className="w-7 h-7 rounded-full bg-brand-dark flex items-center justify-center text-white text-xs font-bold overflow-hidden">
+            {user?.profile_picture
+              ? <img src={`/api/uploads/${user.profile_picture}`} alt="" className="h-full w-full object-cover" />
+              : (user?.name?.charAt(0)?.toUpperCase() || 'U')
+            }
           </div>
           <span className={cn('hidden md:block text-[13px] font-medium max-w-[120px] truncate',
             isDark ? 'text-brand-light' : 'text-gray-700')}>

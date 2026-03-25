@@ -7,7 +7,7 @@ import {
   Phone, TrendingUp, TrendingDown, ArrowUpRight, PieChart, BarChart3,
 } from 'lucide-react'
 import toast from 'react-hot-toast'
-import { getExpenses, submitExpense, uploadAndExtract, getExpenseAnomalies } from '../api/expenses'
+import { getExpenses, submitExpense, uploadAndExtract, getExpenseAnomalies, submitExpenseForApproval } from '../api/expenses'
 import useStore from '../store/useStore'
 import useAutoRefresh from '../hooks/useAutoRefresh'
 import Badge from '../components/ui/Badge'
@@ -69,10 +69,23 @@ export default function Expenses() {
   const norm = useMemo(() => expenses.map(e => ({
     ...e,
     status: String(e.status || 'pending').toLowerCase().replace(/_/g, '-'),
+    approval_status: String(e.approval_status || 'draft').toLowerCase(),
     category: String(e.category || 'other').toLowerCase(),
     dateValue: e.expense_date || e.date || '',
     amount: Number(e.amount || 0),
   })), [expenses])
+
+  const handleSubmitForApproval = async (expenseId) => {
+    try {
+      const data = await submitExpenseForApproval(expenseId)
+      if (data.success) {
+        toast.success('Expense submitted for approval')
+        refresh()
+      } else {
+        toast.error(data.error || 'Failed to submit')
+      }
+    } catch { toast.error('Failed to submit for approval') }
+  }
 
   const summary = useMemo(() => {
     const tot = norm.reduce((s, i) => s + i.amount, 0)
@@ -306,7 +319,7 @@ export default function Expenses() {
               <table className="w-full">
                 <thead className="bg-gray-50">
                   <tr>
-                    {['Description', 'Category', 'Date', 'Amount', 'Status'].map(h => (
+                    {['Description', 'Category', 'Date', 'Amount', 'Status', 'Approval'].map(h => (
                       <th key={h} className="px-5 py-3 text-left text-[11px] font-semibold uppercase tracking-wide text-gray-500">{h}</th>
                     ))}
                   </tr>
@@ -335,6 +348,18 @@ export default function Expenses() {
                         <td className="px-5 py-3.5 text-sm text-gray-500">{fmtDate(e.dateValue)}</td>
                         <td className="px-5 py-3.5 text-sm font-bold text-gray-900">{fmt(e.amount)}</td>
                         <td className="px-5 py-3.5"><Badge status={e.status} dot>{title(e.status)}</Badge></td>
+                        <td className="px-5 py-3.5">
+                          {e.approval_status === 'draft' || !e.approval_status ? (
+                            <button onClick={() => handleSubmitForApproval(e.id)}
+                              className="rounded-md bg-blue-50 border border-blue-200 px-2.5 py-1 text-[10px] font-semibold text-blue-700 hover:bg-blue-100 transition-colors">
+                              Submit
+                            </button>
+                          ) : (
+                            <Badge status={e.approval_status === 'approved' ? 'approved' : e.approval_status === 'rejected' ? 'rejected' : 'pending'} dot>
+                              {title(e.approval_status)}
+                            </Badge>
+                          )}
+                        </td>
                       </tr>
                     )
                   })}

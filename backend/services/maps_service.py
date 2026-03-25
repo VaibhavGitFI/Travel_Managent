@@ -59,6 +59,41 @@ class MapsService:
         self._cache[cache_key] = result
         return result
 
+    def reverse_geocode(self, lat: float, lng: float) -> dict:
+        """Convert lat/lng coordinates to address, city, and country."""
+        cache_key = f"revgeo_{lat:.4f}_{lng:.4f}"
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+
+        if self.configured:
+            try:
+                resp = requests.get(
+                    self.GEOCODE_URL,
+                    params={"latlng": f"{lat},{lng}", "key": self.api_key},
+                    timeout=10,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if data.get("results"):
+                        top = data["results"][0]
+                        components = {c["types"][0]: c["long_name"] for c in top.get("address_components", []) if c.get("types")}
+                        result = {
+                            "formatted_address": top.get("formatted_address", ""),
+                            "city": components.get("locality") or components.get("administrative_area_level_2") or "",
+                            "state": components.get("administrative_area_level_1", ""),
+                            "country": components.get("country", ""),
+                            "postal_code": components.get("postal_code", ""),
+                            "lat": lat,
+                            "lng": lng,
+                            "source": "google_maps",
+                        }
+                        self._cache[cache_key] = result
+                        return result
+            except Exception as e:
+                logger.warning("[Maps] Reverse geocode error: %s", e)
+
+        return {"formatted_address": "", "city": "", "state": "", "country": "", "lat": lat, "lng": lng, "source": "fallback"}
+
     def get_distance_km(self, origin: str, destination: str) -> float:
         """Get driving distance in km between two places."""
         if self.configured:

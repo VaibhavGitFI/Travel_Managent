@@ -16,6 +16,8 @@ const Requests      = lazy(() => import('./pages/Requests'))
 const Approvals     = lazy(() => import('./pages/Approvals'))
 const Analytics     = lazy(() => import('./pages/Analytics'))
 const Chat          = lazy(() => import('./pages/Chat'))
+const Profile       = lazy(() => import('./pages/Profile'))
+const UserManagement = lazy(() => import('./pages/UserManagement'))
 
 function PageLoader() {
   return (
@@ -136,6 +138,22 @@ export default function App() {
             element={
               <Suspense fallback={<PageLoader />}>
                 <Chat />
+              </Suspense>
+            }
+          />
+          <Route
+            path="/profile"
+            element={
+              <Suspense fallback={<PageLoader />}>
+                <Profile />
+              </Suspense>
+            }
+          />
+          <Route
+            path="/user-management"
+            element={
+              <Suspense fallback={<PageLoader />}>
+                <UserManagement />
               </Suspense>
             }
           />

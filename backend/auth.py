@@ -112,14 +112,27 @@ def login_required(f):
 
 
 def admin_required(f):
-    """Decorator: require admin or manager role."""
+    """Decorator: require admin, manager, or super_admin role."""
     @wraps(f)
     def decorated(*args, **kwargs):
         user = get_current_user()
         if not user:
             return jsonify({"success": False, "error": "Authentication required"}), 401
-        if user["role"] not in ("admin", "manager"):
+        if user["role"] not in ("admin", "manager", "super_admin"):
             return jsonify({"success": False, "error": "Admin access required"}), 403
+        return f(*args, **kwargs)
+    return decorated
+
+
+def super_admin_required(f):
+    """Decorator: require super_admin role."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        user = get_current_user()
+        if not user:
+            return jsonify({"success": False, "error": "Authentication required"}), 401
+        if user["role"] != "super_admin":
+            return jsonify({"success": False, "error": "Super admin access required"}), 403
         return f(*args, **kwargs)
     return decorated
 
@@ -155,6 +168,9 @@ def login_user(username, password):
                     "role": u.get("role", "employee"),
                     "department": u.get("department", "General"),
                     "avatar_initials": "".join(w[0].upper() for w in name.split()[:2]),
+                    "profile_picture": u.get("profile_picture"),
+                    "sub_role": u.get("sub_role"),
+                    "phone": u.get("phone"),
                 }
             }
         return {"success": False, "error": "Invalid username or password"}

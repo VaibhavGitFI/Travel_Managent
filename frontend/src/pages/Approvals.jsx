@@ -7,6 +7,7 @@ import {
 } from 'lucide-react'
 import toast from 'react-hot-toast'
 import { getApprovals, approveRequest, rejectRequest } from '../api/approvals'
+import { getPendingExpenseApprovals, approveExpense, rejectExpense } from '../api/expenses'
 import useAutoRefresh from '../hooks/useAutoRefresh'
 import StatCard from '../components/ui/StatCard'
 import Spinner from '../components/ui/Spinner'
@@ -24,6 +25,12 @@ export default function Approvals() {
   const [showHistory, setShowHistory] = useState(false)
 
   const [view, setView] = useState('manager') // 'manager' or 'employee'
+  const [tab, setTab] = useState('travel') // 'travel' or 'expenses'
+  const [pendingExpenses, setPendingExpenses] = useState([])
+  const [expLoading, setExpLoading] = useState(false)
+  const [expRejectModal, setExpRejectModal] = useState(false)
+  const [expSelected, setExpSelected] = useState(null)
+  const [expReason, setExpReason] = useState('')
 
   const fetch = async () => {
     try {
@@ -36,8 +43,33 @@ export default function Approvals() {
     finally { setLoading(false) }
   }
 
-  useEffect(() => { fetch() }, [])
+  const fetchExpenses = async () => {
+    setExpLoading(true)
+    try {
+      const data = await getPendingExpenseApprovals()
+      setPendingExpenses(data.expenses || [])
+    } catch {}
+    finally { setExpLoading(false) }
+  }
+
+  useEffect(() => { fetch(); fetchExpenses() }, [])
+  useEffect(() => { if (view === 'manager' && tab === 'expenses') fetchExpenses() }, [tab])
   useAutoRefresh('approvals', fetch)
+
+  const handleApproveExpense = async (id) => {
+    setProcessing(id)
+    try { await approveExpense(id); toast.success('Expense approved!'); fetchExpenses() }
+    catch { toast.error('Approval failed') }
+    finally { setProcessing(null) }
+  }
+
+  const handleRejectExpense = async () => {
+    if (!expSelected) return
+    setProcessing(expSelected.id)
+    try { await rejectExpense(expSelected.id, expReason); toast.success('Expense rejected.'); setExpRejectModal(false); fetchExpenses() }
+    catch { toast.error('Rejection failed') }
+    finally { setProcessing(null) }
+  }
 
   const handleApprove = async (id) => {
     setProcessing(id)
@@ -107,8 +139,24 @@ export default function Approvals() {
         </>
       )}
 
-      {/* ── Manager approval view ─────────── */}
-      {view === 'manager' && <>
+      {/* ── Tab Switcher (manager only) ──── */}
+      {view === 'manager' && (
+        <div className="flex gap-1 rounded-lg bg-gray-100 p-1 w-fit">
+          {[{ key: 'travel', label: 'Travel Requests' }, { key: 'expenses', label: 'Expense Approvals' }].map(t => (
+            <button key={t.key} onClick={() => setTab(t.key)}
+              className={cn('rounded-md px-4 py-1.5 text-xs font-semibold transition-all',
+                tab === t.key ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700')}>
+              {t.label}
+              {t.key === 'expenses' && pendingExpenses.length > 0 && tab !== 'expenses' && (
+                <span className="ml-1.5 inline-flex h-4 w-4 items-center justify-center rounded-full bg-red-500 text-[9px] font-bold text-white">{pendingExpenses.length}</span>
+              )}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {/* ── Manager approval view — Travel Requests ─── */}
+      {view === 'manager' && tab === 'travel' && <>
       {/* Stats */}
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
         <StatCard icon={<Clock size={20} />} value={loading ? '—' : pendingList.length} label="Awaiting Approval" accentColor="orange" className="rounded-xl border border-gray-200 bg-white shadow-card" loading={loading} />
@@ -237,6 +285,93 @@ export default function Approvals() {
         document.body
       )}
       </>}
+
+      {/* ── Manager approval view — Expense Approvals ── */}
+      {view === 'manager' && tab === 'expenses' && (
+        <div className="rounded-xl border border-gray-200 bg-white shadow-card overflow-hidden">
+          <div className="px-5 py-4 border-b border-gray-100 flex items-center justify-between">
+            <h3 className="text-sm font-semibold text-gray-900">Pending Expense Approvals</h3>
+            {pendingExpenses.length > 0 && (
+              <span className="rounded-full bg-amber-100 border border-amber-200 px-2 py-0.5 text-[10px] font-bold text-amber-700">
+                {pendingExpenses.length} awaiting
+              </span>
+            )}
+          </div>
+          {expLoading ? (
+            <div className="p-5 space-y-3">{[1,2,3].map(i => <SkeletonRow key={i} />)}</div>
+          ) : pendingExpenses.length === 0 ? (
+            <div className="py-12 text-center">
+              <CheckCircle size={28} className="mx-auto mb-2 text-emerald-200" />
+              <p className="text-sm font-medium text-gray-500">All caught up</p>
+              <p className="text-xs text-gray-400 mt-0.5">No expense approvals pending</p>
+            </div>
+          ) : (
+            <div className="divide-y divide-gray-100">
+              {pendingExpenses.map(exp => (
+                <div key={exp.id} className="flex flex-col gap-3 px-5 py-4 transition-colors hover:bg-gray-50/50 sm:flex-row sm:items-center sm:gap-4">
+                  <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-amber-50 border border-amber-100">
+                    <IndianRupee size={16} className="text-amber-600" />
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <p className="text-sm font-semibold text-gray-900">{exp.description || exp.category || 'Expense'}</p>
+                    <div className="flex items-center gap-3 mt-1 flex-wrap text-xs text-gray-500">
+                      <span className="flex items-center gap-1 font-medium">
+                        <User size={11} className="text-gray-400" /> {exp.employee_name || 'Employee'}
+                      </span>
+                      {exp.employee_dept && <span>· {exp.employee_dept}</span>}
+                      {exp.category && <span className="capitalize">· {exp.category}</span>}
+                      <span className="font-semibold text-gray-700">₹{Number(exp.amount || 0).toLocaleString('en-IN')}</span>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <button onClick={() => handleApproveExpense(exp.id)} disabled={processing === exp.id}
+                      className="flex items-center gap-1.5 rounded-lg border border-emerald-200 bg-emerald-50 px-3.5 py-2 text-xs font-semibold text-emerald-700 transition-colors hover:bg-emerald-100 disabled:opacity-50">
+                      {processing === exp.id ? <Spinner size="xs" /> : <CheckCircle size={13} />}
+                      Approve
+                    </button>
+                    <button onClick={() => { setExpSelected(exp); setExpReason(''); setExpRejectModal(true) }} disabled={processing === exp.id}
+                      className="flex items-center gap-1.5 rounded-lg border border-red-200 bg-red-50 px-3.5 py-2 text-xs font-semibold text-red-700 transition-colors hover:bg-red-100 disabled:opacity-50">
+                      <XCircle size={13} /> Reject
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Expense Reject Modal */}
+      {expRejectModal && ReactDOM.createPortal(
+        <div className="fixed inset-0 z-[9999] flex items-center justify-center overflow-y-auto p-4"
+          onClick={(e) => { if (e.target === e.currentTarget) setExpRejectModal(false) }}
+          style={{ background: 'rgba(15,23,42,0.6)', backdropFilter: 'blur(6px)' }}>
+          <div className="relative w-full max-w-md rounded-2xl bg-white shadow-2xl">
+            <div className="border-b border-gray-100 px-6 py-4">
+              <h3 className="text-base font-semibold text-gray-900">Reject Expense</h3>
+              <p className="text-xs text-gray-500">{expSelected?.description} — ₹{Number(expSelected?.amount || 0).toLocaleString('en-IN')}</p>
+            </div>
+            <div className="px-6 py-5 space-y-4">
+              <div>
+                <label className="mb-1 block text-[11px] font-semibold uppercase tracking-wide text-gray-500">Rejection Reason</label>
+                <textarea rows={3} placeholder="Enter reason for rejection..."
+                  value={expReason} onChange={(e) => setExpReason(e.target.value)}
+                  className={cn(inputBase, 'resize-none')} />
+              </div>
+            </div>
+            <div className="flex justify-end gap-2 border-t border-gray-100 px-6 py-4">
+              <button onClick={() => setExpRejectModal(false)}
+                className="rounded-lg border border-gray-200 px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50">Cancel</button>
+              <button onClick={handleRejectExpense} disabled={!!processing || !expReason.trim()}
+                className="flex items-center gap-2 rounded-lg bg-gradient-to-r from-red-600 to-rose-500 px-4 py-2 text-sm font-semibold text-white disabled:opacity-60">
+                {processing ? <Spinner size="xs" color="white" /> : <XCircle size={14} />}
+                Reject Expense
+              </button>
+            </div>
+          </div>
+        </div>,
+        document.body
+      )}
     </div>
   )
 }

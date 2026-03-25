@@ -405,6 +405,17 @@ def _apply_migrations_pg(db):
     _add_col("chat_messages", "session_id", "TEXT")
     _add_col("users", "email_verified", "INTEGER DEFAULT 1")
 
+    # users — profile + role hierarchy
+    _add_col("users", "profile_picture", "TEXT")
+    _add_col("users", "sub_role", "TEXT")
+
+    # expenses_db — approval workflow
+    _add_col("expenses_db", "approval_status", "TEXT DEFAULT 'draft'")
+    _add_col("expenses_db", "approver_id", "INTEGER")
+    _add_col("expenses_db", "approval_comments", "TEXT")
+    _add_col("expenses_db", "submitted_at", "TIMESTAMP")
+    _add_col("expenses_db", "approved_at", "TIMESTAMP")
+
     # chat_sessions table (for existing databases)
     try:
         db.execute("""
@@ -484,6 +495,17 @@ def _apply_migrations(db, c):
 
     # users — email verification flag (default 1 = verified for existing users)
     _add_col("users", "email_verified", "INTEGER DEFAULT 1")
+
+    # users — profile + role hierarchy
+    _add_col("users", "profile_picture", "TEXT")
+    _add_col("users", "sub_role", "TEXT")
+
+    # expenses_db — approval workflow
+    _add_col("expenses_db", "approval_status", "TEXT DEFAULT 'draft'")
+    _add_col("expenses_db", "approver_id", "INTEGER")
+    _add_col("expenses_db", "approval_comments", "TEXT")
+    _add_col("expenses_db", "submitted_at", "TIMESTAMP")
+    _add_col("expenses_db", "approved_at", "TIMESTAMP")
 
     # Sync full_name from name for existing users
     c.execute("""

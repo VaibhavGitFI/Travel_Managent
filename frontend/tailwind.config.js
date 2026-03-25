@@ -11,8 +11,8 @@ export default {
         brand: {
           dark:  '#1B263B',
           mid:   '#22314a',
-          light: '#E0E1DD',
-          muted: '#778DA9',
+          light: '#f0f1ed',
+          muted: '#94a8c4',
           cyan:  '#4CC9F0',
         },
         surface: {

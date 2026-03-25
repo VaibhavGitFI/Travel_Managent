@@ -55,7 +55,7 @@ def _serialize_approval(row: dict) -> dict:
 
 def _require_manager(user):
     """Return a 403 response tuple if user is not a manager or admin, else None."""
-    if user.get("role") not in ("admin", "manager"):
+    if user.get("role") not in ("admin", "manager", "super_admin"):
         return jsonify({"success": False, "error": "Manager or admin access required"}), 403
     return None
 

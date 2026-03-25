@@ -33,6 +33,16 @@ _ALLOWED_TRANSITIONS = {
         "completed":     [],
         "rejected":      [],
     },
+    "super_admin": {
+        "draft":         ["submitted"],
+        "submitted":     ["pending_approval", "approved"],
+        "pending_approval": ["approved", "rejected"],
+        "approved":      ["booked", "rejected"],
+        "booked":        ["in_progress"],
+        "in_progress":   ["completed"],
+        "completed":     [],
+        "rejected":      [],
+    },
 }
 
 

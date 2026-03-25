@@ -307,3 +307,100 @@ def reset_password():
     except Exception as e:
         logger.exception("[Auth] reset_password failed")
         return jsonify({"success": False, "error": "Failed to reset password"}), 500
+
+
+# ── Profile Endpoints ──────────────────────────────────────────────────────────
+
+@auth_bp.route("/profile", methods=["GET"])
+def get_profile():
+    """GET /api/auth/profile — return full user profile."""
+    user = get_current_user()
+    if not user:
+        return jsonify({"success": False, "error": "Authentication required"}), 401
+    safe = {k: v for k, v in dict(user).items() if k != "password_hash"}
+    return jsonify({"success": True, "user": safe}), 200
+
+
+@auth_bp.route("/profile", methods=["PUT"])
+def update_profile():
+    """PUT /api/auth/profile — update editable profile fields."""
+    user = get_current_user()
+    if not user:
+        return jsonify({"success": False, "error": "Authentication required"}), 401
+
+    data = request.get_json(silent=True) or {}
+    allowed = {"full_name", "name", "phone", "department", "sub_role", "avatar_initials"}
+    updates = {k: v for k, v in data.items() if k in allowed and v is not None}
+
+    if not updates:
+        return jsonify({"success": False, "error": "No valid fields to update"}), 400
+
+    # Keep name and full_name in sync
+    if "full_name" in updates:
+        updates["name"] = updates["full_name"]
+        updates["avatar_initials"] = "".join(w[0].upper() for w in updates["full_name"].split()[:2])
+
+    try:
+        db = get_db()
+        # Schema-tolerant: only update columns that exist
+        cols = {r[1] for r in db.execute("PRAGMA table_info(users)").fetchall()}
+        valid_updates = {k: v for k, v in updates.items() if k in cols}
+
+        if valid_updates:
+            set_clause = ", ".join(f"{k} = ?" for k in valid_updates)
+            values = list(valid_updates.values()) + [user["id"]]
+            db.execute(f"UPDATE users SET {set_clause} WHERE id = ?", values)
+            db.commit()
+
+        # Bust auth cache
+        from auth import _user_cache
+        _user_cache.pop(user["id"], None)
+
+        # Return updated user
+        updated = db.execute("SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone()
+        db.close()
+        safe = {k: v for k, v in dict(updated).items() if k != "password_hash"}
+        return jsonify({"success": True, "user": safe}), 200
+    except Exception:
+        logger.exception("[Auth] update_profile failed")
+        return jsonify({"success": False, "error": "Failed to update profile"}), 500
+
+
+@auth_bp.route("/profile/avatar", methods=["POST"])
+def upload_avatar():
+    """POST /api/auth/profile/avatar — upload a profile picture."""
+    import os
+    from werkzeug.utils import secure_filename
+    from config import Config
+
+    user = get_current_user()
+    if not user:
+        return jsonify({"success": False, "error": "Authentication required"}), 401
+
+    upload = request.files.get("avatar")
+    if not upload or not upload.filename:
+        return jsonify({"success": False, "error": "Avatar file is required"}), 400
+
+    ext = os.path.splitext(upload.filename)[1].lower()
+    if ext not in {".png", ".jpg", ".jpeg", ".gif", ".webp"}:
+        return jsonify({"success": False, "error": "Only image files allowed (png, jpg, gif, webp)"}), 400
+
+    try:
+        os.makedirs(Config.UPLOAD_FOLDER, exist_ok=True)
+        safe_name = secure_filename(upload.filename)
+        filename = f"avatar_{user['id']}_{safe_name}"
+        filepath = os.path.join(Config.UPLOAD_FOLDER, filename)
+        upload.save(filepath)
+
+        db = get_db()
+        db.execute("UPDATE users SET profile_picture = ? WHERE id = ?", (filename, user["id"]))
+        db.commit()
+        db.close()
+
+        from auth import _user_cache
+        _user_cache.pop(user["id"], None)
+
+        return jsonify({"success": True, "url": f"/api/uploads/{filename}"}), 200
+    except Exception:
+        logger.exception("[Auth] upload_avatar failed")
+        return jsonify({"success": False, "error": "Failed to upload avatar"}), 500
