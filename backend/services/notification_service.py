@@ -29,6 +29,7 @@ def notify(
     broadcast_to_role: str | None = None,
     action_url: str | None = None,
     extra: dict | None = None,
+    details: dict | None = None,
 ) -> None:
     """
     Dispatch a notification to all configured channels.
@@ -57,12 +58,13 @@ def notify(
         broadcast_to_role=broadcast_to_role,
         action_url=action_url,
         extra=extra,
+        details=details,
     )
 
 
 def _dispatch(
     user_id, title, message, notification_type,
-    channels, request_id, broadcast_to_role, action_url, extra,
+    channels, request_id, broadcast_to_role, action_url, extra, details,
 ):
     """Runs in a worker thread. Fans out to all channels."""
     use_all = channels is None
@@ -84,11 +86,11 @@ def _dispatch(
 
     # 2. SocketIO (real-time in-app)
     if use_all or "socketio" in ch:
-        _send_socketio(target_ids, title, message, notification_type, request_id, extra)
+        _send_socketio(target_ids, title, message, notification_type, request_id, action_url, extra)
 
     # 3. Email
     if use_all or "email" in ch:
-        _send_email(target_ids, title, message, notification_type, action_url)
+        _send_email(target_ids, title, message, notification_type, action_url, details)
 
     # 4. Zoho Cliq
     if use_all or "cliq" in ch:
@@ -117,7 +119,7 @@ def _persist(user_id, title, message, notification_type, request_id, action_url)
         logger.debug("[Notify] DB persist failed: %s", exc)
 
 
-def _send_socketio(target_ids, title, message, notification_type, request_id, extra):
+def _send_socketio(target_ids, title, message, notification_type, request_id, action_url, extra):
     """Emit via SocketIO to each target user's room."""
     try:
         from extensions import socketio
@@ -129,6 +131,8 @@ def _send_socketio(target_ids, title, message, notification_type, request_id, ex
         }
         if request_id:
             payload["request_id"] = request_id
+        if action_url:
+            payload["action_url"] = action_url
         if extra:
             payload.update(extra)
 
@@ -138,7 +142,7 @@ def _send_socketio(target_ids, title, message, notification_type, request_id, ex
         logger.debug("[Notify] SocketIO emit failed: %s", exc)
 
 
-def _send_email(target_ids, title, message, notification_type, action_url):
+def _send_email(target_ids, title, message, notification_type, action_url, details):
     """Look up each user's email from DB and send."""
     try:
         from services.email_service import email_service
@@ -156,6 +160,7 @@ def _send_email(target_ids, title, message, notification_type, action_url):
                         message=message,
                         notification_type=notification_type,
                         action_url=action_url,
+                        details=details,
                     )
             except Exception as exc:
                 logger.debug("[Notify] Email to user %s failed: %s", uid, exc)

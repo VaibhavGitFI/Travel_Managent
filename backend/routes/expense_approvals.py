@@ -79,6 +79,21 @@ def submit_expense(expense_id):
         db.commit()
         db.close()
 
+        # Notify the approver
+        try:
+            from services.notification_service import notify
+            amt = exp.get("verified_amount") or exp.get("invoice_amount") or exp.get("payment_amount") or 0
+            notify(
+                user_id=approver_id,
+                title="New Expense for Approval",
+                message=f"{user.get('full_name') or user.get('name', 'An employee')} submitted an expense of ₹{int(amt):,} for your approval.",
+                notification_type="expense_submitted",
+                action_url="/approvals",
+                details={"Category": exp.get("category", ""), "Amount": f"₹{int(amt):,}", "Description": exp.get("description", "")},
+            )
+        except Exception:
+            pass
+
         return jsonify({"success": True, "message": "Expense submitted for approval", "approver_id": approver_id}), 200
     except Exception:
         logger.exception("[ExpenseApproval] submit failed")
@@ -118,8 +133,24 @@ def approve_expense(expense_id):
             (now, data.get("comments", ""), expense_id),
         )
         db.commit()
-        db.close()
 
+        # Notify the expense owner
+        try:
+            from services.notification_service import notify
+            amt = exp.get("verified_amount") or exp.get("invoice_amount") or exp.get("payment_amount") or 0
+            notify(
+                user_id=exp["user_id"],
+                title="Expense Approved ✅",
+                message=f"Your expense of ₹{int(amt):,} ({exp.get('category', '')}) has been approved.",
+                notification_type="expense_approved",
+                action_url="/expenses",
+            )
+            from extensions import socketio
+            socketio.emit("data_changed", {"entity": "expenses"}, namespace="/")
+        except Exception:
+            pass
+
+        db.close()
         return jsonify({"success": True, "message": "Expense approved"}), 200
     except Exception:
         logger.exception("[ExpenseApproval] approve failed")
@@ -162,8 +193,24 @@ def reject_expense(expense_id):
             (now, reason, expense_id),
         )
         db.commit()
-        db.close()
 
+        # Notify the expense owner
+        try:
+            from services.notification_service import notify
+            amt = exp.get("verified_amount") or exp.get("invoice_amount") or exp.get("payment_amount") or 0
+            notify(
+                user_id=exp["user_id"],
+                title="Expense Rejected ❌",
+                message=f"Your expense of ₹{int(amt):,} ({exp.get('category', '')}) was rejected. Reason: {reason}",
+                notification_type="expense_rejected",
+                action_url="/expenses",
+            )
+            from extensions import socketio
+            socketio.emit("data_changed", {"entity": "expenses"}, namespace="/")
+        except Exception:
+            pass
+
+        db.close()
         return jsonify({"success": True, "message": "Expense rejected"}), 200
     except Exception:
         logger.exception("[ExpenseApproval] reject failed")

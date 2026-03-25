@@ -251,7 +251,7 @@ def _estimate_region_from_coords(lat: float, lng: float) -> dict:
 def reverse_geocode_location(lat: float, lng: float) -> dict:
     """Reverse-geocode GPS coordinates into city, country, and address.
     Uses Google Maps → Nominatim → coordinate-based estimation, in order."""
-    if not lat or not lng:
+    if lat is None or lng is None:
         return {"city": "", "country": "", "formatted_address": "", "source": "none"}
 
     # Try Google Maps first

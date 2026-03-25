@@ -1,10 +1,11 @@
 import { useEffect, useState, useRef, useCallback } from 'react'
-import { Outlet } from 'react-router-dom'
+import { Outlet, useNavigate } from 'react-router-dom'
 import toast from 'react-hot-toast'
 import { cn } from '../../lib/cn'
 import {
   Phone, AlertTriangle, X, Loader2, MapPin, Mic, MicOff, Navigation,
   Building2, Shield, Heart, Siren, ChevronDown, ChevronUp, Copy, Check,
+  CheckCircle, XCircle, ClipboardList, Map, Bell, Wallet, Calendar,
 } from 'lucide-react'
 import Sidebar from './Sidebar'
 import Topbar from './Topbar'
@@ -14,12 +15,41 @@ import socket from '../../lib/socket'
 import { triggerSOS, getEmergencyContacts, reverseGeocode } from '../../api/sos'
 import { getNotifications } from '../../api/notifications'
 
-const NOTIF_ICONS = {
-  approval: '✅',
-  rejection: '❌',
-  approval_request: '📋',
-  trip_plan_ready: '🗺️',
-  expense: '💰',
+// ── Notification type config ─────────────────────────────────────────────────
+const NOTIF_CONFIG = {
+  approval:          { icon: CheckCircle,    color: 'text-emerald-500', bg: 'bg-emerald-50',  border: 'border-emerald-200', label: 'Approved' },
+  rejection:         { icon: XCircle,        color: 'text-red-500',     bg: 'bg-red-50',      border: 'border-red-200',     label: 'Rejected' },
+  approval_request:  { icon: ClipboardList,  color: 'text-indigo-500',  bg: 'bg-indigo-50',   border: 'border-indigo-200',  label: 'New Request' },
+  trip_plan_ready:   { icon: Map,            color: 'text-violet-500',  bg: 'bg-violet-50',   border: 'border-violet-200',  label: 'Trip Plan' },
+  status_update:     { icon: Navigation,     color: 'text-sky-500',     bg: 'bg-sky-50',      border: 'border-sky-200',     label: 'Status Update' },
+  expense_submitted: { icon: Wallet,         color: 'text-amber-500',   bg: 'bg-amber-50',    border: 'border-amber-200',   label: 'Expense' },
+  expense_approved:  { icon: CheckCircle,    color: 'text-emerald-500', bg: 'bg-emerald-50',  border: 'border-emerald-200', label: 'Expense Approved' },
+  expense_rejected:  { icon: XCircle,        color: 'text-red-500',     bg: 'bg-red-50',      border: 'border-red-200',     label: 'Expense Rejected' },
+  sos_alert:         { icon: AlertTriangle,  color: 'text-red-500',     bg: 'bg-red-50',      border: 'border-red-200',     label: 'SOS' },
+  meeting_reminder:  { icon: Calendar,       color: 'text-sky-500',     bg: 'bg-sky-50',      border: 'border-sky-200',     label: 'Meeting' },
+  info:              { icon: Bell,           color: 'text-blue-500',    bg: 'bg-blue-50',     border: 'border-blue-200',    label: 'Info' },
+}
+
+// ── Request browser notification permission on first load ────────────────────
+function requestBrowserNotifPermission() {
+  if ('Notification' in window && Notification.permission === 'default') {
+    Notification.requestPermission()
+  }
+}
+
+function showBrowserNotification(title, message, type) {
+  if ('Notification' in window && Notification.permission === 'granted') {
+    try {
+      const n = new Notification(title, {
+        body: message,
+        icon: '/favicon.ico',
+        tag: `ts-${type}-${Date.now()}`,
+        silent: type !== 'sos_alert',
+      })
+      // Auto-close after 6 seconds
+      setTimeout(() => n.close(), 6000)
+    } catch { /* non-blocking */ }
+  }
 }
 
 export default function Layout() {
@@ -51,6 +81,13 @@ export default function Layout() {
     }
   }, [theme])
 
+  const navigate = useNavigate()
+
+  // ── Request browser notification permission ─────────────────────────────────
+  useEffect(() => {
+    if (auth.isLoggedIn) requestBrowserNotifPermission()
+  }, [auth.isLoggedIn])
+
   // ── Load persistent notifications from DB on login ──────────────────────────
   useEffect(() => {
     if (!auth.isLoggedIn) return
@@ -78,30 +115,85 @@ export default function Layout() {
         type: data.type,
         request_id: data.request_id,
       })
-      const icon = NOTIF_ICONS[data.type] || '🔔'
+
+      // Browser native notification (works in background tab)
+      showBrowserNotification(data.title, data.message, data.type)
+
+      // Styled in-app toast
+      const cfg = NOTIF_CONFIG[data.type] || NOTIF_CONFIG.info
+      const Icon = cfg.icon
+      const actionUrl = data.action_url
       toast(
-        () => (
-          <div className="flex items-start gap-2">
-            <span className="text-lg leading-none">{icon}</span>
-            <div>
-              <p className="font-medium text-gray-900 text-sm">{data.title}</p>
-              {data.message && <p className="text-xs text-gray-500 mt-0.5">{data.message}</p>}
+        (t) => (
+          <div
+            className={cn('flex items-start gap-3 cursor-pointer')}
+            onClick={() => { toast.dismiss(t.id); if (actionUrl) navigate(actionUrl) }}
+          >
+            <div className={cn('flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border', cfg.bg, cfg.border)}>
+              <Icon size={16} className={cfg.color} />
             </div>
+            <div className="flex-1 min-w-0">
+              <p className="font-semibold text-gray-900 text-sm leading-tight">{data.title}</p>
+              {data.message && <p className="text-xs text-gray-500 mt-0.5 line-clamp-2">{data.message}</p>}
+              {actionUrl && <p className="text-[10px] text-blue-500 font-medium mt-1">Click to view →</p>}
+            </div>
+            <button onClick={(e) => { e.stopPropagation(); toast.dismiss(t.id) }}
+              className="shrink-0 p-0.5 rounded text-gray-300 hover:text-gray-500 transition-colors">
+              <X size={14} />
+            </button>
           </div>
         ),
-        { duration: 6000, id: `notif-${data.request_id || Date.now()}` }
+        {
+          duration: data.type === 'sos_alert' ? 15000 : 8000,
+          id: `notif-${data.request_id || Date.now()}`,
+          style: {
+            padding: '14px 16px',
+            borderRadius: '14px',
+            maxWidth: '420px',
+            boxShadow: '0 10px 25px -5px rgba(0,0,0,.12), 0 4px 10px -6px rgba(0,0,0,.08)',
+          },
+        }
       )
+
+      // Auto-refresh stale data for relevant notification types
+      const entityMap = {
+        approval: 'approvals', rejection: 'requests', approval_request: 'approvals',
+        status_update: 'requests', expense_submitted: 'approvals',
+        expense_approved: 'expenses', expense_rejected: 'expenses',
+      }
+      if (entityMap[data.type]) markStale(entityMap[data.type])
     }
 
     const handleTripUpdate = (data) => {
       const now = new Date()
       addNotification({
-        title: data.title || 'Trip Update',
+        title: data.title || 'Trip Plan Ready',
         message: data.message || '',
         time: now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        type: 'trip_update',
+        type: 'trip_plan_ready',
       })
-      toast.success(data.message || 'Trip plan is ready!', { duration: 5000 })
+      showBrowserNotification(data.title || 'Trip Plan Ready', data.message, 'trip_plan_ready')
+      const cfg = NOTIF_CONFIG.trip_plan_ready
+      const Icon = cfg.icon
+      toast(
+        (t) => (
+          <div className="flex items-start gap-3 cursor-pointer" onClick={() => { toast.dismiss(t.id); navigate('/planner') }}>
+            <div className={cn('flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border', cfg.bg, cfg.border)}>
+              <Icon size={16} className={cfg.color} />
+            </div>
+            <div className="flex-1 min-w-0">
+              <p className="font-semibold text-gray-900 text-sm leading-tight">{data.title || 'Trip Plan Ready'}</p>
+              <p className="text-xs text-gray-500 mt-0.5 line-clamp-2">{data.message || 'Your AI trip plan is ready!'}</p>
+              <p className="text-[10px] text-violet-500 font-medium mt-1">Click to view plan →</p>
+            </div>
+          </div>
+        ),
+        {
+          duration: 10000,
+          style: { padding: '14px 16px', borderRadius: '14px', maxWidth: '420px',
+                   boxShadow: '0 10px 25px -5px rgba(0,0,0,.12), 0 4px 10px -6px rgba(0,0,0,.08)' },
+        }
+      )
     }
 
     const handleDataChanged = (data) => {
