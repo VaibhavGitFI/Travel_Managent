@@ -6,7 +6,7 @@ Status flow: draft -> submitted -> pending_approval -> approved -> booked -> in_
 import logging
 from datetime import datetime
 from flask import Blueprint, request, jsonify
-from auth import get_current_user
+from auth import get_current_user, get_current_org
 from agents.request_agent import (
     create_request,
     get_requests,
@@ -18,6 +18,8 @@ from agents.request_agent import (
     generate_trip_report,
 )
 from agents.budget_forecast_agent import forecast_budget
+from extensions import limiter
+from validators import ValidationError, validate_string, validate_date, validate_int, validate_float, validate_enum
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +45,7 @@ def _notify_manager_of_new_request(request_id: str, destination: str, requester_
                 action_url="/approvals",
             )
     except Exception:
-        pass
+        logger.debug("[Requests] _notify_manager failed silently")
 
 requests_bp = Blueprint("requests", __name__, url_prefix="/api/requests")
 
@@ -136,6 +138,7 @@ def _serialize_request(row: dict) -> dict:
 
 
 @requests_bp.route("/budget-forecast", methods=["POST"])
+@limiter.limit("20 per minute")
 def budget_forecast():
     """POST /api/requests/budget-forecast — AI budget prediction for a proposed trip."""
     user = get_current_user()
@@ -201,12 +204,15 @@ def list_requests():
         # Silently auto-transition trips based on travel dates
         check_and_auto_transition()
 
-        if user.get("role") in ("admin", "manager"):
+        org = get_current_org()
+        oid = org["org_id"] if org else None
+
+        if user.get("role") in ("admin", "manager", "super_admin"):
             status_filter = request.args.get("status")
-            rows = get_requests(status=status_filter)
+            rows = get_requests(status=status_filter, org_id=oid)
         else:
             status_filter = request.args.get("status")
-            rows = get_requests(user_id=user["id"], status=status_filter)
+            rows = get_requests(user_id=user["id"], status=status_filter, org_id=oid)
 
         serialized = [_serialize_request(r) for r in rows]
 
@@ -236,7 +242,6 @@ def list_requests():
         return jsonify({
             "success": True,
             "requests": items,
-            "items": items,
             "total": total,
             "page": page,
             "per_page": per_page,
@@ -248,6 +253,7 @@ def list_requests():
 
 
 @requests_bp.route("", methods=["POST"])
+@limiter.limit("20 per minute")
 def create_travel_request():
     """POST /api/requests — create a new travel request."""
     user = get_current_user()
@@ -256,11 +262,24 @@ def create_travel_request():
 
     data = _normalize_request_payload(request.get_json(silent=True) or {})
 
+    # Validate required fields
+    try:
+        validate_string(data, "destination", min_len=2, max_len=100)
+        validate_enum(data, "trip_type", {"domestic", "international"}, required=False, default="domestic")
+        validate_int(data, "num_travelers", min_val=1, max_val=50, required=False, default=1)
+        validate_int(data, "duration_days", min_val=1, max_val=365, required=False, default=1)
+        validate_float(data, "hotel_budget_per_night", min_val=0, max_val=500000, required=False, default=5000)
+        validate_float(data, "estimated_total", min_val=0, max_val=50000000, required=False, default=0)
+    except ValidationError as e:
+        return jsonify({"success": False, "error": e.message}), 400
+
     # Support optional immediate submit action
     action = data.pop("action", "submit")
 
     try:
-        result = create_request(data, user_id=user["id"])
+        org = get_current_org()
+        oid = org["org_id"] if org else None
+        result = create_request(data, user_id=user["id"], org_id=oid)
         if not result.get("success"):
             return jsonify(result), 400
 
@@ -397,6 +416,7 @@ def get_trip_report(request_id):
 
 
 @requests_bp.route("/<string:request_id>/submit", methods=["POST"])
+@limiter.limit("10 per minute")
 def submit_travel_request(request_id):
     """POST /api/requests/<id>/submit — submit a draft request for approval."""
     user = get_current_user()

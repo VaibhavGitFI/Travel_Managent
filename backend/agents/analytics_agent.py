@@ -4,28 +4,14 @@ Schema-tolerant analytics for dashboard, spend, and compliance views.
 """
 import json
 from datetime import datetime, timedelta
-from database import get_db
+from database import get_db, table_columns as _tc
 from services.currency_service import currency
 
 
 def _table_columns(db, table: str) -> set[str]:
-    try:
-        rows = db.execute(f"PRAGMA table_info({table})").fetchall()
-        if rows:
-            return {r[1] if not isinstance(r, dict) else r.get("name", "") for r in rows}
-    except Exception:
-        try:
-            db.commit()
-        except Exception:
-            pass
-    try:
-        rows = db.execute("SELECT column_name FROM information_schema.columns WHERE table_name = ?", (table,)).fetchall()
-        return {r["column_name"] if isinstance(r, dict) else r[0] for r in rows}
-    except Exception:
-        try:
-            db.commit()
-        except Exception:
-            pass
+    cols = _tc(db, table)
+    if cols:
+        return cols
     return {"id", "user_id", "request_id", "trip_id", "category", "description",
             "invoice_amount", "date", "verification_status", "status", "stage",
             "destination", "origin", "start_date", "end_date", "estimated_total",

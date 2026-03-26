@@ -62,7 +62,7 @@ HELP_TEXT = (
     "1 - My Trips\n"
     "2 - Trip Status\n"
     "3 - Approvals\n"
-    "4 - Expenses\n"
+    "4 - Expenses (with pending/approved breakdown)\n"
     "5 - Meetings\n"
     "6 - Weather (e.g. weather Mumbai)\n"
     "7 - SOS / Emergency\n\n"
@@ -70,7 +70,11 @@ HELP_TEXT = (
     "- Send a receipt photo to auto-scan and save\n"
     "- Type: expense 500 Uber cab to airport\n"
     "- UPI screenshots are auto-categorized\n\n"
-    "You can also type any travel-related question and I will assist you."
+    "*Expense Approvals (Managers):*\n"
+    "- expense approvals — view pending\n"
+    "- approve-expense <id> — approve\n"
+    "- reject-expense <id> — reject\n\n"
+    "You can also ask me anything about your trips, expenses, meetings, or policies — I have full access to your TravelSync data."
 )
 
 WELCOME_TEXT = (
@@ -179,29 +183,74 @@ def _get_pending_approvals(user_id: int, role: str) -> str:
 
 def _get_expense_summary(user_id: int) -> str:
     try:
+        from database import table_columns
         db = get_db()
+        ecols = table_columns(db, "expenses_db")
+        has_approval = "approval_status" in ecols
+        amt_expr = "COALESCE(verified_amount, invoice_amount, payment_amount, 0)" if "verified_amount" in ecols else "COALESCE(invoice_amount, 0)"
+
         rows = db.execute(
-            "SELECT category, SUM(invoice_amount) as total, COUNT(*) as cnt "
-            "FROM expenses_db WHERE user_id = ? GROUP BY category ORDER BY total DESC",
+            f"SELECT category, SUM({amt_expr}) as total, COUNT(*) as cnt "
+            f"FROM expenses_db WHERE user_id = ? GROUP BY category ORDER BY total DESC",
             (user_id,),
         ).fetchall()
         total_row = db.execute(
-            "SELECT SUM(invoice_amount) as grand_total, COUNT(*) as cnt FROM expenses_db WHERE user_id = ?",
+            f"SELECT SUM({amt_expr}) as grand_total, COUNT(*) as cnt FROM expenses_db WHERE user_id = ?",
             (user_id,),
         ).fetchone()
-        db.close()
 
         if not rows:
+            db.close()
             return "No expenses recorded yet."
 
         total_row = dict(total_row)
         lines = ["*Expense Summary*\n"]
+
+        # Approval status breakdown
+        if has_approval:
+            status_rows = db.execute(
+                f"SELECT COALESCE(approval_status, 'draft') as status, COUNT(*) as cnt, SUM({amt_expr}) as total "
+                f"FROM expenses_db WHERE user_id = ? GROUP BY COALESCE(approval_status, 'draft')",
+                (user_id,),
+            ).fetchall()
+            if status_rows:
+                lines.append("*By Status:*")
+                for sr in status_rows:
+                    sd = dict(sr)
+                    status_label = (sd.get("status") or "draft").title()
+                    lines.append(f"  {status_label}: {sd['cnt']} items — Rs. {int(sd.get('total') or 0):,}")
+                lines.append("")
+
+        lines.append("*By Category:*")
         for r in rows:
             row = dict(r)
             lines.append(f"  {(row.get('category') or 'other').title()}: Rs. {int(row['total'] or 0):,} ({row['cnt']} items)")
 
         grand = int(total_row.get("grand_total") or 0)
         lines.append(f"\n*Total: Rs. {grand:,}* across {total_row.get('cnt', 0)} expenses")
+
+        # Recent 3 expenses
+        recent_select = [f"{amt_expr} as amount", "category", "description"]
+        if has_approval:
+            recent_select.append("approval_status")
+        if "date" in ecols:
+            recent_select.append("date")
+        recent = db.execute(
+            f"SELECT {', '.join(recent_select)} FROM expenses_db WHERE user_id = ? ORDER BY created_at DESC LIMIT 3",
+            (user_id,),
+        ).fetchall()
+        if recent:
+            lines.append("\n*Recent:*")
+            for r in recent:
+                rd = dict(r)
+                line = f"  Rs. {int(rd.get('amount') or 0):,} — {(rd.get('category') or 'other').title()}"
+                if rd.get("description"):
+                    line += f" ({rd['description'][:30]})"
+                if has_approval:
+                    line += f" [{(rd.get('approval_status') or 'draft').title()}]"
+                lines.append(line)
+
+        db.close()
         return "\n".join(lines)
     except Exception as e:
         logger.warning("[WA Bot] get_expense_summary failed: %s", e)
@@ -257,6 +306,109 @@ def _handle_approve_reject(user: dict, command: str, request_id: str) -> str:
         return "Failed to process the request. Please try on the web app."
 
 
+def _get_pending_expense_approvals(user_id: int, role: str) -> str:
+    """List expenses pending approval for managers."""
+    try:
+        if role not in ("admin", "manager", "super_admin"):
+            return "Only managers and admins can view expense approvals."
+
+        from database import table_columns
+        db = get_db()
+        ecols = table_columns(db, "expenses_db")
+        if "approval_status" not in ecols:
+            db.close()
+            return "Expense approval workflow is not configured."
+
+        amt_expr = "COALESCE(e.verified_amount, e.invoice_amount, 0)"
+        rows = db.execute(
+            f"SELECT e.id, e.category, e.description, {amt_expr} as amount, "
+            f"e.date, u.full_name "
+            f"FROM expenses_db e JOIN users u ON e.user_id = u.id "
+            f"WHERE e.approval_status = 'submitted' AND e.approver_id = ? "
+            f"ORDER BY e.submitted_at DESC LIMIT 10",
+            (user_id,),
+        ).fetchall()
+        db.close()
+
+        if not rows:
+            return "No pending expense approvals. You're all caught up."
+
+        lines = [f"*Pending Expense Approvals ({len(rows)})*\n"]
+        for i, r in enumerate(rows, 1):
+            rd = dict(r)
+            lines.append(
+                f"*{i}. {rd.get('full_name', '?')}* — {(rd.get('category') or 'other').title()}\n"
+                f"  Amount: Rs. {int(rd.get('amount') or 0):,}\n"
+                f"  {rd.get('description', '')[:50]}\n"
+                f"  Date: {rd.get('date', '?')}\n"
+                f"  To approve: approve-expense {rd.get('id', '')}\n"
+                f"  To reject: reject-expense {rd.get('id', '')}\n"
+            )
+        return "\n".join(lines)
+    except Exception as e:
+        logger.warning("[WA Bot] get_pending_expense_approvals failed: %s", e)
+        return "Unable to load expense approvals. Please try again."
+
+
+def _handle_expense_approve_reject(user: dict, command: str, expense_id: str) -> str:
+    """Approve or reject an expense via chat."""
+    try:
+        if user.get("role") not in ("admin", "manager", "super_admin"):
+            return "Only managers and admins can approve or reject expenses."
+
+        from database import table_columns
+        db = get_db()
+        ecols = table_columns(db, "expenses_db")
+        if "approval_status" not in ecols:
+            db.close()
+            return "Expense approval workflow is not configured."
+
+        # Verify expense exists and is submitted
+        expense = db.execute(
+            "SELECT id, user_id, approval_status, approver_id FROM expenses_db WHERE id = ?",
+            (int(expense_id),),
+        ).fetchone()
+
+        if not expense:
+            db.close()
+            return f"Expense #{expense_id} not found."
+
+        ed = dict(expense)
+        if ed.get("approval_status") != "submitted":
+            db.close()
+            return f"Expense #{expense_id} is not in submitted status (current: {ed.get('approval_status', 'draft')})."
+
+        if ed.get("approver_id") and ed["approver_id"] != user["id"] and user.get("role") != "super_admin":
+            db.close()
+            return "You are not the assigned approver for this expense."
+
+        action = "approved" if "approve" in command else "rejected"
+        from datetime import datetime
+        db.execute(
+            "UPDATE expenses_db SET approval_status = ?, approval_comments = ?, approved_at = ? WHERE id = ?",
+            (action, f"Via chat by {user.get('full_name', user['username'])}", datetime.utcnow().isoformat(), int(expense_id)),
+        )
+        db.commit()
+
+        # Notify the submitter
+        try:
+            from services.notification_service import notify
+            notify(
+                user_id=ed["user_id"],
+                type="expense_" + action,
+                title=f"Expense #{expense_id} {action}",
+                message=f"Your expense has been {action} by {user.get('full_name', 'a manager')}.",
+            )
+        except Exception:
+            pass
+
+        db.close()
+        return f"Expense *#{expense_id}* has been *{action}* successfully."
+    except Exception as e:
+        logger.warning("[WA Bot] expense approve/reject failed: %s", e)
+        return "Failed to process. Please try on the web app."
+
+
 def _get_weather(city: str) -> str:
     try:
         from services.weather_service import weather
@@ -278,24 +430,35 @@ def _get_weather(city: str) -> str:
 # ── AI Chat ──────────────────────────────────────────────────────────────────
 
 def _ai_chat(user: dict, message: str, phone: str) -> str:
+    """AI chat with full TravelSync database context — dynamic responses to any query."""
+    from agents.chat_agent import _build_user_context
+
+    # Build rich DB context (same as in-app chat)
+    user_context = _build_user_context(user)
+
     system_prompt = (
-        "You are TravelSync Pro, a corporate travel assistant available on WhatsApp. "
-        "You help with travel planning, hotel recommendations, flight options, expense policies, and travel tips. "
-        f"The user is {user.get('full_name', 'an employee')} ({user.get('role', 'employee')}) "
-        f"from the {user.get('department', 'General')} department.\n\n"
-        "Rules:\n"
-        "- Respond concisely in under 150 words\n"
-        "- Use *bold* only for section headings\n"
-        "- Do not use italic, strikethrough, or emoji-heavy formatting\n"
-        "- Use numbered lists (1. 2. 3.) for recommendations and steps\n"
-        "- Use bullet points (- or •) for details under each item\n"
-        "- Add a blank line between sections for readability\n"
-        "- Never reveal or mention your AI model, engine, or provider name\n"
-        "- You are TravelSync Pro. Refer to yourself only as TravelSync Pro if needed\n"
-        "- Be professional, clear, and well-structured like a premium assistant\n"
-        "- End with a brief actionable suggestion when appropriate\n"
+        "You are TravelSync Pro, a corporate travel assistant available on WhatsApp/Cliq. "
+        "You have FULL access to the user's TravelSync data shown below in USER CONTEXT. "
+        "Use this data to answer ANY question about their trips, expenses, approvals, meetings, policies, etc.\n\n"
+        "## Capabilities\n"
+        "- Answer queries about trip status, expense status (pending/approved/rejected/draft), approval workflows\n"
+        "- Provide expense breakdowns by category, approval status, and date\n"
+        "- Show meeting schedules, travel policy details, notification counts\n"
+        "- Help with travel planning, hotel recommendations, flight options\n"
+        "- Currency conversion, weather forecasts, packing tips\n\n"
+        "## Response Rules\n"
+        "- Respond concisely in under 200 words\n"
+        "- Use *bold* only for section headings and key data\n"
+        "- Use numbered lists (1. 2. 3.) for recommendations\n"
+        "- Use bullet points for details\n"
+        "- Add a blank line between sections\n"
+        "- Never reveal AI model name — you are TravelSync Pro\n"
+        "- Be professional, clear, and well-structured\n"
+        "- When user asks about their data (expenses, trips, etc.), refer to USER CONTEXT below\n"
+        "- For expense queries: always mention approval_status (draft/submitted/approved/rejected)\n"
         "- If asked something unrelated to travel or business, politely redirect\n"
-        "- You have access to the conversation history. Use it to maintain context and give relevant follow-up answers."
+        "- You have conversation history. Use it for context.\n\n"
+        f"--- USER CONTEXT ---\n{user_context}\n--- END CONTEXT ---"
     )
 
     # Build conversation history for the AI
@@ -763,7 +926,7 @@ def _process_message(from_number: str, body: str) -> str:
     if text.startswith("expense ") or text.startswith("exp "):
         return _handle_quick_expense(user, body, phone)
 
-    # Approve / reject
+    # Approve / reject travel requests
     if text.startswith("approve ") or text.startswith("reject "):
         parts = text.split(maxsplit=1)
         cmd = parts[0]
@@ -772,7 +935,61 @@ def _process_message(from_number: str, body: str) -> str:
             return f"Usage: {cmd} TR-2026-XXXXXXX"
         return _handle_approve_reject(user, cmd, rid)
 
-    # AI chat — with conversation memory
+    # Approve / reject expenses
+    if text.startswith("approve-expense ") or text.startswith("reject-expense "):
+        parts = text.split(maxsplit=1)
+        cmd = parts[0]
+        eid = parts[1].strip() if len(parts) > 1 else ""
+        if not eid:
+            return f"Usage: {cmd} <expense_id>"
+        return _handle_expense_approve_reject(user, cmd, eid)
+
+    # Pending expense approvals (for managers)
+    if text in ("expense approvals", "pending expenses", "expense pending"):
+        return _get_pending_expense_approvals(user["id"], user.get("role", "employee"))
+
+    # Smart intent detection — handle natural language queries with DB data
+    # Uses word-level matching so "pending approvals" and "how many approvals pending" both match
+    words = set(text.split())
+    has = lambda *kws: all(any(kw in w for w in words) for kw in kws)
+
+    # Expense queries — "show my expenses", "pending expenses", "expense status", "how much expense"
+    if (has("expense") and any(w in text for w in ("pending", "approved", "rejected", "status", "show", "list", "detail", "how much", "how many", "total"))) \
+       or ("expense" in text and ("my" in text or "all" in text)):
+        summary = _get_expense_summary(user["id"])
+        _add_to_history(phone, "user", body)
+        _add_to_history(phone, "assistant", summary)
+        return summary
+
+    # Approval queries — "pending approvals", "how many approvals", "approval status", "amount pending for approval"
+    if (has("approval") and any(w in text for w in ("pending", "status", "how many", "how much", "show", "list", "my"))) \
+       or ("pending" in text and "approval" in text) \
+       or ("pending" in text and "approve" in text):
+        # If it mentions "expense" too, show expense approvals for managers
+        if "expense" in text and user.get("role") in ("admin", "manager", "super_admin"):
+            result = _get_pending_expense_approvals(user["id"], user.get("role", "employee"))
+        else:
+            result = _get_pending_approvals(user["id"], user.get("role", "employee"))
+        _add_to_history(phone, "user", body)
+        _add_to_history(phone, "assistant", result)
+        return result
+
+    # Trip queries — "my trips", "trip status", "travel status"
+    if has("trip") or has("travel") and any(w in text for w in ("my", "status", "show", "list", "upcoming")):
+        if any(w in text for w in ("my", "status", "show", "list", "upcoming", "recent")):
+            result = _get_user_trips(user["id"])
+            _add_to_history(phone, "user", body)
+            _add_to_history(phone, "assistant", result)
+            return result
+
+    # Meeting queries — "my meetings", "upcoming meetings", "next meeting"
+    if any(w in text for w in ("meeting", "meetings")) and any(w in text for w in ("my", "upcoming", "next", "client", "show", "list", "schedule")):
+        result = _get_upcoming_meetings(user["id"])
+        _add_to_history(phone, "user", body)
+        _add_to_history(phone, "assistant", result)
+        return result
+
+    # AI chat — with conversation memory and full DB context
     _add_to_history(phone, "user", body)
     reply = _ai_chat(user, body, phone)
     _add_to_history(phone, "assistant", reply)

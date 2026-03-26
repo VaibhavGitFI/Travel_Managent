@@ -6,6 +6,7 @@ import logging
 from flask import Blueprint, request, jsonify
 from auth import get_current_user
 from services.currency_service import currency as currency_service
+from extensions import limiter
 
 logger = logging.getLogger(__name__)
 
@@ -13,6 +14,7 @@ currency_bp = Blueprint("currency", __name__, url_prefix="/api/currency")
 
 
 @currency_bp.route("/convert", methods=["POST"])
+@limiter.limit("30 per minute")
 def convert():
     """POST /api/currency/convert — convert between any two currencies."""
     user = get_current_user()

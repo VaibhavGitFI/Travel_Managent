@@ -5,7 +5,7 @@ Meetings can originate from any source: manual, email, WhatsApp, phone, calendar
 """
 import logging
 from flask import Blueprint, request, jsonify
-from auth import get_current_user
+from auth import get_current_user, get_current_org
 from agents.meeting_agent import (
     add_meeting,
     get_all_meetings,
@@ -15,6 +15,8 @@ from agents.meeting_agent import (
     suggest_nearby_venues,
     parse_meeting_text,
 )
+from extensions import limiter
+from validators import ValidationError, validate_string, validate_email as v_email
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +94,7 @@ def list_meetings():
 
 
 @meetings_bp.route("", methods=["POST"])
+@limiter.limit("20 per minute")
 def create_meeting():
     """POST /api/meetings — create a new client meeting."""
     user = get_current_user()
@@ -101,7 +104,17 @@ def create_meeting():
     data = _normalize_meeting_payload(request.get_json(silent=True) or {})
 
     try:
-        result = add_meeting(data, user_id=user["id"])
+        validate_string(data, "client_name", min_len=2, max_len=100)
+        validate_string(data, "company", max_len=100, required=False)
+        validate_string(data, "agenda", max_len=500, required=False)
+        v_email(data, "email", required=False)
+    except ValidationError as e:
+        return jsonify({"success": False, "error": e.message}), 400
+
+    try:
+        org = get_current_org()
+        oid = org["org_id"] if org else None
+        result = add_meeting(data, user_id=user["id"], org_id=oid)
         status = 201 if result.get("success") else 400
         if result.get("success"):
             try:
@@ -162,6 +175,7 @@ def remove_meeting(meeting_id):
 
 
 @meetings_bp.route("/suggest-schedule", methods=["POST"])
+@limiter.limit("10 per minute")
 def suggest_schedule():
     """POST /api/meetings/suggest-schedule — Gemini-powered schedule optimization."""
     user = get_current_user()

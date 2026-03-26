@@ -17,7 +17,7 @@ from services.gemini_service import gemini
 from services.weather_service import weather
 from services.currency_service import currency
 from services.search_service import search
-from database import get_db
+from database import get_db, table_columns
 
 logger = logging.getLogger(__name__)
 
@@ -78,8 +78,7 @@ def _build_user_context(user: dict) -> str:
 
         # Recent travel requests (last 5)
         try:
-            cols_info = db.execute("PRAGMA table_info(travel_requests)").fetchall()
-            cols = {r[1] for r in cols_info}
+            cols = table_columns(db, "travel_requests")
             select = ["request_id", "destination", "status"]
             if "origin" in cols:
                 select.append("origin")
@@ -154,17 +153,81 @@ def _build_user_context(user: dict) -> str:
         except Exception as e:
             logger.debug("[Chat Context] Meetings query error: %s", e)
 
-        # Recent expenses summary
+        # Detailed expenses with approval status breakdown
         try:
+            ecols = table_columns(db, "expenses_db")
+            amt_expr = "COALESCE(verified_amount, invoice_amount, payment_amount, 0)" if "verified_amount" in ecols else "COALESCE(invoice_amount, 0)"
+            has_approval = "approval_status" in ecols
+
+            # Total summary
             expenses = db.execute(
-                "SELECT COUNT(*) as cnt, SUM(COALESCE(verified_amount, invoice_amount, payment_amount, 0)) as total FROM expenses_db WHERE user_id = ?",
+                f"SELECT COUNT(*) as cnt, SUM({amt_expr}) as total FROM expenses_db WHERE user_id = ?",
                 (user["id"],),
             ).fetchone()
             ed = dict(expenses)
+
             if ed.get("cnt", 0) > 0:
                 context_parts.append(f"Total expenses: {ed['cnt']} items, ₹{ed.get('total', 0):,.0f}")
+
+                # Approval status breakdown
+                if has_approval:
+                    status_rows = db.execute(
+                        f"SELECT COALESCE(approval_status, 'draft') as status, COUNT(*) as cnt, SUM({amt_expr}) as total "
+                        f"FROM expenses_db WHERE user_id = ? GROUP BY COALESCE(approval_status, 'draft')",
+                        (user["id"],),
+                    ).fetchall()
+                    status_parts = []
+                    for sr in status_rows:
+                        sd = dict(sr)
+                        status_parts.append(f"{sd['status']}: {sd['cnt']} items (₹{sd.get('total', 0):,.0f})")
+                    if status_parts:
+                        context_parts.append("  Expense breakdown: " + " | ".join(status_parts))
+
+                # By category
+                cat_rows = db.execute(
+                    f"SELECT category, COUNT(*) as cnt, SUM({amt_expr}) as total FROM expenses_db WHERE user_id = ? GROUP BY category ORDER BY total DESC LIMIT 5",
+                    (user["id"],),
+                ).fetchall()
+                if cat_rows:
+                    cat_parts = [f"{dict(c).get('category', 'other')}: ₹{dict(c).get('total', 0):,.0f}" for c in cat_rows]
+                    context_parts.append("  By category: " + " | ".join(cat_parts))
+
+                # Recent 5 expenses with status
+                select_cols = ["id", "category", "description", f"{amt_expr} as amount"]
+                if has_approval:
+                    select_cols.append("approval_status")
+                if "date" in ecols:
+                    select_cols.append("date")
+                recent_exp = db.execute(
+                    f"SELECT {', '.join(select_cols)} FROM expenses_db WHERE user_id = ? ORDER BY created_at DESC LIMIT 5",
+                    (user["id"],),
+                ).fetchall()
+                if recent_exp:
+                    exp_lines = []
+                    for e in recent_exp:
+                        ed2 = dict(e)
+                        line = f"  - #{ed2.get('id', '?')}: {ed2.get('category', '?')} — ₹{ed2.get('amount', 0):,.0f}"
+                        if ed2.get('description'):
+                            line += f" ({ed2['description'][:40]})"
+                        if has_approval:
+                            line += f" | Status: {ed2.get('approval_status', 'draft')}"
+                        if ed2.get('date'):
+                            line += f" | Date: {ed2['date']}"
+                        exp_lines.append(line)
+                    context_parts.append("Recent expenses:\n" + "\n".join(exp_lines))
             else:
                 context_parts.append("Total expenses: None recorded")
+
+            # Pending expense approvals (for managers)
+            if has_approval and user.get("role") in ("manager", "admin"):
+                pending_exp = db.execute(
+                    f"SELECT COUNT(*) as cnt, SUM({amt_expr}) as total FROM expenses_db WHERE approver_id = ? AND approval_status = 'submitted'",
+                    (user["id"],),
+                ).fetchone()
+                pe = dict(pending_exp)
+                if pe.get("cnt", 0) > 0:
+                    context_parts.append(f"Expense approvals pending for you: {pe['cnt']} items (₹{pe.get('total', 0):,.0f})")
+
         except Exception as e:
             logger.debug("[Chat Context] Expenses query error: %s", e)
 
@@ -179,6 +242,30 @@ def _build_user_context(user: dict) -> str:
                     f"Monthly budget=₹{pd.get('monthly_budget_inr', 'N/A')}, "
                     f"Auto-approve threshold=₹{pd.get('auto_approve_threshold', 'N/A')}"
                 )
+        except Exception:
+            pass
+
+        # Active SOS events
+        try:
+            sos = db.execute(
+                "SELECT COUNT(*) as cnt FROM sos_events WHERE user_id = ? AND resolved = 0",
+                (user["id"],),
+            ).fetchone()
+            sos_cnt = dict(sos).get("cnt", 0)
+            if sos_cnt > 0:
+                context_parts.append(f"Active SOS alerts: {sos_cnt}")
+        except Exception:
+            pass
+
+        # Notifications unread count
+        try:
+            notif = db.execute(
+                "SELECT COUNT(*) as cnt FROM notifications WHERE user_id = ? AND read = 0",
+                (user["id"],),
+            ).fetchone()
+            notif_cnt = dict(notif).get("cnt", 0)
+            if notif_cnt > 0:
+                context_parts.append(f"Unread notifications: {notif_cnt}")
         except Exception:
             pass
 

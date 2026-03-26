@@ -3,10 +3,11 @@ TravelSync Pro — Expense Approval Routes
 Adds approval workflow on top of existing expense CRUD (which stays untouched).
 """
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from flask import Blueprint, request, jsonify
 from auth import get_current_user
 from database import get_db
+from extensions import limiter
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,7 @@ def _find_approver(db, user):
 
 
 @expense_approvals_bp.route("/<int:expense_id>/submit", methods=["POST"])
+@limiter.limit("20 per minute")
 def submit_expense(expense_id):
     """POST /api/expenses/:id/submit — submit an expense for approval."""
     user = get_current_user()
@@ -71,7 +73,7 @@ def submit_expense(expense_id):
             db.close()
             return jsonify({"success": False, "error": "No approver available. Contact your admin."}), 400
 
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         db.execute(
             "UPDATE expenses_db SET approval_status = 'submitted', approver_id = ?, submitted_at = ?, approval_comments = NULL WHERE id = ?",
             (approver_id, now, expense_id),
@@ -101,6 +103,7 @@ def submit_expense(expense_id):
 
 
 @expense_approvals_bp.route("/<int:expense_id>/approve", methods=["POST"])
+@limiter.limit("20 per minute")
 def approve_expense(expense_id):
     """POST /api/expenses/:id/approve — approve an expense."""
     user = get_current_user()
@@ -127,7 +130,7 @@ def approve_expense(expense_id):
             return jsonify({"success": False, "error": "Not assigned as approver"}), 403
 
         data = request.get_json(silent=True) or {}
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         db.execute(
             "UPDATE expenses_db SET approval_status = 'approved', approved_at = ?, approval_comments = ? WHERE id = ?",
             (now, data.get("comments", ""), expense_id),
@@ -158,6 +161,7 @@ def approve_expense(expense_id):
 
 
 @expense_approvals_bp.route("/<int:expense_id>/reject", methods=["POST"])
+@limiter.limit("20 per minute")
 def reject_expense(expense_id):
     """POST /api/expenses/:id/reject — reject an expense with reason."""
     user = get_current_user()
@@ -187,7 +191,7 @@ def reject_expense(expense_id):
             db.close()
             return jsonify({"success": False, "error": "Not assigned as approver"}), 403
 
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         db.execute(
             "UPDATE expenses_db SET approval_status = 'rejected', approved_at = ?, approval_comments = ? WHERE id = ?",
             (now, reason, expense_id),

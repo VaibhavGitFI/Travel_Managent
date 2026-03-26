@@ -4,7 +4,9 @@ Single entry point for all notifications. Dispatches to:
   1. Database (notifications table — persistent history)
   2. SocketIO (real-time in-app)
   3. Email (SMTP)
-  4. Zoho Cliq (incoming webhook)
+  4. Zoho Cliq (channel webhook)
+  5. WhatsApp (Twilio)
+  6. Slack (webhook or bot)
 
 All channels are independently gated — unconfigured channels are silently skipped.
 Dispatch runs in a background thread so it never blocks the HTTP response.
@@ -99,6 +101,10 @@ def _dispatch(
     # 5. WhatsApp
     if use_all or "whatsapp" in ch:
         _send_whatsapp(target_ids, title, message, notification_type)
+
+    # 6. Slack
+    if use_all or "slack" in ch:
+        _send_slack(title, message, notification_type, action_url)
 
 
 # ── Channel implementations ──────────────────────────────────────────────────
@@ -198,6 +204,17 @@ def _send_whatsapp(target_ids, title, message, notification_type):
         db.close()
     except Exception as exc:
         logger.debug("[Notify] WhatsApp channel failed: %s", exc)
+
+
+def _send_slack(title, message, notification_type, action_url):
+    """Post to the Slack channel (channel-level, not per-user)."""
+    try:
+        from services.slack_service import slack_service
+        if not slack_service.configured:
+            return
+        slack_service.send(title, message, notification_type, action_url)
+    except Exception as exc:
+        logger.debug("[Notify] Slack channel failed: %s", exc)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────

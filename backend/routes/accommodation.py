@@ -7,6 +7,7 @@ from datetime import datetime
 from flask import Blueprint, request, jsonify
 from auth import get_current_user
 from agents.hotel_agent import search_hotels, search_pg_options
+from extensions import limiter
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +33,7 @@ def _duration_days(check_in: str, check_out: str) -> int:
 
 
 @accommodation_bp.route("/search", methods=["GET"])
+@limiter.limit("30 per minute")
 def search():
     """GET /api/accommodation/search — search hotels for destination/date range."""
     user = get_current_user()
@@ -71,6 +73,7 @@ def search():
 
 
 @accommodation_bp.route("/pg-options", methods=["POST"])
+@limiter.limit("20 per minute")
 def pg_options():
     """POST /api/accommodation/pg-options — search PG/serviced options for long stays."""
     user = get_current_user()

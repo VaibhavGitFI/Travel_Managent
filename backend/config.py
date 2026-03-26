@@ -56,7 +56,10 @@ class Config:
     # Core
     SECRET_KEY = _get_env_or_secret("FLASK_SECRET_KEY", default="change-this-in-production")
     DEBUG = os.getenv("DEBUG", "True").lower() == "true"
-    PORT = int(os.getenv("PORT", 3399))
+    try:
+        PORT = int(os.getenv("PORT", 3399))
+    except (ValueError, TypeError):
+        PORT = 3399
 
     # Warn loudly if using the default secret in production
     if _is_gcp() and SECRET_KEY == "change-this-in-production":
@@ -93,7 +96,10 @@ class Config:
 
     # Notifications — Email (SMTP)
     SMTP_HOST          = _get_env_or_secret("SMTP_HOST")
-    SMTP_PORT          = int(os.getenv("SMTP_PORT", "587"))
+    try:
+        SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+    except (ValueError, TypeError):
+        SMTP_PORT = 587
     SMTP_USER          = _get_env_or_secret("SMTP_USER")
     SMTP_PASSWORD      = _get_env_or_secret("SMTP_PASSWORD")
     SMTP_FROM_EMAIL    = os.getenv("SMTP_FROM_EMAIL")
@@ -106,13 +112,24 @@ class Config:
     ZOHO_CLIQ_REFRESH_TOKEN = _get_env_or_secret("ZOHO_CLIQ_REFRESH_TOKEN")
     ZOHO_CLIQ_ACCESS_TOKEN  = _get_env_or_secret("ZOHO_CLIQ_ACCESS_TOKEN")
 
+    # Notifications — Slack
+    SLACK_WEBHOOK_URL = _get_env_or_secret("SLACK_WEBHOOK_URL")
+    SLACK_BOT_TOKEN   = _get_env_or_secret("SLACK_BOT_TOKEN")
+    SLACK_CHANNEL     = os.getenv("SLACK_CHANNEL", "#travel-notifications")
+
     # Database — Cloud SQL PostgreSQL in prod (via DATABASE_URL), SQLite in dev
     DATABASE_URL = _get_env_or_secret("DATABASE_URL")
 
     # JWT
     JWT_SECRET_KEY  = _get_env_or_secret("JWT_SECRET_KEY", default=SECRET_KEY)
-    JWT_ACCESS_TTL  = int(os.getenv("JWT_ACCESS_TTL_MINUTES", "1440"))   # 24 h
-    JWT_REFRESH_TTL = int(os.getenv("JWT_REFRESH_TTL_DAYS", "30"))
+    try:
+        JWT_ACCESS_TTL = int(os.getenv("JWT_ACCESS_TTL_MINUTES", "1440"))
+    except (ValueError, TypeError):
+        JWT_ACCESS_TTL = 1440
+    try:
+        JWT_REFRESH_TTL = int(os.getenv("JWT_REFRESH_TTL_DAYS", "30"))
+    except (ValueError, TypeError):
+        JWT_REFRESH_TTL = 30
 
     # GCP
     GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID") or os.getenv("GOOGLE_CLOUD_PROJECT")
@@ -132,6 +149,7 @@ class Config:
             "whatsapp":          bool(cls.TWILIO_ACCOUNT_SID and cls.TWILIO_AUTH_TOKEN),
             "email_smtp":        bool(cls.SMTP_HOST and cls.SMTP_USER),
             "zoho_cliq":         bool(cls.ZOHO_CLIQ_API_ENDPOINT and cls.ZOHO_CLIQ_REFRESH_TOKEN),
+            "slack":             bool(cls.SLACK_WEBHOOK_URL or cls.SLACK_BOT_TOKEN),
         }
 
     @classmethod

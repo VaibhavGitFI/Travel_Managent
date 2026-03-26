@@ -7,6 +7,7 @@ import logging
 from datetime import datetime
 from flask import Blueprint, request, jsonify
 from auth import get_current_user
+from extensions import limiter
 from agents.sos_agent import (
     get_emergency_contacts, find_nearby_hospitals, find_nearby_police,
     reverse_geocode_location,
@@ -40,10 +41,11 @@ def _emit_sos_alert(user: dict, city: str, message: str, lat=None, lng=None) -> 
             },
         )
     except Exception:
-        pass
+        logger.debug("[SOS] _emit_sos_alert failed silently")
 
 
 @sos_bp.route("", methods=["POST"])
+@limiter.limit("5 per minute")
 def trigger_sos():
     """
     POST /api/sos
@@ -89,7 +91,7 @@ def trigger_sos():
         db.commit()
         db.close()
     except Exception:
-        pass  # DB failure must not block emergency response
+        logger.warning("[SOS] Failed to log SOS event to database")  # DB failure must not block emergency response
 
     # Broadcast to managers
     _emit_sos_alert(user, city, message, latitude, longitude)

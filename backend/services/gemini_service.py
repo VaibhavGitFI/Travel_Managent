@@ -1,6 +1,7 @@
 """
 TravelSync Pro — Gemini AI Service
-Uses Google Gemini 2.0 Flash (fast, cheap) and 1.5 Pro (complex analysis)
+Uses Gemini 2.5 Pro (complex/chat) and 2.5 Flash (fast/vision/streaming).
+Enterprise-grade with higher rate limits.
 Falls back gracefully when GEMINI_API_KEY not set.
 """
 import os
@@ -231,15 +232,31 @@ Return JSON with keys:
             return None
         if self._cooldown_until > time.time():
             return None
+        import tempfile
+        tmp_path = None
+        uploaded_file = None
         try:
+            # Gemini requires file upload for audio — write to temp file first
+            ext_map = {
+                "audio/ogg": ".ogg", "audio/mpeg": ".mp3", "audio/wav": ".wav",
+                "audio/mp4": ".m4a", "audio/aac": ".aac", "audio/opus": ".opus",
+                "audio/webm": ".webm", "audio/amr": ".amr",
+            }
+            suffix = ext_map.get(mime_type, ".ogg")
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                tmp.write(audio_bytes)
+                tmp.flush()
+                tmp_path = tmp.name
+
+            uploaded_file = self._genai.upload_file(tmp_path, mime_type=mime_type)
+
             model = self._genai.GenerativeModel(GEMINI_MODELS["flash"])
-            audio_part = {"mime_type": mime_type, "data": audio_bytes}
             prompt = (
                 "Transcribe this audio accurately. Return ONLY the spoken text, "
                 "nothing else. If the audio is in Hindi or another Indian language, "
                 "transliterate to English. If the audio is unclear or empty, return: [unclear]"
             )
-            response = model.generate_content([prompt, audio_part])
+            response = model.generate_content([prompt, uploaded_file])
             text = (response.text or "").strip()
             if not text or text == "[unclear]":
                 return None
@@ -251,6 +268,18 @@ Return JSON with keys:
                 return None
             logger.warning("[Gemini] Audio transcription error: %s", e)
             return None
+        finally:
+            # Clean up temp file and uploaded file
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+            if uploaded_file:
+                try:
+                    self._genai.delete_file(uploaded_file.name)
+                except Exception:
+                    pass
 
     @property
     def is_available(self) -> bool:

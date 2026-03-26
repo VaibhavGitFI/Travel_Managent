@@ -23,7 +23,7 @@ from agents.chat_agent import (
 )
 from services.anthropic_service import claude
 from services.gemini_service import gemini
-from database import get_db
+from database import get_db, table_columns
 from config import Config
 from services.vision_service import vision
 
@@ -108,7 +108,7 @@ def _extract_attachment(file_path: str, filename: str) -> dict:
 
 
 def _insert_chat_message(db, user_id: int, role: str, content: str, intent: str = None, action_cards=None, session_id: str = None):
-    cols = {r[1] for r in db.execute("PRAGMA table_info(chat_messages)").fetchall()}
+    cols = table_columns(db, "chat_messages")
     values = {"user_id": user_id, "role": role, "content": content}
     if "intent" in cols and intent is not None:
         values["intent"] = intent
@@ -407,11 +407,14 @@ def history():
         return jsonify({"success": False, "error": "Authentication required"}), 401
 
     session_id = request.args.get("session_id")
-    limit = min(int(request.args.get("limit", 50)), 200)
+    try:
+        limit = min(int(request.args.get("limit", 50)), 200)
+    except (ValueError, TypeError):
+        limit = 50
 
     try:
         db = get_db()
-        cols = {r[1] for r in db.execute("PRAGMA table_info(chat_messages)").fetchall()}
+        cols = table_columns(db, "chat_messages")
         select_cols = ["id", "role", "content", "created_at"]
         if "intent" in cols:
             select_cols.append("intent")

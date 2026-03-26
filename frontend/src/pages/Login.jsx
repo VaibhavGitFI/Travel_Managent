@@ -1,8 +1,9 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Eye, EyeOff, Layers, Lock, Mail, ArrowLeft, Building } from 'lucide-react'
+import { Eye, EyeOff, Layers, Lock, Mail, ArrowLeft, Building, User } from 'lucide-react'
 import toast from 'react-hot-toast'
 import { login, register, verifyEmail, forgotPassword, resetPassword } from '../api/auth'
+import { getMyOrganization } from '../api/organizations'
 import useStore from '../store/useStore'
 
 
@@ -80,6 +81,11 @@ export default function Login() {
       const u = data.user || { id: 0, username: form.username, name: form.username, role: 'employee' }
       if (!u.name && u.full_name) u.name = u.full_name
       setUser(u)
+      // Load org context after login
+      try {
+        const orgData = await getMyOrganization()
+        useStore.getState().setOrg(orgData.organization || null)
+      } catch { /* no org yet — that's fine */ }
       toast.success(`Welcome back, ${data.user?.name || form.username}!`)
       navigate('/dashboard', { replace: true })
     } catch (error) {
@@ -104,7 +110,10 @@ export default function Login() {
     if (!regForm.email.trim()) nextErrors.email = 'Email is required'
     if (!regForm.email.includes('@')) nextErrors.email = 'Invalid email'
     if (!regForm.password) nextErrors.password = 'Password is required'
-    if (regForm.password.length < 6) nextErrors.password = 'Min 6 characters'
+    else if (regForm.password.length < 8) nextErrors.password = 'Min 8 characters'
+    else if (!/[A-Z]/.test(regForm.password)) nextErrors.password = 'Needs an uppercase letter'
+    else if (!/[a-z]/.test(regForm.password)) nextErrors.password = 'Needs a lowercase letter'
+    else if (!/\d/.test(regForm.password)) nextErrors.password = 'Needs a number'
     if (Object.keys(nextErrors).length) { setErrors(nextErrors); return }
 
     setErrors({})

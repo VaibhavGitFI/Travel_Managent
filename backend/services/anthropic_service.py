@@ -9,8 +9,8 @@ from typing import Generator
 
 logger = logging.getLogger(__name__)
 
-MODEL = "claude-opus-4-6"
-MAX_TOKENS = 1024
+MODEL = "claude-sonnet-4-20250514"
+MAX_TOKENS = 8192
 
 
 class AnthropicService:

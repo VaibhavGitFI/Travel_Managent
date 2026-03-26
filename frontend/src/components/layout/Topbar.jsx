@@ -241,9 +241,10 @@ export default function Topbar() {
         >
           <div className="w-7 h-7 rounded-full bg-brand-dark flex items-center justify-center text-white text-xs font-bold overflow-hidden">
             {user?.profile_picture
-              ? <img src={`/api/uploads/${user.profile_picture}`} alt="" className="h-full w-full object-cover" />
-              : (user?.name?.charAt(0)?.toUpperCase() || 'U')
+              ? <img src={`${import.meta.env.DEV ? 'http://localhost:3399' : ''}/api/uploads/${user.profile_picture}`} alt="" className="h-full w-full object-cover" onError={e => e.target.style.display='none'} />
+              : null
             }
+            {(!user?.profile_picture) && (user?.name?.charAt(0)?.toUpperCase() || 'U')}
           </div>
           <span className={cn('hidden md:block text-[13px] font-medium max-w-[120px] truncate',
             isDark ? 'text-brand-light' : 'text-gray-700')}>

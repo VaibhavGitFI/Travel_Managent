@@ -5,7 +5,7 @@ Works with both legacy and newer expenses_db column layouts.
 """
 import os
 from datetime import datetime
-from database import get_db
+from database import get_db, table_columns
 from services.vision_service import vision
 from services.currency_service import currency
 
@@ -18,26 +18,10 @@ EXPENSE_CATEGORIES = [
 
 
 def _table_columns(db, table: str) -> set[str]:
-    """Get column names — works with both SQLite and PostgreSQL."""
-    try:
-        rows = db.execute(f"PRAGMA table_info({table})").fetchall()
-        if rows:
-            return {r[1] if not isinstance(r, dict) else r.get("name", "") for r in rows}
-    except Exception:
-        try:
-            db.commit()  # Reset aborted transaction
-        except Exception:
-            pass
-    try:
-        rows = db.execute(
-            "SELECT column_name FROM information_schema.columns WHERE table_name = ?", (table,)
-        ).fetchall()
-        return {r["column_name"] if isinstance(r, dict) else r[0] for r in rows}
-    except Exception:
-        try:
-            db.commit()
-        except Exception:
-            pass
+    """Get column names — works with both SQLite and PostgreSQL (Supabase)."""
+    cols = table_columns(db, table)
+    if cols:
+        return cols
     return {"id", "user_id", "request_id", "trip_id", "category", "description",
             "invoice_amount", "date", "verification_status", "stage", "currency_code",
             "ocr_extracted_amount", "ocr_confidence", "created_at"}
@@ -107,6 +91,8 @@ def add_expense(data: dict) -> dict:
             }
 
         record = {}
+        if "org_id" in cols and data.get("org_id"):
+            record["org_id"] = data.get("org_id")
         if "request_id" in cols:
             record["request_id"] = data.get("request_id") or data.get("trip_id") or "default"
         if "trip_id" in cols:
@@ -168,31 +154,43 @@ def add_expense(data: dict) -> dict:
         db.close()
 
 
-def get_expenses(trip_id: str = None, user_id: int = None) -> dict:
-    """Fetch expenses, optionally filtered by trip/request id."""
+def get_expenses(trip_id: str = None, user_id: int = None, org_id: int = None) -> dict:
+    """Fetch expenses, optionally filtered by trip/request id and org."""
     db = get_db()
     try:
         cols = _table_columns(db, "expenses_db")
-        query = "SELECT * FROM expenses_db WHERE 1=1"
+        # Join approver info if approval workflow columns exist
+        has_approval = "approver_id" in cols
+        if has_approval:
+            query = ("SELECT e.*, u.full_name as approver_name "
+                     "FROM expenses_db e LEFT JOIN users u ON e.approver_id = u.id WHERE 1=1")
+        else:
+            query = "SELECT * FROM expenses_db WHERE 1=1"
         params = []
 
+        p = "e." if has_approval else ""
+        if org_id and "org_id" in cols:
+            query += f" AND {p}org_id = ?"
+            params.append(org_id)
+
         if user_id and "user_id" in cols:
-            query += " AND user_id = ?"
+            query += f" AND {p}user_id = ?"
             params.append(user_id)
 
         if trip_id:
             trip_filters = []
             if "trip_id" in cols:
-                trip_filters.append("trip_id = ?")
+                trip_filters.append(f"{p}trip_id = ?")
                 params.append(trip_id)
             if "request_id" in cols:
-                trip_filters.append("request_id = ?")
+                trip_filters.append(f"{p}request_id = ?")
                 params.append(trip_id)
             if trip_filters:
                 query += " AND (" + " OR ".join(trip_filters) + ")"
 
         order_col = "expense_date" if "expense_date" in cols else "date" if "date" in cols else "created_at"
-        query += f" ORDER BY {order_col} DESC"
+        prefix = "e." if has_approval else ""
+        query += f" ORDER BY {prefix}{order_col} DESC"
         rows = db.execute(query, tuple(params)).fetchall()
 
         expenses = []

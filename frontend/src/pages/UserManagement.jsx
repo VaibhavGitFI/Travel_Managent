@@ -151,7 +151,7 @@ export default function UserManagement() {
                         <div className={cn('flex h-8 w-8 items-center justify-center rounded-full text-xs font-bold overflow-hidden',
                           u.profile_picture ? '' : 'bg-gradient-to-br from-brand-dark to-brand-mid text-white')}>
                           {u.profile_picture
-                            ? <img src={`/api/uploads/${u.profile_picture}`} alt="" className="h-full w-full object-cover" />
+                            ? <img src={`${import.meta.env.DEV ? 'http://localhost:3399' : ''}/api/uploads/${u.profile_picture}`} alt="" className="h-full w-full object-cover" onError={e => e.target.style.display='none'} />
                             : (u.avatar_initials || u.name?.charAt(0)?.toUpperCase() || 'U')
                           }
                         </div>

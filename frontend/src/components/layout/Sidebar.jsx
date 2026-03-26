@@ -16,6 +16,7 @@ import {
   ChevronsRight,
   UserCircle,
   Settings,
+  Globe,
 } from 'lucide-react'
 import { cn } from '../../lib/cn'
 import useStore from '../../store/useStore'
@@ -40,7 +41,7 @@ const navGroups = [
     items: [
       { to: '/expenses',  icon: Receipt,     label: 'Expenses' },
       { to: '/requests',  icon: FileText,    label: 'Requests' },
-      { to: '/approvals', icon: CheckSquare, label: 'Approvals', roles: ELEVATED },
+      { to: '/approvals', icon: CheckSquare, label: 'Approvals' },
       { to: '/analytics', icon: BarChart3,   label: 'Analytics', roles: ELEVATED },
     ],
   },
@@ -48,17 +49,20 @@ const navGroups = [
     label: 'Account',
     items: [
       { to: '/profile',         icon: UserCircle, label: 'Profile' },
+      { to: '/organization',    icon: Building2,  label: 'Organization' },
       { to: '/user-management', icon: Settings,   label: 'Users', roles: ['super_admin'] },
+      { to: '/platform-admin',  icon: Globe,      label: 'Platform Admin', roles: ['super_admin'] },
     ],
   },
 ]
 
 export default function Sidebar() {
-  const { auth, sidebar, toggleSidebar, setSidebarCollapsed, logout: storeLogout } = useStore()
+  const { auth, sidebar, org, toggleSidebar, setSidebarCollapsed, logout: storeLogout } = useStore()
   const collapsed = sidebar.collapsed
   const navigate = useNavigate()
   const user = auth.user
   const userRole = user?.role || 'employee'
+  const orgName = org?.current?.name || user?.org_name
 
   // Filter nav items by role
   const filteredGroups = navGroups
@@ -130,7 +134,7 @@ export default function Sidebar() {
               TravelSync
             </span>
             <span className="-mt-0.5 block whitespace-nowrap text-[10px] font-medium uppercase tracking-[0.15em] text-brand-muted">
-              Pro
+              {orgName || 'Pro'}
             </span>
           </div>
         )}

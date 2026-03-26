@@ -6,6 +6,7 @@ import logging
 from flask import Blueprint, request, jsonify
 from auth import get_current_user, super_admin_required, _user_cache
 from database import get_db
+from extensions import limiter
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +24,7 @@ def list_users():
 
     try:
         db = get_db()
-        query = "SELECT id, username, name, full_name, email, role, department, sub_role, phone, profile_picture, created_at FROM users"
+        query = "SELECT id, username, name, full_name, email, role, department, sub_role, phone, profile_picture, email_verified, created_at FROM users"
         params = []
         conditions = []
 
@@ -46,7 +47,7 @@ def list_users():
         return jsonify({"success": True, "users": users, "total": len(users)}), 200
     except Exception:
         logger.exception("[Users] list failed")
-        return jsonify({"success": True, "users": [], "total": 0}), 200
+        return jsonify({"success": False, "error": "Failed to list users"}), 500
 
 
 @users_bp.route("/<int:user_id>", methods=["GET"])
@@ -67,6 +68,7 @@ def get_user(user_id):
 
 
 @users_bp.route("/<int:user_id>/role", methods=["PUT"])
+@limiter.limit("10 per minute")
 @super_admin_required
 def update_role(user_id):
     """PUT /api/users/:id/role — change a user's role (super_admin only)."""
@@ -105,3 +107,25 @@ def update_role(user_id):
     except Exception:
         logger.exception("[Users] role update failed")
         return jsonify({"success": False, "error": "Failed to update role"}), 500
+
+
+@users_bp.route("/<int:user_id>/verify", methods=["POST"])
+@limiter.limit("10 per minute")
+@super_admin_required
+def verify_user(user_id):
+    """POST /api/users/:id/verify — manually verify a user's email (super_admin only)."""
+    try:
+        db = get_db()
+        user = db.execute("SELECT id, email, email_verified FROM users WHERE id = ?", (user_id,)).fetchone()
+        if not user:
+            db.close()
+            return jsonify({"success": False, "error": "User not found"}), 404
+
+        db.execute("UPDATE users SET email_verified = 1 WHERE id = ?", (user_id,))
+        db.commit()
+        db.close()
+        _user_cache.pop(user_id, None)
+        return jsonify({"success": True, "message": "User email verified"}), 200
+    except Exception:
+        logger.exception("[Users] verify user failed")
+        return jsonify({"success": False, "error": "Failed to verify user"}), 500

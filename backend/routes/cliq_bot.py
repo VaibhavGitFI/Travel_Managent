@@ -487,7 +487,7 @@ def _process_cliq_message(body: str, user: dict | None, phone_key: str) -> str:
     if text.startswith("expense ") or text.startswith("exp "):
         return _handle_quick_expense(user, body, phone_key)
 
-    # Approve / reject
+    # Approve / reject travel requests
     if text.startswith("approve ") or text.startswith("reject "):
         parts = text.split(maxsplit=1)
         cmd = parts[0]
@@ -496,7 +496,60 @@ def _process_cliq_message(body: str, user: dict | None, phone_key: str) -> str:
             return f"Usage: {cmd} TR-2026-XXXXXXX"
         return _handle_approve_reject(user, cmd, rid)
 
-    # AI chat with memory
+    # Approve / reject expenses
+    from routes.whatsapp import _handle_expense_approve_reject, _get_pending_expense_approvals
+    if text.startswith("approve-expense ") or text.startswith("reject-expense "):
+        parts = text.split(maxsplit=1)
+        cmd = parts[0]
+        eid = parts[1].strip() if len(parts) > 1 else ""
+        if not eid:
+            return f"Usage: {cmd} <expense_id>"
+        return _handle_expense_approve_reject(user, cmd, eid)
+
+    # Pending expense approvals (for managers)
+    if text in ("expense approvals", "pending expenses", "expense pending"):
+        return _get_pending_expense_approvals(user["id"], user.get("role", "employee"))
+
+    # Smart intent detection — word-level matching for natural language
+    words = set(text.split())
+    has = lambda *kws: all(any(kw in w for w in words) for kw in kws)
+
+    # Expense queries
+    if (has("expense") and any(w in text for w in ("pending", "approved", "rejected", "status", "show", "list", "detail", "how much", "how many", "total"))) \
+       or ("expense" in text and ("my" in text or "all" in text)):
+        summary = _get_expense_summary(user["id"])
+        _add_to_history(phone_key, "user", body)
+        _add_to_history(phone_key, "assistant", summary)
+        return summary
+
+    # Approval queries
+    if (has("approval") and any(w in text for w in ("pending", "status", "how many", "how much", "show", "list", "my"))) \
+       or ("pending" in text and "approval" in text) \
+       or ("pending" in text and "approve" in text):
+        if "expense" in text and user.get("role") in ("admin", "manager", "super_admin"):
+            result = _get_pending_expense_approvals(user["id"], user.get("role", "employee"))
+        else:
+            result = _get_pending_approvals(user["id"], user.get("role", "employee"))
+        _add_to_history(phone_key, "user", body)
+        _add_to_history(phone_key, "assistant", result)
+        return result
+
+    # Trip queries
+    if has("trip") or has("travel") and any(w in text for w in ("my", "status", "show", "list", "upcoming")):
+        if any(w in text for w in ("my", "status", "show", "list", "upcoming", "recent")):
+            result = _get_user_trips(user["id"])
+            _add_to_history(phone_key, "user", body)
+            _add_to_history(phone_key, "assistant", result)
+            return result
+
+    # Meeting queries
+    if any(w in text for w in ("meeting", "meetings")) and any(w in text for w in ("my", "upcoming", "next", "client", "show", "list", "schedule")):
+        result = _get_upcoming_meetings(user["id"])
+        _add_to_history(phone_key, "user", body)
+        _add_to_history(phone_key, "assistant", result)
+        return result
+
+    # AI chat with memory and full DB context
     _add_to_history(phone_key, "user", body)
     reply = _ai_chat(user, body, phone_key)
     _add_to_history(phone_key, "assistant", reply)

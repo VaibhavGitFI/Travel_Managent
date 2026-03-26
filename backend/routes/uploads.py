@@ -11,12 +11,14 @@ from werkzeug.utils import secure_filename
 from auth import get_current_user
 from config import Config
 from agents.document_agent import parse_document
+from extensions import limiter
 
 uploads_bp = Blueprint("uploads", __name__, url_prefix="/api/uploads")
 logger = logging.getLogger(__name__)
 
 
 @uploads_bp.route("", methods=["POST"])
+@limiter.limit("15 per minute")
 def upload_file():
     """POST /api/uploads — upload a file; returns filename, url, and size."""
     user = get_current_user()
@@ -38,7 +40,15 @@ def upload_file():
 
     try:
         os.makedirs(Config.UPLOAD_FOLDER, exist_ok=True)
-        filename = secure_filename(uploaded_file.filename)
+        raw_name = secure_filename(uploaded_file.filename)
+        # Avoid collisions: prefix with timestamp if file already exists
+        base_path = os.path.join(Config.UPLOAD_FOLDER, raw_name)
+        if os.path.exists(base_path):
+            ts = datetime.utcnow().strftime('%Y%m%d%H%M%S%f')
+            name_part, ext_part = os.path.splitext(raw_name)
+            filename = f"{name_part}_{ts}{ext_part}"
+        else:
+            filename = raw_name
         file_path = os.path.join(Config.UPLOAD_FOLDER, filename)
         uploaded_file.save(file_path)
         size = os.path.getsize(file_path)
@@ -54,6 +64,7 @@ def upload_file():
 
 
 @uploads_bp.route("/parse-document", methods=["POST"])
+@limiter.limit("10 per minute")
 def parse_document_endpoint():
     """
     POST /api/uploads/parse-document — multipart upload + instant document parsing.
@@ -111,16 +122,22 @@ def parse_document_endpoint():
 
 @uploads_bp.route("/<path:filename>", methods=["GET"])
 def serve_file(filename):
-    """GET /api/uploads/<filename> — serve an uploaded file (auth required)."""
-    user = get_current_user()
-    if not user:
-        return jsonify({"success": False, "error": "Authentication required"}), 401
+    """GET /api/uploads/<filename> — serve an uploaded file."""
     # Prevent path traversal
     safe = os.path.basename(filename)
     if safe != filename:
         return jsonify({"success": False, "error": "Invalid filename"}), 400
+
+    file_path = os.path.join(Config.UPLOAD_FOLDER, safe)
+    if not os.path.isfile(file_path):
+        return jsonify({"success": False, "error": "File not found"}), 404
+
     try:
-        return send_from_directory(Config.UPLOAD_FOLDER, safe)
+        response = send_from_directory(Config.UPLOAD_FOLDER, safe)
+        # Cache avatars for 1 hour to avoid repeated loads
+        if safe.startswith("avatar_"):
+            response.headers["Cache-Control"] = "public, max-age=3600"
+        return response
     except Exception as e:
         logger.exception("Failed to serve file %s", filename)
         return jsonify({"success": False, "error": "File not found"}), 404

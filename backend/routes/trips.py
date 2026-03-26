@@ -37,7 +37,7 @@ def _emit_trip_update(user_id: int, destination: str, result: dict) -> None:
             extra={"destination": destination},
         )
     except Exception:
-        pass
+        logger.debug("[Trips] _emit_trip_update failed silently")
 
 trips_bp = Blueprint("trips", __name__, url_prefix="/api")
 
@@ -160,7 +160,7 @@ def list_trips():
     limit = min(_safe_int(request.args.get("limit"), 50), 200)
     db = get_db()
     try:
-        if user.get("role") in ("admin", "manager"):
+        if user.get("role") in ("admin", "manager", "super_admin"):
             rows = db.execute(
                 "SELECT * FROM travel_requests ORDER BY created_at DESC LIMIT ?",
                 (limit,)
@@ -198,7 +198,7 @@ def get_trip(trip_id: str):
             return jsonify({"success": False, "error": "Trip not found"}), 404
 
         trip = dict(row)
-        if user.get("role") not in ("admin", "manager") and trip.get("user_id") != user.get("id"):
+        if user.get("role") not in ("admin", "manager", "super_admin") and trip.get("user_id") != user.get("id"):
             return jsonify({"success": False, "error": "Forbidden"}), 403
 
         return jsonify({"success": True, "trip": _serialize_trip(trip)}), 200

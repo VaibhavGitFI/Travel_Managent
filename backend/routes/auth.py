@@ -7,9 +7,11 @@ import secrets
 import time
 from flask import Blueprint, request, jsonify, session
 from werkzeug.security import generate_password_hash
-from auth import login_user, logout_user, get_current_user, verify_token, generate_tokens, _get_user_by_id
+from auth import (login_user, logout_user, get_current_user, verify_token,
+                generate_tokens, _get_user_by_id, generate_csrf_token)
 from database import get_db
 from extensions import limiter
+from validators import ValidationError, validate_email, validate_password, validate_string
 
 logger = logging.getLogger(__name__)
 
@@ -33,14 +35,28 @@ def login():
 
     result = login_user(username, password)
     status = 200 if result.get("success") else 401
-    return jsonify(result), status
+    resp = jsonify(result)
+    if result.get("success") and result.get("csrf_token"):
+        # Set CSRF token as a JS-readable cookie (not HttpOnly) so frontend can read it
+        resp.set_cookie("csrf_token", result["csrf_token"], httponly=False,
+                        samesite="Lax", secure=request.is_secure, max_age=86400)
+    return resp, status
 
 
 @auth_bp.route("/logout", methods=["POST"])
 def logout():
-    """POST /api/auth/logout — clear session."""
-    result = logout_user()
-    return jsonify(result), 200
+    """POST /api/auth/logout — clear session and revoke tokens."""
+    data = request.get_json(silent=True) or {}
+    access_token = data.get("access_token") or ""
+    refresh_token = data.get("refresh_token") or ""
+    # Also try Authorization header
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer ") and not access_token:
+        access_token = auth_header[7:].strip()
+    result = logout_user(access_token=access_token, refresh_token=refresh_token)
+    resp = jsonify(result)
+    resp.delete_cookie("csrf_token")
+    return resp, 200
 
 
 @auth_bp.route("/refresh", methods=["POST"])
@@ -79,19 +95,14 @@ def me():
 def register():
     """POST /api/auth/register — create account and send verification email."""
     data = request.get_json(silent=True) or {}
-    full_name = (data.get("full_name") or data.get("name") or "").strip()
-    email = (data.get("email") or "").strip().lower()
-    password = data.get("password", "")
+    data["full_name"] = data.get("full_name") or data.get("name") or ""
+    try:
+        full_name = validate_string(data, "full_name", min_len=2, max_len=100)
+        email = validate_email(data)
+        password = validate_password(data.get("password", ""))
+    except ValidationError as e:
+        return jsonify({"success": False, "error": e.message}), 400
     department = (data.get("department") or "General").strip()
-
-    if not full_name or not email or not password:
-        return jsonify({"success": False, "error": "Full name, email, and password are required"}), 400
-
-    if "@" not in email or "." not in email:
-        return jsonify({"success": False, "error": "Invalid email address"}), 400
-
-    if len(password) < 6:
-        return jsonify({"success": False, "error": "Password must be at least 6 characters"}), 400
 
     # Generate username from email (before the @)
     username = email.split("@")[0].lower().replace(".", "_").replace("-", "_")
@@ -140,9 +151,10 @@ def register():
         db.close()
 
         if user:
+            user_id = user["id"] if isinstance(user, dict) else user[0]
             # Generate and send verification code
             verify_code = f"{secrets.randbelow(1000000):06d}"
-            _verify_tokens[verify_code] = {"user_id": user["id"], "email": email, "expires": time.time() + 900}
+            _verify_tokens[verify_code] = {"user_id": user_id, "email": email, "expires": time.time() + 900}
             _send_verification_email(email, full_name, verify_code)
 
             return jsonify({
@@ -189,10 +201,12 @@ def verify_email():
             u = dict(user)
             session["user_id"] = u["id"]
             tokens = generate_tokens(u["id"])
+            csrf_token = generate_csrf_token()
             name = u.get("full_name") or u.get("name") or u["username"]
-            return jsonify({
+            resp = jsonify({
                 "success": True,
                 **tokens,
+                "csrf_token": csrf_token,
                 "user": {
                     "id": u["id"],
                     "username": u["username"],
@@ -203,7 +217,10 @@ def verify_email():
                     "department": u.get("department", "General"),
                     "avatar_initials": u.get("avatar_initials", ""),
                 },
-            }), 200
+            })
+            resp.set_cookie("csrf_token", csrf_token, httponly=False,
+                            samesite="Lax", secure=request.is_secure, max_age=86400)
+            return resp, 200
 
         return jsonify({"success": False, "error": "Verification failed"}), 500
     except Exception as e:
@@ -281,8 +298,10 @@ def reset_password():
     if not code or not new_password:
         return jsonify({"success": False, "error": "Reset code and new password are required"}), 400
 
-    if len(new_password) < 6:
-        return jsonify({"success": False, "error": "Password must be at least 6 characters"}), 400
+    try:
+        validate_password(new_password)
+    except ValidationError as e:
+        return jsonify({"success": False, "error": e.message}), 400
 
     # Validate token
     token_data = _reset_tokens.get(code)
@@ -342,8 +361,9 @@ def update_profile():
 
     try:
         db = get_db()
-        # Schema-tolerant: only update columns that exist
-        cols = {r[1] for r in db.execute("PRAGMA table_info(users)").fetchall()}
+        # Schema-tolerant: only update columns that exist (works on both SQLite and PostgreSQL)
+        from database import table_columns
+        cols = table_columns(db, "users")
         valid_updates = {k: v for k, v in updates.items() if k in cols}
 
         if valid_updates:

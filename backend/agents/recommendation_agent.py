@@ -4,7 +4,7 @@ Analyzes past trips + travel policy to suggest optimal hotel/flight combos
 before the user searches. Uses historical data + Gemini for insights.
 """
 import logging
-from database import get_db
+from database import get_db, table_columns
 from services.gemini_service import gemini
 
 logger = logging.getLogger(__name__)
@@ -22,7 +22,7 @@ def get_recommendations(user_id: int, destination: str, duration_days: int = 3) 
         # 1. Past trips to same destination
         past_trips = []
         try:
-            cols = {r[1] for r in db.execute("PRAGMA table_info(travel_requests)").fetchall()}
+            cols = table_columns(db, "travel_requests")
             if "destination" in cols:
                 rows = db.execute(
                     "SELECT * FROM travel_requests WHERE LOWER(destination) = ? ORDER BY created_at DESC LIMIT 5",
@@ -35,7 +35,7 @@ def get_recommendations(user_id: int, destination: str, duration_days: int = 3) 
         # 2. Past expenses for this destination
         past_expenses = {}
         try:
-            ecols = {r[1] for r in db.execute("PRAGMA table_info(expenses_db)").fetchall()}
+            ecols = table_columns(db, "expenses_db")
             # Find trip_ids/request_ids for this destination
             trip_ids = [str(t.get("request_id", "")) for t in past_trips if t.get("request_id")]
             if trip_ids and "category" in ecols:

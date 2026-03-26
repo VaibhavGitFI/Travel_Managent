@@ -24,7 +24,30 @@ const useStore = create(
       logout: () =>
         set({
           auth: { user: null, isLoggedIn: false, loading: false },
+          org: { current: null, members: [], loading: false },
         }),
+
+      // ── Organization ───────────────────────────────────
+      org: {
+        current: null,   // { id, name, slug, plan, my_role, member_count }
+        members: [],
+        loading: false,
+      },
+
+      setOrg: (orgData) =>
+        set((state) => ({
+          org: { ...state.org, current: orgData, loading: false },
+        })),
+
+      setOrgMembers: (members) =>
+        set((state) => ({
+          org: { ...state.org, members },
+        })),
+
+      setOrgLoading: (loading) =>
+        set((state) => ({
+          org: { ...state.org, loading },
+        })),
 
       // ── Theme ───────────────────────────────────────────
       theme: 'light', // 'light' | 'dark'
