@@ -4,7 +4,7 @@ Schema-tolerant expense CRUD + OCR extraction helper.
 Works with both legacy and newer expenses_db column layouts.
 """
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from database import get_db, table_columns
 from services.vision_service import vision
 from services.currency_service import currency
@@ -41,6 +41,114 @@ def _format_amount(amount: float, currency_code: str) -> str:
     if callable(formatter):
         return formatter(amount, currency_code)
     return f"{currency_code} {amount:,.2f}"
+
+
+def check_duplicate_expense(user_id: int, amount: float, vendor: str = None,
+                            date: str = None, category: str = None) -> dict:
+    """
+    Check if a similar expense already exists (potential duplicate).
+    Returns: {"is_duplicate": bool, "matches": list, "confidence": str}
+    """
+    if not amount or amount <= 0:
+        return {"is_duplicate": False, "matches": [], "confidence": "none"}
+
+    db = get_db()
+    try:
+        cols = _table_columns(db, "expenses_db")
+
+        # Build query to find potential duplicates within 24 hours
+        query_parts = ["SELECT id, category, description, invoice_amount, date, vendor, source FROM expenses_db WHERE user_id = ?"]
+        params = [user_id]
+
+        # Amount tolerance: ±₹1
+        query_parts.append("AND ABS(COALESCE(invoice_amount, 0) - ?) <= 1")
+        params.append(amount)
+
+        # Date range: ±1 day if date provided
+        if date and "date" in cols:
+            try:
+                expense_date = datetime.strptime(date, "%Y-%m-%d")
+                date_min = (expense_date - timedelta(days=1)).strftime("%Y-%m-%d")
+                date_max = (expense_date + timedelta(days=1)).strftime("%Y-%m-%d")
+                query_parts.append("AND date >= ? AND date <= ?")
+                params.extend([date_min, date_max])
+            except ValueError:
+                pass  # Invalid date format, skip date filter
+
+        # Category match if provided
+        if category and "category" in cols:
+            query_parts.append("AND category = ?")
+            params.append(category)
+
+        # Vendor match if provided (exact or partial)
+        if vendor and "vendor" in cols and vendor.strip():
+            vendor_clean = vendor.strip().lower()
+            query_parts.append("AND (LOWER(vendor) = ? OR LOWER(vendor) LIKE ? OR LOWER(description) LIKE ?)")
+            params.extend([vendor_clean, f"%{vendor_clean}%", f"%{vendor_clean}%"])
+
+        query_parts.append("ORDER BY date DESC, id DESC LIMIT 5")
+        query = " ".join(query_parts)
+
+        matches = db.execute(query, tuple(params)).fetchall()
+        db.close()
+
+        if not matches:
+            return {"is_duplicate": False, "matches": [], "confidence": "none"}
+
+        # Analyze matches
+        match_list = []
+        exact_match = False
+
+        for row in matches:
+            match = dict(row)
+            similarity_score = 0
+
+            # Amount exact match = +3 points
+            if abs(match.get("invoice_amount", 0) - amount) < 0.01:
+                similarity_score += 3
+
+            # Vendor exact match = +2 points
+            if vendor and match.get("vendor"):
+                if vendor.strip().lower() == match.get("vendor", "").strip().lower():
+                    similarity_score += 2
+
+            # Date exact match = +2 points
+            if date and match.get("date") == date:
+                similarity_score += 2
+
+            # Category exact match = +1 point
+            if category and match.get("category") == category:
+                similarity_score += 1
+
+            # Score >= 5 = very likely duplicate
+            if similarity_score >= 5:
+                exact_match = True
+
+            match_list.append({
+                "expense_id": match.get("id"),
+                "amount": match.get("invoice_amount"),
+                "vendor": match.get("vendor") or "Unknown",
+                "date": match.get("date"),
+                "category": match.get("category"),
+                "source": match.get("source", "web"),
+                "description": match.get("description", ""),
+                "similarity_score": similarity_score,
+            })
+
+        confidence = "high" if exact_match else ("medium" if len(match_list) > 0 else "low")
+
+        return {
+            "is_duplicate": exact_match,
+            "matches": match_list,
+            "confidence": confidence,
+            "message": f"Found {len(match_list)} similar expense(s)" if match_list else "No duplicates found",
+        }
+
+    except Exception as e:
+        return {"is_duplicate": False, "matches": [], "confidence": "error", "error": str(e)}
+    finally:
+        if db:
+            db.close()
 
 
 def add_expense(data: dict) -> dict:
@@ -123,6 +231,8 @@ def add_expense(data: dict) -> dict:
             record["submitter"] = data.get("vendor") or data.get("submitter") or ""
         if "vendor" in cols:
             record["vendor"] = data.get("vendor", "")
+        if "source" in cols:
+            record["source"] = data.get("source", "web")  # whatsapp, cliq, web, manual
         if "is_personal" in cols:
             record["is_personal"] = 1 if data.get("is_personal") else 0
         if "policy_compliant" in cols:
@@ -131,6 +241,15 @@ def add_expense(data: dict) -> dict:
             record["invoice_file"] = data.get("invoice_file")
         if "payment_ref" in cols and data.get("payment_ref"):
             record["payment_ref"] = data.get("payment_ref")
+
+        # Check for duplicates before inserting
+        duplicate_check = check_duplicate_expense(
+            user_id=user_id,
+            amount=amount,
+            vendor=data.get("vendor"),
+            date=expense_date,
+            category=data.get("category"),
+        )
 
         keys = list(record.keys())
         placeholders = ",".join("?" for _ in keys)
@@ -141,13 +260,21 @@ def add_expense(data: dict) -> dict:
         db.commit()
         new_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
 
-        return {
+        result = {
             "success": True,
             "expense_id": new_id,
             "amount": amount,
             "formatted_amount": _format_amount(amount, currency_code),
             "message": "Expense submitted",
         }
+
+        # Include duplicate warning if found
+        if duplicate_check.get("is_duplicate") or duplicate_check.get("confidence") in ("high", "medium"):
+            result["duplicate_warning"] = True
+            result["duplicate_info"] = duplicate_check
+            result["message"] += " (Possible duplicate detected)"
+
+        return result
     except Exception as e:
         return {"success": False, "error": str(e)}
     finally:

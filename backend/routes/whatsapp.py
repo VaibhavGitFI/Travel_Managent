@@ -777,24 +777,37 @@ def _categorize_text(description: str) -> str:
     return "other"
 
 
-def _save_expense(user_id: int, category: str, description: str, amount, vendor: str, date: str) -> bool:
+def _save_expense(user_id: int, category: str, description: str, amount, vendor: str, date: str, source: str = "whatsapp") -> bool:
     """Save an expense to the database. Returns True on success."""
     try:
+        from agents.expense_agent import add_expense
         desc = description or (f"Receipt from {vendor}" if vendor else "Expense")
         if vendor and vendor not in desc:
             desc = f"{vendor} - {desc}"
-        db = get_db()
-        db.execute(
-            """INSERT INTO expenses_db
-               (user_id, category, description, invoice_amount, date, verification_status, stage, currency_code)
-               VALUES (?, ?, ?, ?, ?, 'pending', 1, 'INR')""",
-            (user_id, category, desc, float(amount or 0), date or ""),
-        )
-        db.commit()
-        db.close()
-        return True
+
+        expense_data = {
+            "user_id": user_id,
+            "category": category,
+            "description": desc,
+            "invoice_amount": float(amount or 0),
+            "date": date or "",
+            "vendor": vendor or "",
+            "source": source,  # whatsapp, cliq, web, manual
+            "verification_status": "pending",
+            "stage": 1,
+            "currency_code": "INR",
+        }
+        logger.info("[%s Bot] Calling add_expense with data: %s", source.upper() if source else "WA", expense_data)
+        result = add_expense(expense_data)
+        logger.info("[%s Bot] add_expense returned: %s", source.upper() if source else "WA", result)
+        success = result.get("success", False)
+        if success:
+            logger.info("[%s Bot] Expense saved successfully with ID: %s", source.upper() if source else "WA", result.get("expense_id"))
+        else:
+            logger.warning("[%s Bot] Expense save failed: %s", source.upper() if source else "WA", result.get("error", "Unknown error"))
+        return success
     except Exception as exc:
-        logger.warning("[WA Bot] Failed to save expense: %s", exc)
+        logger.exception("[%s Bot] Exception while saving expense: %s", source.upper() if source else "WA", exc)
         return False
 
 
@@ -864,9 +877,25 @@ def _process_message(from_number: str, body: str) -> str:
     # Check if user has a pending expense waiting for category
     if phone in _pending_expenses:
         cat_map = {"1": "flight", "2": "hotel", "3": "food", "4": "transport", "5": "visa", "6": "communication", "7": "other"}
+        # Also accept text category names
+        text_cat_map = {
+            "flight": "flight", "flights": "flight",
+            "hotel": "hotel", "hotels": "hotel", "accommodation": "hotel",
+            "food": "food", "meals": "food", "meal": "food", "food & meals": "food",
+            "transport": "transport", "local transport": "transport", "cab": "transport", "taxi": "transport", "uber": "transport", "ola": "transport",
+            "visa": "visa", "visa / docs": "visa", "docs": "visa", "documents": "visa",
+            "communication": "communication", "internet": "communication", "phone": "communication",
+            "other": "other", "miscellaneous": "other", "misc": "other",
+        }
+
+        category = None
         if text in cat_map:
-            pending = _pending_expenses.pop(phone)
             category = cat_map[text]
+        elif text in text_cat_map:
+            category = text_cat_map[text]
+
+        if category:
+            pending = _pending_expenses.pop(phone)
             cat_labels = {"flight": "Flight", "hotel": "Hotel", "food": "Food & Meals", "transport": "Local Transport", "visa": "Visa / Docs", "communication": "Communication", "other": "Other"}
             saved = _save_expense(
                 pending["user_id"], category, pending.get("description", ""),
@@ -884,11 +913,16 @@ def _process_message(from_number: str, body: str) -> str:
         elif text in ("cancel", "skip", "no"):
             _pending_expenses.pop(phone)
             return "Expense cancelled. Send another receipt anytime."
-        # If they typed something else, remind them
-        # Don't consume the message — fall through to normal processing
-        # But first remind about pending
-        # Actually let's just remind and continue
-        pass
+        else:
+            # Remind user about pending expense - don't consume the message
+            return (
+                f"*Pending Expense*\n\n"
+                f"You have an unsaved expense of Rs. {float(_pending_expenses[phone].get('amount', 0)):,.2f}\n\n"
+                f"Please select a category:\n\n"
+                f"1 - Flight\n2 - Hotel\n3 - Food & Meals\n4 - Local Transport\n5 - Visa / Docs\n6 - Communication\n7 - Other\n\n"
+                f"Or type the category name (e.g., 'food', 'transport')\n"
+                f"Type 'cancel' to discard this expense."
+            )
 
     # Commands (these don't need conversation context)
     if text in ("1", "trips", "my trips"):
@@ -988,6 +1022,87 @@ def _process_message(from_number: str, body: str) -> str:
         _add_to_history(phone, "user", body)
         _add_to_history(phone, "assistant", result)
         return result
+
+    # Advanced query engine — handles complex natural language queries with date ranges
+    # Examples: "show expenses from last month", "trips in january", "pending approvals this week"
+    if any(keyword in text for keyword in ("show", "list", "from", "in", "this", "last", "pending", "approved", "rejected")):
+        try:
+            from agents.query_engine import handle_query, query_trips, query_expenses, query_approvals
+
+            # Try query engine for sophisticated queries
+            query_result = handle_query(user, body)
+
+            if query_result and query_result.get("data", {}).get("success"):
+                data = query_result["data"]
+                query_type = query_result["type"]
+
+                # Format response based on query type
+                if query_type == "expenses" and data.get("expenses"):
+                    expenses = data["expenses"][:10]  # Limit to 10 for WhatsApp
+                    lines = [f"*Your Expenses* ({data['scope']} scope)\n"]
+                    lines.append(f"Total: {data['count']} items, ₹{data.get('total_amount', 0):,.0f}\n")
+                    for exp in expenses:
+                        cat = exp.get("category", "other")
+                        amt = exp.get("invoice_amount") or exp.get("verified_amount") or exp.get("payment_amount") or 0
+                        desc = exp.get("description", "")[:50]
+                        date = exp.get("date", "")
+                        source_icon = {"whatsapp": "💬", "cliq": "💼", "web": "🌐"}.get(exp.get("source"), "📝")
+                        lines.append(f"{source_icon} Rs. {float(amt):,.0f} - {cat}")
+                        if desc:
+                            lines.append(f"  {desc}")
+                        if date:
+                            lines.append(f"  📅 {date}")
+                        lines.append("")
+                    reply = "\n".join(lines)
+                    _add_to_history(phone, "user", body)
+                    _add_to_history(phone, "assistant", reply)
+                    return reply
+
+                elif query_type == "trips" and data.get("trips"):
+                    trips = data["trips"][:10]
+                    lines = [f"*Your Trips* ({data['scope']} scope)\n"]
+                    lines.append(f"Total: {data['count']} trips\n")
+                    for trip in trips:
+                        dest = trip.get("destination", "?")
+                        origin = trip.get("origin", "?")
+                        status = trip.get("status", "pending")
+                        dates = f"{trip.get('start_date', '')} to {trip.get('end_date', '')}" if trip.get("start_date") else ""
+                        lines.append(f"📍 {origin} → {dest}")
+                        lines.append(f"  Status: {status}")
+                        if dates:
+                            lines.append(f"  📅 {dates}")
+                        if trip.get("estimated_total"):
+                            lines.append(f"  💰 Rs. {trip['estimated_total']:,.0f}")
+                        lines.append("")
+                    reply = "\n".join(lines)
+                    _add_to_history(phone, "user", body)
+                    _add_to_history(phone, "assistant", reply)
+                    return reply
+
+                elif query_type == "approvals" and data.get("approvals"):
+                    approvals = data["approvals"][:10]
+                    lines = [f"*Pending Approvals* ({data['role']} view)\n"]
+                    lines.append(f"Total: {data['count']} approvals\n")
+                    for appr in approvals:
+                        requester = appr.get("requester_name", "Unknown")
+                        dest = appr.get("destination", "?")
+                        status = appr.get("status", "pending")
+                        lines.append(f"👤 {requester} → {dest}")
+                        lines.append(f"  Status: {status}")
+                        if appr.get("start_date"):
+                            lines.append(f"  📅 {appr['start_date']}")
+                        if appr.get("estimated_total"):
+                            lines.append(f"  💰 Rs. {appr['estimated_total']:,.0f}")
+                        lines.append(f"  ID: {appr.get('request_id', '?')}")
+                        lines.append("")
+                    reply = "\n".join(lines)
+                    _add_to_history(phone, "user", body)
+                    _add_to_history(phone, "assistant", reply)
+                    return reply
+
+        except Exception as e:
+            logger.warning("[WA Bot] Query engine failed: %s", e)
+            # Continue to AI chat fallback
 
     # AI chat — with conversation memory and full DB context
     _add_to_history(phone, "user", body)

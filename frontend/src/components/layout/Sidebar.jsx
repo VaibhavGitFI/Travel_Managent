@@ -17,6 +17,7 @@ import {
   UserCircle,
   Settings,
   Globe,
+  Volume2,
 } from 'lucide-react'
 import { cn } from '../../lib/cn'
 import useStore from '../../store/useStore'
@@ -43,6 +44,7 @@ const navGroups = [
       { to: '/requests',  icon: FileText,    label: 'Requests' },
       { to: '/approvals', icon: CheckSquare, label: 'Approvals' },
       { to: '/analytics', icon: BarChart3,   label: 'Analytics', roles: ELEVATED },
+      { to: '/otis',      icon: Volume2,     label: 'OTIS Voice', roles: ELEVATED },
     ],
   },
   {

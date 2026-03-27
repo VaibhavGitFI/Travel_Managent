@@ -110,12 +110,17 @@ def _process_receipt(file_url: str, user: dict, caption: str = "") -> str:
         phone_key = f"cliq_{user.get('email', '')}"
         if category in confident_categories and amount:
             lines.append(f"\n*Category:* {cat_labels.get(category, category)} (auto-detected)")
-            saved = _save_expense(user["id"], category, description, amount, vendor or "", date or "")
+            logger.info("[Cliq Bot] Saving expense: user_id=%s, category=%s, amount=%s, vendor=%s, date=%s, source=cliq",
+                       user["id"], category, amount, vendor or "", date or "")
+            saved = _save_expense(user["id"], category, description, amount, vendor or "", date or "", source="cliq")
+            logger.info("[Cliq Bot] Expense save result: %s", saved)
             lines.append("")
             if saved:
                 lines.append("Expense saved to your account.")
+                logger.info("[Cliq Bot] Expense successfully saved for user %s", user["id"])
             else:
                 lines.append("Could not save. Please submit on the app.")
+                logger.warning("[Cliq Bot] Expense save failed for user %s", user["id"])
         elif amount:
             # Ask for category
             _pending_expenses[phone_key] = {
@@ -190,15 +195,40 @@ def _process_voice_note(file_url: str, file_type: str, user: dict, phone_key: st
 
 
 def _find_user_by_email(email: str) -> dict | None:
-    """Look up user by email address."""
+    """Look up user by email address with intelligent fallback."""
     if not email:
+        logger.warning("[Cliq Bot] _find_user_by_email called with empty email")
         return None
+
     try:
         db = get_db()
-        user = db.execute("SELECT * FROM users WHERE email = ?", (email.lower().strip(),)).fetchone()
+        email_clean = email.lower().strip()
+
+        # Try exact lowercase match first
+        user = db.execute("SELECT * FROM users WHERE LOWER(email) = ?", (email_clean,)).fetchone()
+
+        if user:
+            logger.info("[Cliq Bot] User found by email: %s (ID: %s)", email, user["id"])
+            db.close()
+            return dict(user)
+
+        # Try partial match as fallback
+        user = db.execute("SELECT * FROM users WHERE LOWER(email) LIKE ?", (f"%{email_clean}%",)).fetchone()
+
+        if user:
+            logger.info("[Cliq Bot] User found by partial email match: %s -> %s (ID: %s)", email, user["email"], user["id"])
+            db.close()
+            return dict(user)
+
+        # Log all emails for debugging
+        all_emails = db.execute("SELECT id, email FROM users WHERE email IS NOT NULL LIMIT 5").fetchall()
+        logger.warning("[Cliq Bot] User NOT found for email: %s. Sample emails in DB: %s",
+                      email, [dict(e)["email"] for e in all_emails])
         db.close()
-        return dict(user) if user else None
-    except Exception:
+        return None
+
+    except Exception as e:
+        logger.exception("[Cliq Bot] _find_user_by_email failed for %s: %s", email, e)
         return None
 
 
@@ -271,6 +301,33 @@ def bot_handler():
 
     # Find user in our DB
     user = _find_user_by_email(user_email) or _find_user_by_name(user_name)
+
+    # If user not found and not asking for help, provide intelligent diagnostic
+    if not user and message.lower() not in ("hi", "hello", "hey", "help", "start", "hii"):
+        # Log detailed diagnostic
+        logger.error(
+            "[Cliq Bot] User lookup failed - Email: %s | Name: %s | Chat ID: %s",
+            user_email, user_name, chat_id
+        )
+
+        return jsonify({
+            "text": (
+                "**Account Lookup Failed**\n\n"
+                f"Could not find account for:\n"
+                f"▸ **Email:** {user_email}\n"
+                f"▸ **Name:** {user_name or 'Not provided'}\n\n"
+                "**Possible reasons:**\n"
+                "1. Email mismatch - Check your TravelSync account email\n"
+                "2. Account not yet created in the system\n"
+                "3. Database connection issue\n\n"
+                "**Next steps:**\n"
+                "▸ Verify your email in TravelSync web app\n"
+                "▸ Contact admin if issue persists\n"
+                "▸ Check logs for detailed error info\n\n"
+                "**Debug Info:** Searched for '{user_email}' - check server logs for details."
+            ),
+            "suggestions": [{"text": "Help"}, {"text": "Contact Admin"}]
+        })
 
     try:
         phone_key = f"cliq_{user_email or user_name}"
@@ -418,9 +475,14 @@ def _process_cliq_message(body: str, user: dict | None, phone_key: str) -> str:
             pending = _pending_expenses.pop(phone_key)
             category = cat_map[text]
             cat_labels = {"flight": "Flight", "hotel": "Hotel", "food": "Food & Meals", "transport": "Local Transport", "visa": "Visa / Docs", "communication": "Communication", "other": "Other"}
-            saved = _save_expense(pending["user_id"], category, pending.get("description", ""), pending.get("amount"), pending.get("vendor", ""), pending.get("date", ""))
+            logger.info("[Cliq Bot] Saving pending expense: user_id=%s, category=%s, amount=%s, vendor=%s, date=%s, source=cliq",
+                       pending["user_id"], category, pending.get("amount"), pending.get("vendor", ""), pending.get("date", ""))
+            saved = _save_expense(pending["user_id"], category, pending.get("description", ""), pending.get("amount"), pending.get("vendor", ""), pending.get("date", ""), source="cliq")
+            logger.info("[Cliq Bot] Pending expense save result: %s", saved)
             if saved:
+                logger.info("[Cliq Bot] Pending expense successfully saved for user %s", pending["user_id"])
                 return f"*Expense Saved*\n\n*Amount:* Rs. {float(pending.get('amount', 0)):,.2f}\n*Category:* {cat_labels.get(category, category)}\n\nExpense added to your TravelSync account."
+            logger.warning("[Cliq Bot] Pending expense save failed for user %s", pending["user_id"])
             return "Could not save. Please try on the web app."
         elif text in ("cancel", "skip"):
             _pending_expenses.pop(phone_key)
@@ -437,19 +499,23 @@ def _process_cliq_message(body: str, user: dict | None, phone_key: str) -> str:
         "submit receipt", "scan receipt", "expense entry", "record expense",
     )
     if text in expense_triggers or (("expense" in text or "receipt" in text) and ("add" in text or "submit" in text or "log" in text or "upload" in text or "scan" in text or "want" in text)):
+        if not user:
+            return "**Account Not Linked**\n\nYour Cliq account is not connected to TravelSync.\n\nPlease contact your admin to link your account first."
         return (
-            "*Add New Expense*\n\n"
+            "**Add New Expense**\n\n"
             "Choose how you'd like to add:\n\n"
-            "*Option 1:* Upload a receipt image — I'll auto-extract amount, vendor, category and save it.\n\n"
-            "*Option 2:* Type the details directly:\n"
-            "Example: expense 500 Uber cab to airport\n\n"
-            "*Option 3:* Guided step-by-step — type *start expense*"
+            "▸ **Option 1:** Upload a receipt image — I'll auto-extract amount, vendor, category and save it.\n\n"
+            "▸ **Option 2:** Type the details directly:\n"
+            "   Example: expense 500 Uber cab to airport\n\n"
+            "▸ **Option 3:** Guided step-by-step — type **start expense**"
         )
 
     # Start step-by-step guided flow
     if text == "start expense":
+        if not user:
+            return "**Account Not Linked**\n\nYour Cliq account is not connected to TravelSync.\n\nPlease contact your admin to link your account."
         _expense_flow[phone_key] = {"step": "amount", "user_id": user["id"]}
-        return "Enter the expense amount in Rs:\n\nExample: 500"
+        return "**Enter Expense Amount**\n\nEnter the amount in Rupees:\n\nExample: 500"
 
     # Commands
     if text in ("1", "trips", "my trips"):
@@ -549,6 +615,82 @@ def _process_cliq_message(body: str, user: dict | None, phone_key: str) -> str:
         _add_to_history(phone_key, "assistant", result)
         return result
 
+    # Advanced query engine — handles complex natural language queries with date ranges
+    if any(keyword in text for keyword in ("show", "list", "from", "in", "this", "last", "pending", "approved", "rejected")):
+        try:
+            from agents.query_engine import handle_query
+
+            query_result = handle_query(user, body)
+
+            if query_result and query_result.get("data", {}).get("success"):
+                data = query_result["data"]
+                query_type = query_result["type"]
+
+                # Format response for Cliq
+                if query_type == "expenses" and data.get("expenses"):
+                    expenses = data["expenses"][:10]
+                    lines = [f"*Your Expenses* ({data['scope']} scope)\n"]
+                    lines.append(f"Total: {data['count']} items, ₹{data.get('total_amount', 0):,.0f}\n")
+                    for exp in expenses:
+                        cat = exp.get("category", "other")
+                        amt = exp.get("invoice_amount") or exp.get("verified_amount") or exp.get("payment_amount") or 0
+                        desc = exp.get("description", "")[:50]
+                        date = exp.get("date", "")
+                        source_icon = {"whatsapp": "💬", "cliq": "💼", "web": "🌐"}.get(exp.get("source"), "📝")
+                        lines.append(f"{source_icon} Rs. {float(amt):,.0f} - {cat}")
+                        if desc:
+                            lines.append(f"  {desc}")
+                        if date:
+                            lines.append(f"  📅 {date}")
+                        lines.append("")
+                    _add_to_history(phone_key, "user", body)
+                    _add_to_history(phone_key, "assistant", "\n".join(lines))
+                    return "\n".join(lines)
+
+                elif query_type == "trips" and data.get("trips"):
+                    trips = data["trips"][:10]
+                    lines = [f"*Your Trips* ({data['scope']} scope)\n"]
+                    lines.append(f"Total: {data['count']} trips\n")
+                    for trip in trips:
+                        dest = trip.get("destination", "?")
+                        origin = trip.get("origin", "?")
+                        status = trip.get("status", "pending")
+                        dates = f"{trip.get('start_date', '')} to {trip.get('end_date', '')}" if trip.get("start_date") else ""
+                        lines.append(f"📍 {origin} → {dest}")
+                        lines.append(f"  Status: {status}")
+                        if dates:
+                            lines.append(f"  📅 {dates}")
+                        if trip.get("estimated_total"):
+                            lines.append(f"  💰 Rs. {trip['estimated_total']:,.0f}")
+                        lines.append("")
+                    _add_to_history(phone_key, "user", body)
+                    _add_to_history(phone_key, "assistant", "\n".join(lines))
+                    return "\n".join(lines)
+
+                elif query_type == "approvals" and data.get("approvals"):
+                    approvals = data["approvals"][:10]
+                    lines = [f"*Pending Approvals* ({data['role']} view)\n"]
+                    lines.append(f"Total: {data['count']} approvals\n")
+                    for appr in approvals:
+                        requester = appr.get("requester_name", "Unknown")
+                        dest = appr.get("destination", "?")
+                        status = appr.get("status", "pending")
+                        lines.append(f"👤 {requester} → {dest}")
+                        lines.append(f"  Status: {status}")
+                        if appr.get("start_date"):
+                            lines.append(f"  📅 {appr['start_date']}")
+                        if appr.get("estimated_total"):
+                            lines.append(f"  💰 Rs. {appr['estimated_total']:,.0f}")
+                        lines.append(f"  ID: {appr.get('request_id', '?')}")
+                        lines.append("")
+                    _add_to_history(phone_key, "user", body)
+                    _add_to_history(phone_key, "assistant", "\n".join(lines))
+                    return "\n".join(lines)
+
+        except Exception as e:
+            logger.warning("[Cliq Bot] Query engine failed: %s", e)
+            # Continue to AI chat fallback
+
     # AI chat with memory and full DB context
     _add_to_history(phone_key, "user", body)
     reply = _ai_chat(user, body, phone_key)
@@ -577,7 +719,7 @@ def _handle_expense_flow(phone_key: str, text: str, raw: str, user: dict) -> str
                 return "Please enter a valid amount between 1 and 10,00,000.\n\nExample: 500"
             flow["amount"] = amount
             flow["step"] = "description"
-            return f"Amount: *Rs. {amount:,.2f}*\n\nNow describe the expense:\n\nExample: Uber cab to airport"
+            return f"**Amount Set**\n\n▸ Rs. {amount:,.2f}\n\n**Now Describe the Expense**\n\nExample: Uber cab to airport"
         except (ValueError, TypeError):
             return "Invalid amount. Please enter a number.\n\nExample: 500"
 
@@ -617,30 +759,38 @@ def _handle_expense_flow(phone_key: str, text: str, raw: str, user: dict) -> str
         flow["step"] = "confirm"
         cat_labels = {"flight": "Flight", "hotel": "Hotel", "food": "Food & Meals", "transport": "Local Transport", "visa": "Visa / Docs", "communication": "Communication", "other": "Other"}
         return (
-            f"*Expense Summary*\n\n"
-            f"*Amount:* Rs. {flow['amount']:,.2f}\n"
-            f"*Description:* {flow['description']}\n"
-            f"*Category:* {cat_labels.get(cat, cat)}\n"
-            f"*Date:* {time.strftime('%Y-%m-%d')}\n\n"
-            f"Confirm and save?"
+            f"**Expense Summary**\n\n"
+            f"▸ **Amount:** Rs. {flow['amount']:,.2f}\n"
+            f"▸ **Description:** {flow['description']}\n"
+            f"▸ **Category:** {cat_labels.get(cat, cat)} (auto-detected)\n"
+            f"▸ **Date:** {time.strftime('%Y-%m-%d')}\n\n"
+            f"**Confirm and save?**\n\n"
+            f"Reply **yes** to save or **no** to cancel"
         )
 
     # Step 4: Confirm
     if step == "confirm":
         if text in ("yes", "confirm", "save", "ok", "y", "submit"):
+            logger.info("[Cliq Bot] Saving guided expense: user_id=%s, category=%s, amount=%s, description=%s, source=cliq",
+                       flow["user_id"], flow["category"], flow["amount"], flow["description"])
             saved = _save_expense(
                 flow["user_id"], flow["category"], flow["description"],
-                flow["amount"], "", time.strftime("%Y-%m-%d"),
+                flow["amount"], "", time.strftime("%Y-%m-%d"), source="cliq"
             )
+            logger.info("[Cliq Bot] Guided expense save result: %s", saved)
             _expense_flow.pop(phone_key, None)
             if saved:
+                logger.info("[Cliq Bot] Guided expense successfully saved for user %s", flow["user_id"])
                 return (
-                    f"*Expense Saved*\n\n"
-                    f"*Amount:* Rs. {flow['amount']:,.2f}\n"
-                    f"*Description:* {flow['description']}\n\n"
-                    f"Expense has been added to your TravelSync account."
+                    f"**Expense Saved Successfully**\n\n"
+                    f"▸ **Amount:** Rs. {flow['amount']:,.2f}\n"
+                    f"▸ **Description:** {flow['description']}\n"
+                    f"▸ **Category:** {cat_labels.get(flow['category'], flow['category'])}\n\n"
+                    f"Your expense has been added to TravelSync Pro.\n\n"
+                    f"View all expenses: Type **4** or **expenses**"
                 )
-            return "Failed to save expense. Please try on the web app."
+            logger.warning("[Cliq Bot] Guided expense save failed for user %s", flow["user_id"])
+            return "**Failed to Save**\n\nCouldn't save the expense. Please try on the web app or contact support."
         elif text in ("no", "cancel", "edit", "n"):
             _expense_flow.pop(phone_key, None)
             return "Expense cancelled. Type *submit expense* to start again."

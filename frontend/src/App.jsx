@@ -21,6 +21,7 @@ const Profile       = lazy(() => import('./pages/Profile'))
 const UserManagement = lazy(() => import('./pages/UserManagement'))
 const Organization   = lazy(() => import('./pages/Organization'))
 const PlatformAdmin  = lazy(() => import('./pages/PlatformAdmin'))
+const OtisDashboard  = lazy(() => import('./pages/OtisDashboard'))
 
 function PageLoader() {
   return (
@@ -179,6 +180,14 @@ export default function App() {
             element={
               <Suspense fallback={<PageLoader />}>
                 <PlatformAdmin />
+              </Suspense>
+            }
+          />
+          <Route
+            path="/otis"
+            element={
+              <Suspense fallback={<PageLoader />}>
+                <OtisDashboard />
               </Suspense>
             }
           />

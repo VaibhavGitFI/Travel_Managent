@@ -4,6 +4,7 @@ Flask REST API + React SPA frontend
 """
 import os
 import logging
+from datetime import datetime
 from flask import Flask, send_from_directory, jsonify, request
 from flask_socketio import emit, join_room
 from flask_cors import CORS
@@ -138,12 +139,13 @@ def create_app() -> Flask:
     from routes.webhooks import webhooks_bp
     from routes.exports import exports_bp
     from routes.admin import admin_bp
+    from routes.otis import otis_bp
 
     for bp in (auth_bp, trips_bp, weather_bp, currency_bp, meetings_bp,
                expenses_bp, accommodation_bp, requests_bp, approvals_bp, analytics_bp,
                chat_bp, uploads_bp, health_bp, sos_bp, alerts_bp, notifications_bp,
                whatsapp_bp, cliq_bot_bp, expense_approvals_bp, users_bp, orgs_bp, agents_bp, docs_bp,
-               audit_bp, webhooks_bp, exports_bp, admin_bp):
+               audit_bp, webhooks_bp, exports_bp, admin_bp, otis_bp):
         app.register_blueprint(bp)
 
     # ── Standardized Error Handlers ───────────────────────────────────────────
@@ -208,6 +210,221 @@ def create_app() -> Flask:
             join_room(room)
             emit("room_joined", {"room": room})
 
+    # ── OTIS Voice Assistant WebSocket Events ─────────────────────────────────
+    @socketio.on("otis:start_session")
+    def handle_otis_start(data):
+        """Start OTIS voice session."""
+        from auth import get_current_user
+        user = get_current_user()
+        if not user:
+            emit("otis:error", {"error": "Authentication required"})
+            return
+
+        try:
+            session_id = data.get("session_id")
+            logger.info(f"[OTIS WebSocket] Session {session_id} started for user {user['id']}")
+            emit("otis:session_started", {"session_id": session_id, "status": "ready"})
+        except Exception as e:
+            logger.exception("[OTIS WebSocket] Start session failed")
+            emit("otis:error", {"error": "Failed to start session"})
+
+    @socketio.on("otis:audio_chunk")
+    def handle_otis_audio(data):
+        """
+        Receive audio chunk for STT processing.
+        Client sends raw audio data, we transcribe and process.
+        """
+        from auth import get_current_user
+        user = get_current_user()
+        if not user:
+            emit("otis:error", {"error": "Authentication required"})
+            return
+
+        try:
+            session_id = data.get("session_id")
+            audio_data = data.get("audio")  # Base64 encoded audio
+            is_final = data.get("is_final", False)
+
+            if not audio_data:
+                emit("otis:error", {"error": "Audio data required"})
+                return
+
+            # TODO: In production, accumulate chunks and transcribe when is_final=True
+            # For now, emit acknowledgment
+            emit("otis:audio_received", {
+                "session_id": session_id,
+                "chunk_size": len(audio_data),
+                "is_final": is_final
+            })
+
+            # If final chunk, trigger STT processing
+            if is_final:
+                emit("otis:transcribing", {"session_id": session_id})
+                # Actual STT processing would happen here
+                # For now, emit placeholder
+                # emit("otis:transcript", {"text": "...", "session_id": session_id})
+
+        except Exception as e:
+            logger.exception("[OTIS WebSocket] Audio processing failed")
+            emit("otis:error", {"error": "Failed to process audio"})
+
+    @socketio.on("otis:process_command")
+    def handle_otis_command(data):
+        """
+        Process a voice command (text already transcribed).
+        This is the main OTIS processing pipeline.
+        """
+        import asyncio
+        import concurrent.futures
+
+        from auth import get_current_user
+        user = get_current_user()
+        if not user:
+            emit("otis:error", {"error": "Authentication required"})
+            return
+
+        try:
+            session_id = data.get("session_id")
+            command_text = data.get("command", "").strip()
+
+            if not command_text:
+                emit("otis:error", {"error": "Command text required"})
+                return
+
+            logger.info(f"[OTIS WebSocket] Processing command: '{command_text}' (session: {session_id})")
+
+            # Security: validate command before processing
+            try:
+                from otis_security import OtisCommandSecurity
+                validation = OtisCommandSecurity.validate(command_text)
+                if not validation["valid"]:
+                    emit("otis:error", {"error": validation["error"], "session_id": session_id})
+                    return
+                command_text = validation["command"]  # Use sanitized command
+                # If high-risk and needs confirmation, notify client
+                if validation.get("needs_confirmation"):
+                    emit("otis:confirm_required", {
+                        "session_id": session_id,
+                        "command": command_text,
+                        "risk_reason": validation["risk_reason"]
+                    })
+                    return
+                # Quota check
+                if session_id:
+                    allowed, quota_reason = OtisCommandSecurity.check_command_quota(user["id"], session_id)
+                    if not allowed:
+                        emit("otis:error", {"error": quota_reason, "session_id": session_id})
+                        return
+            except ImportError:
+                pass  # Security module optional — don't block if not yet installed
+
+            emit("otis:processing", {"session_id": session_id, "command": command_text})
+
+            # Import OTIS agent (use pool to avoid re-initializing services each call)
+            try:
+                from agents.otis_agent import OtisAgentPool
+
+                pool = OtisAgentPool.instance()
+                agent = pool.get_or_create(
+                    user_id=user["id"],
+                    org_id=user.get("org_id"),
+                    session_id=session_id or f"ws-{user['id']}"
+                )
+
+                # Run async process_command in a thread with its own event loop
+                def _run_command():
+                    return asyncio.run(agent.process_command(command_text))
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                    response_text = executor.submit(_run_command).result(timeout=30)
+
+                # Send response back to client
+                emit("otis:response", {
+                    "session_id": session_id,
+                    "command": command_text,
+                    "response": response_text,
+                    "timestamp": datetime.now().isoformat()
+                })
+
+                logger.info(f"[OTIS WebSocket] Response sent: '{response_text[:50]}...'")
+
+            except ImportError as ie:
+                logger.error(f"[OTIS WebSocket] OTIS agent not found: {ie}")
+                emit("otis:response", {
+                    "session_id": session_id,
+                    "response": "OTIS is not fully configured. Please contact your administrator.",
+                    "error": True
+                })
+            except Exception as agent_err:
+                logger.exception("[OTIS WebSocket] Agent processing failed")
+                emit("otis:response", {
+                    "session_id": session_id,
+                    "response": "I encountered an error processing your command. Please try again.",
+                    "error": True
+                })
+
+        except Exception as e:
+            logger.exception("[OTIS WebSocket] Command processing failed")
+            emit("otis:error", {"error": "Failed to process command"})
+
+    @socketio.on("otis:request_audio")
+    def handle_otis_request_audio(data):
+        """
+        Request TTS audio for a text response.
+        Client can request audio generation for a specific text.
+        """
+        from auth import get_current_user
+        user = get_current_user()
+        if not user:
+            emit("otis:error", {"error": "Authentication required"})
+            return
+
+        try:
+            session_id = data.get("session_id")
+            text = data.get("text", "").strip()
+
+            if not text:
+                emit("otis:error", {"error": "Text required for audio generation"})
+                return
+
+            logger.info(f"[OTIS WebSocket] Generating audio for: '{text[:50]}...'")
+
+            # TODO: Generate TTS audio
+            # For now, emit placeholder
+            emit("otis:audio_ready", {
+                "session_id": session_id,
+                "text": text,
+                "audio_url": None,  # Would be base64 audio or URL
+                "duration_ms": 0
+            })
+
+        except Exception as e:
+            logger.exception("[OTIS WebSocket] Audio generation failed")
+            emit("otis:error", {"error": "Failed to generate audio"})
+
+    @socketio.on("otis:stop_session")
+    def handle_otis_stop(data):
+        """Stop OTIS voice session."""
+        from auth import get_current_user
+        user = get_current_user()
+        if not user:
+            emit("otis:error", {"error": "Authentication required"})
+            return
+
+        try:
+            session_id = data.get("session_id")
+            logger.info(f"[OTIS WebSocket] Session {session_id} stopped")
+            # Release agent from pool to free resources
+            try:
+                from agents.otis_agent import OtisAgentPool
+                OtisAgentPool.instance().release(session_id or f"ws-{user['id']}")
+            except Exception:
+                pass
+            emit("otis:session_stopped", {"session_id": session_id})
+        except Exception as e:
+            logger.exception("[OTIS WebSocket] Stop session failed")
+            emit("otis:error", {"error": "Failed to stop session"})
+
     # ── Serve React SPA (production) ───────────────────────────────────────────
     @app.route("/", defaults={"path": ""})
     @app.route("/<path:path>")
@@ -240,21 +457,22 @@ def log_startup_banner() -> None:
     status = Config.services_status()
     lines = [
         "",
-        "═" * 62,
+        "=" * 62,
         "  TravelSync Pro v3.0 — AI-Powered Corporate Travel",
-        "═" * 62,
+        "=" * 62,
     ]
     for svc, live in status.items():
-        icon = "✅ Live    " if live else "⚠️  Fallback"
+        icon = "[LIVE]    " if live else "[FALLBACK]"
         lines.append(f"  {svc:<28} {icon}")
     lines.extend([
-        "─" * 62,
+        "-" * 62,
         f"  API     : http://localhost:{Config.PORT}/api",
         "  React   : http://localhost:5173  (cd frontend && npm run dev)",
         f"  Debug   : {Config.DEBUG}",
-        "═" * 62,
+        "=" * 62,
     ])
-    logger.info("\n".join(lines))
+    # Print directly to bypass JSON formatter for clean startup banner
+    print("\n".join(lines))
 
 
 # ── Supabase Keep-Alive ───────────────────────────────────────────────────────

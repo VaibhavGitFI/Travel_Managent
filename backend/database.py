@@ -487,6 +487,108 @@ def _create_tables(c, pg=None):
         created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )""")
 
+    # ── OTIS Voice Agent Tables ───────────────────────────────────────────────
+
+    c.execute(f"""
+    CREATE TABLE IF NOT EXISTS otis_sessions (
+        id                  {pk},
+        org_id              INTEGER REFERENCES organizations(id),
+        user_id             INTEGER REFERENCES users(id),
+        session_id          TEXT UNIQUE NOT NULL,
+        status              TEXT DEFAULT 'active',
+        wake_word_detected  INTEGER DEFAULT 0,
+        total_turns         INTEGER DEFAULT 0,
+        started_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        ended_at            TIMESTAMP,
+        duration_seconds    INTEGER DEFAULT 0
+    )""")
+
+    c.execute(f"""
+    CREATE TABLE IF NOT EXISTS otis_commands (
+        id                      {pk},
+        org_id                  INTEGER REFERENCES organizations(id),
+        user_id                 INTEGER REFERENCES users(id),
+        session_id              TEXT REFERENCES otis_sessions(session_id),
+
+        command_text            TEXT NOT NULL,
+        transcript              TEXT,
+        transcript_confidence   REAL,
+
+        intent                  TEXT,
+        intent_confidence       REAL,
+        entities_json           TEXT DEFAULT '{{}}',
+
+        function_called         TEXT,
+        function_params_json    TEXT DEFAULT '{{}}',
+        function_result_json    TEXT DEFAULT '{{}}',
+
+        response_text           TEXT,
+        response_audio_url      TEXT,
+
+        success                 INTEGER DEFAULT 1,
+        error_message           TEXT,
+
+        latency_ms              INTEGER,
+        cost_usd                REAL,
+
+        created_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+
+    c.execute(f"""
+    CREATE TABLE IF NOT EXISTS otis_conversations (
+        id              {pk},
+        session_id      TEXT REFERENCES otis_sessions(session_id),
+        turn_number     INTEGER NOT NULL,
+        role            TEXT NOT NULL,
+        content         TEXT NOT NULL,
+        audio_url       TEXT,
+        timestamp       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+
+    c.execute(f"""
+    CREATE TABLE IF NOT EXISTS otis_settings (
+        id                      {pk},
+        org_id                  INTEGER UNIQUE REFERENCES organizations(id),
+        user_id                 INTEGER UNIQUE REFERENCES users(id),
+
+        enabled                 INTEGER DEFAULT 1,
+        admin_only              INTEGER DEFAULT 1,
+
+        wake_word               TEXT DEFAULT 'Hey Otis',
+        voice_id                TEXT DEFAULT 'en-IN-female',
+        voice_speed             REAL DEFAULT 1.0,
+        voice_pitch             REAL DEFAULT 1.0,
+
+        auto_execute_actions    INTEGER DEFAULT 0,
+        require_confirmation    INTEGER DEFAULT 1,
+
+        max_session_duration    INTEGER DEFAULT 600,
+        idle_timeout_seconds    INTEGER DEFAULT 30,
+
+        created_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+
+    c.execute(f"""
+    CREATE TABLE IF NOT EXISTS otis_analytics (
+        id                      {pk},
+        org_id                  INTEGER REFERENCES organizations(id),
+        date                    TEXT NOT NULL,
+
+        total_sessions          INTEGER DEFAULT 0,
+        total_commands          INTEGER DEFAULT 0,
+        successful_commands     INTEGER DEFAULT 0,
+        failed_commands         INTEGER DEFAULT 0,
+
+        avg_latency_ms          REAL DEFAULT 0,
+        total_cost_usd          REAL DEFAULT 0,
+
+        most_used_function      TEXT,
+        total_active_users      INTEGER DEFAULT 0,
+
+        created_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+
     # ── Indexes for query performance ─────────────────────────────────────────
     _create_indexes(c, use_pg)
 
@@ -544,6 +646,17 @@ def _create_indexes(c, pg=False):
         ("idx_audit_logs_created_at",         "audit_logs", "created_at"),
         # webhook_subscriptions
         ("idx_webhooks_org_event",            "webhook_subscriptions", "org_id"),
+        # OTIS voice agent
+        ("idx_otis_sessions_org_id",          "otis_sessions", "org_id"),
+        ("idx_otis_sessions_user_id",         "otis_sessions", "user_id"),
+        ("idx_otis_sessions_session_id",      "otis_sessions", "session_id"),
+        ("idx_otis_sessions_status",          "otis_sessions", "status"),
+        ("idx_otis_commands_org_id",          "otis_commands", "org_id"),
+        ("idx_otis_commands_user_id",         "otis_commands", "user_id"),
+        ("idx_otis_commands_session_id",      "otis_commands", "session_id"),
+        ("idx_otis_commands_function",        "otis_commands", "function_called"),
+        ("idx_otis_conversations_session",    "otis_conversations", "session_id"),
+        ("idx_otis_analytics_org_date",       "otis_analytics", "org_id"),
     ]
     for idx_name, table, column in indexes:
         try:
@@ -599,6 +712,10 @@ def _apply_migrations_pg(db):
     _add_col("expenses_db", "approval_comments", "TEXT")
     _add_col("expenses_db", "submitted_at", "TIMESTAMP")
     _add_col("expenses_db", "approved_at", "TIMESTAMP")
+
+    # expenses_db — source tracking and duplicate detection
+    _add_col("expenses_db", "source", "TEXT DEFAULT 'web'")  # whatsapp, cliq, web, manual
+    _add_col("expenses_db", "vendor", "TEXT")  # extracted vendor name for duplicate detection
 
     # chat_sessions table (for existing databases)
     try:
@@ -705,6 +822,10 @@ def _apply_migrations(db, c):
     _add_col("expenses_db", "approval_comments", "TEXT")
     _add_col("expenses_db", "submitted_at", "TIMESTAMP")
     _add_col("expenses_db", "approved_at", "TIMESTAMP")
+
+    # expenses_db — source tracking and duplicate detection
+    _add_col("expenses_db", "source", "TEXT DEFAULT 'web'")  # whatsapp, cliq, web, manual
+    _add_col("expenses_db", "vendor", "TEXT")  # extracted vendor name for duplicate detection
 
     # Multi-tenancy: org_id columns on all data tables
     _add_col("travel_policies",  "org_id", "INTEGER")

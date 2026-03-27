@@ -375,6 +375,94 @@ def process_message(message: str, user: dict = None, model=None, context: dict =
     intent = _detect_intent(message)
     entities = _extract_entities(message, context=context)
 
+    # Try query engine first for data-specific queries
+    if user and any(keyword in message.lower() for keyword in ["show", "list", "from", "in", "this", "last", "pending", "approved", "rejected", "how many", "how much"]):
+        try:
+            from agents.query_engine import handle_query
+
+            query_result = handle_query(user, message)
+
+            if query_result and query_result.get("data", {}).get("success"):
+                data = query_result["data"]
+                query_type = query_result["type"]
+
+                # Format structured response for in-app chat
+                if query_type == "expenses" and data.get("expenses"):
+                    expenses = data["expenses"][:15]  # More items for web
+                    scope_label = {"self": "Your", "team": "Team", "org": "Organization"}[data.get("scope", "self")]
+                    reply_lines = [f"### {scope_label} Expenses\n"]
+                    reply_lines.append(f"**Total:** {data['count']} items, ₹{data.get('total_amount', 0):,.0f}\n")
+                    reply_lines.append("| Date | Category | Amount | Source | Description |")
+                    reply_lines.append("|------|----------|--------|--------|-------------|")
+                    for exp in expenses:
+                        cat = exp.get("category", "other").title()
+                        amt = exp.get("invoice_amount") or exp.get("verified_amount") or exp.get("payment_amount") or 0
+                        desc = exp.get("description", "")[:40]
+                        date = exp.get("date", "")
+                        source = exp.get("source", "web").upper()
+                        reply_lines.append(f"| {date} | {cat} | ₹{float(amt):,.0f} | {source} | {desc} |")
+                    return {
+                        "reply": "\n".join(reply_lines),
+                        "intent": "expense",
+                        "entities": entities,
+                        "action_cards": [],
+                        "ai_powered": True,
+                        "query_data": data,
+                    }
+
+                elif query_type == "trips" and data.get("trips"):
+                    trips = data["trips"][:15]
+                    scope_label = {"self": "Your", "team": "Team", "org": "Organization"}[data.get("scope", "self")]
+                    reply_lines = [f"### {scope_label} Travel Requests\n"]
+                    reply_lines.append(f"**Total:** {data['count']} trips\n")
+                    reply_lines.append("| Route | Dates | Status | Budget |")
+                    reply_lines.append("|-------|-------|--------|--------|")
+                    for trip in trips:
+                        route = f"{trip.get('origin', '?')} → {trip.get('destination', '?')}"
+                        dates = f"{trip.get('start_date', '')} to {trip.get('end_date', '')}" if trip.get("start_date") else "TBD"
+                        status = trip.get("status", "pending").upper()
+                        budget = f"₹{trip['estimated_total']:,.0f}" if trip.get("estimated_total") else "TBD"
+                        reply_lines.append(f"| {route} | {dates} | {status} | {budget} |")
+                    return {
+                        "reply": "\n".join(reply_lines),
+                        "intent": "status",
+                        "entities": entities,
+                        "action_cards": [],
+                        "ai_powered": True,
+                        "query_data": data,
+                    }
+
+                elif query_type == "analytics" and data.get("success"):
+                    scope_label = {"self": "Your", "team": "Team", "org": "Organization"}[data.get("scope", "self")]
+                    exp_data = data.get("expenses", {})
+                    trip_data = data.get("trips", {})
+                    reply_lines = [f"### {scope_label} Analytics\n"]
+                    reply_lines.append(f"**Expenses:** {exp_data.get('count', 0)} items, ₹{exp_data.get('total_amount', 0):,.0f}")
+                    reply_lines.append(f"**Trips:** {trip_data.get('count', 0)} trips, ₹{trip_data.get('total_budget', 0):,.0f}\n")
+
+                    if exp_data.get("by_category"):
+                        reply_lines.append("**By Category:**")
+                        for cat in exp_data["by_category"][:5]:
+                            reply_lines.append(f"- **{cat.get('category', 'other').title()}:** ₹{cat.get('total', 0):,.0f} ({cat.get('count', 0)} items)")
+
+                    if exp_data.get("by_source"):
+                        reply_lines.append("\n**By Source:**")
+                        for src in exp_data["by_source"]:
+                            reply_lines.append(f"- **{src.get('source', 'web').upper()}:** ₹{src.get('total', 0):,.0f} ({src.get('count', 0)} items)")
+
+                    return {
+                        "reply": "\n".join(reply_lines),
+                        "intent": "status",
+                        "entities": entities,
+                        "action_cards": [],
+                        "ai_powered": True,
+                        "query_data": data,
+                    }
+
+        except Exception as e:
+            logger.warning("[Chat] Query engine failed: %s", e)
+            # Continue with normal AI processing
+
     # If plan_trip intent with a destination, run the orchestrator
     trip_results = None
     if intent == "plan_trip" and entities.get("destination"):

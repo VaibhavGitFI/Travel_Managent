@@ -9,6 +9,7 @@ import {
 } from 'lucide-react'
 import Sidebar from './Sidebar'
 import Topbar from './Topbar'
+import OtisLauncher from '../voice/OtisLauncher'
 import useStore from '../../store/useStore'
 import client from '../../api/client'
 import socket from '../../lib/socket'
@@ -438,6 +439,9 @@ export default function Layout() {
           </div>
         </main>
       </div>
+
+      {/* ── OTIS Voice Launcher ──────────────────────────────────────────── */}
+      <OtisLauncher />
 
       {/* ── Floating SOS Button ─────────────────────────────────────────── */}
       {auth.isLoggedIn && (
