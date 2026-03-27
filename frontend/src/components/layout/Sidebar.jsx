@@ -14,11 +14,17 @@ import {
   X,
   ChevronsLeft,
   ChevronsRight,
+  UserCircle,
+  Settings,
+  Globe,
+  Volume2,
 } from 'lucide-react'
 import { cn } from '../../lib/cn'
 import useStore from '../../store/useStore'
 import { logout as apiLogout } from '../../api/auth'
 import toast from 'react-hot-toast'
+
+const ELEVATED = ['manager', 'admin', 'super_admin']
 
 const navGroups = [
   {
@@ -37,16 +43,36 @@ const navGroups = [
       { to: '/expenses',  icon: Receipt,     label: 'Expenses' },
       { to: '/requests',  icon: FileText,    label: 'Requests' },
       { to: '/approvals', icon: CheckSquare, label: 'Approvals' },
-      { to: '/analytics', icon: BarChart3,   label: 'Analytics' },
+      { to: '/analytics', icon: BarChart3,   label: 'Analytics', roles: ELEVATED },
+      { to: '/otis',      icon: Volume2,     label: 'OTIS Voice', roles: ELEVATED },
+    ],
+  },
+  {
+    label: 'Account',
+    items: [
+      { to: '/profile',         icon: UserCircle, label: 'Profile' },
+      { to: '/organization',    icon: Building2,  label: 'Organization' },
+      { to: '/user-management', icon: Settings,   label: 'Users', roles: ['super_admin'] },
+      { to: '/platform-admin',  icon: Globe,      label: 'Platform Admin', roles: ['super_admin'] },
     ],
   },
 ]
 
 export default function Sidebar() {
-  const { auth, sidebar, toggleSidebar, setSidebarCollapsed, logout: storeLogout } = useStore()
+  const { auth, sidebar, org, toggleSidebar, setSidebarCollapsed, logout: storeLogout } = useStore()
   const collapsed = sidebar.collapsed
   const navigate = useNavigate()
   const user = auth.user
+  const userRole = user?.role || 'employee'
+  const orgName = org?.current?.name || user?.org_name
+
+  // Filter nav items by role
+  const filteredGroups = navGroups
+    .map(group => ({
+      ...group,
+      items: group.items.filter(item => !item.roles || item.roles.includes(userRole)),
+    }))
+    .filter(group => group.items.length > 0)
 
   const handleLogout = async () => {
     try {
@@ -110,7 +136,7 @@ export default function Sidebar() {
               TravelSync
             </span>
             <span className="-mt-0.5 block whitespace-nowrap text-[10px] font-medium uppercase tracking-[0.15em] text-brand-muted">
-              Pro
+              {orgName || 'Pro'}
             </span>
           </div>
         )}
@@ -118,7 +144,7 @@ export default function Sidebar() {
 
       {/* Navigation */}
       <nav className="sidebar-scroll flex-1 overflow-x-hidden overflow-y-auto py-3">
-        {navGroups.map((group) => (
+        {filteredGroups.map((group) => (
           <div key={group.label} className="mb-1">
             {!collapsed && (
               <p className="mb-1.5 mt-2 px-5 text-[10px] font-semibold uppercase tracking-[0.14em] text-brand-muted/70">

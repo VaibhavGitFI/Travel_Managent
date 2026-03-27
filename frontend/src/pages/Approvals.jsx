@@ -4,9 +4,11 @@ import { cn } from '../lib/cn'
 import {
   CheckCircle, XCircle, Clock, Calendar, AlertCircle, Shield,
   Plane, User, IndianRupee, Briefcase, ChevronDown, ChevronUp,
+  Receipt, Send, ArrowRight,
 } from 'lucide-react'
 import toast from 'react-hot-toast'
 import { getApprovals, approveRequest, rejectRequest } from '../api/approvals'
+import { getExpenses, getPendingExpenseApprovals, approveExpense, rejectExpense, submitExpenseForApproval } from '../api/expenses'
 import useAutoRefresh from '../hooks/useAutoRefresh'
 import StatCard from '../components/ui/StatCard'
 import Spinner from '../components/ui/Spinner'
@@ -24,6 +26,16 @@ export default function Approvals() {
   const [showHistory, setShowHistory] = useState(false)
 
   const [view, setView] = useState('manager') // 'manager' or 'employee'
+  const [tab, setTab] = useState('travel') // 'travel' or 'expenses'
+  const [pendingExpenses, setPendingExpenses] = useState([])
+  const [expLoading, setExpLoading] = useState(false)
+  const [expRejectModal, setExpRejectModal] = useState(false)
+  const [expSelected, setExpSelected] = useState(null)
+  const [expReason, setExpReason] = useState('')
+  const [empTab, setEmpTab] = useState('travel') // employee tab: 'travel' or 'expenses'
+  const [myExpenses, setMyExpenses] = useState([])
+  const [myExpLoading, setMyExpLoading] = useState(false)
+  const [submittingExp, setSubmittingExp] = useState(null)
 
   const fetch = async () => {
     try {
@@ -36,8 +48,52 @@ export default function Approvals() {
     finally { setLoading(false) }
   }
 
-  useEffect(() => { fetch() }, [])
+  const fetchExpenses = async () => {
+    setExpLoading(true)
+    try {
+      const data = await getPendingExpenseApprovals()
+      setPendingExpenses(data.expenses || [])
+    } catch {}
+    finally { setExpLoading(false) }
+  }
+
+  const fetchMyExpenses = async () => {
+    setMyExpLoading(true)
+    try {
+      const data = await getExpenses()
+      setMyExpenses(data.expenses || [])
+    } catch {}
+    finally { setMyExpLoading(false) }
+  }
+
+  const handleSubmitForApproval = async (id) => {
+    setSubmittingExp(id)
+    try {
+      await submitExpenseForApproval(id)
+      toast.success('Expense submitted for approval')
+      fetchMyExpenses()
+    } catch (err) { toast.error(err.response?.data?.error || 'Submit failed') }
+    finally { setSubmittingExp(null) }
+  }
+
+  useEffect(() => { fetch(); fetchExpenses(); fetchMyExpenses() }, [])
+  useEffect(() => { if (view === 'manager' && tab === 'expenses') fetchExpenses() }, [tab])
   useAutoRefresh('approvals', fetch)
+
+  const handleApproveExpense = async (id) => {
+    setProcessing(id)
+    try { await approveExpense(id); toast.success('Expense approved!'); fetchExpenses() }
+    catch { toast.error('Approval failed') }
+    finally { setProcessing(null) }
+  }
+
+  const handleRejectExpense = async () => {
+    if (!expSelected) return
+    setProcessing(expSelected.id)
+    try { await rejectExpense(expSelected.id, expReason); toast.success('Expense rejected.'); setExpRejectModal(false); fetchExpenses() }
+    catch { toast.error('Rejection failed') }
+    finally { setProcessing(null) }
+  }
 
   const handleApprove = async (id) => {
     setProcessing(id)
@@ -83,32 +139,163 @@ export default function Approvals() {
       {/* ── Employee tracking view ──────────── */}
       {view === 'employee' && (
         <>
-          <div className="rounded-xl border border-gray-200 bg-white shadow-card overflow-hidden">
-            <div className="px-5 py-4 border-b border-gray-100">
-              <h3 className="text-sm font-semibold text-gray-900">Your Request Status</h3>
-              <p className="text-xs text-gray-500 mt-0.5">Track where your travel requests are in the approval pipeline</p>
-            </div>
-            {loading ? (
-              <div className="divide-y divide-gray-100">{Array.from({ length: 3 }).map((_, i) => <SkeletonRow key={i} />)}</div>
-            ) : requests.length === 0 ? (
-              <div className="py-14 text-center">
-                <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-2xl bg-gradient-to-br from-gray-100 to-gray-200">
-                  <Plane size={24} className="text-gray-400" />
-                </div>
-                <p className="font-semibold text-gray-700">No requests submitted</p>
-                <p className="mt-1 text-sm text-gray-500">Submit a travel request to see its approval status here</p>
-              </div>
-            ) : (
-              <div className="divide-y divide-gray-100">
-                {requests.map(r => <EmployeeTrackRow key={r.request_id} request={r} />)}
-              </div>
-            )}
+          {/* Employee tab switcher */}
+          <div className="flex gap-1 rounded-lg bg-gray-100 p-1 w-fit">
+            {[
+              { key: 'travel', label: 'Travel Requests', icon: Plane },
+              { key: 'expenses', label: 'My Expenses', icon: Receipt },
+            ].map(t => (
+              <button key={t.key} onClick={() => setEmpTab(t.key)}
+                className={cn('flex items-center gap-1.5 rounded-md px-4 py-1.5 text-xs font-semibold transition-all',
+                  empTab === t.key ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700')}>
+                <t.icon size={13} />
+                {t.label}
+                {t.key === 'expenses' && myExpenses.filter(e => e.approval_status === 'submitted').length > 0 && empTab !== 'expenses' && (
+                  <span className="ml-1 inline-flex h-4 w-4 items-center justify-center rounded-full bg-amber-500 text-[9px] font-bold text-white">
+                    {myExpenses.filter(e => e.approval_status === 'submitted').length}
+                  </span>
+                )}
+              </button>
+            ))}
           </div>
+
+          {/* Travel Requests */}
+          {empTab === 'travel' && (
+            <div className="rounded-xl border border-gray-200 bg-white shadow-card overflow-hidden">
+              <div className="px-5 py-4 border-b border-gray-100">
+                <h3 className="text-sm font-semibold text-gray-900">Your Travel Request Status</h3>
+                <p className="text-xs text-gray-500 mt-0.5">Track where your travel requests are in the approval pipeline</p>
+              </div>
+              {loading ? (
+                <div className="divide-y divide-gray-100">{Array.from({ length: 3 }).map((_, i) => <SkeletonRow key={i} />)}</div>
+              ) : requests.length === 0 ? (
+                <div className="py-14 text-center">
+                  <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-2xl bg-gradient-to-br from-gray-100 to-gray-200">
+                    <Plane size={24} className="text-gray-400" />
+                  </div>
+                  <p className="font-semibold text-gray-700">No requests submitted</p>
+                  <p className="mt-1 text-sm text-gray-500">Submit a travel request to see its approval status here</p>
+                </div>
+              ) : (
+                <div className="divide-y divide-gray-100">
+                  {requests.map(r => <EmployeeTrackRow key={r.request_id} request={r} />)}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Expense Approval Status */}
+          {empTab === 'expenses' && (
+            <div className="space-y-4">
+              {/* Expense stats */}
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                {[
+                  { label: 'Draft', count: myExpenses.filter(e => !e.approval_status || e.approval_status === 'draft').length, color: 'gray' },
+                  { label: 'Pending', count: myExpenses.filter(e => e.approval_status === 'submitted').length, color: 'amber' },
+                  { label: 'Approved', count: myExpenses.filter(e => e.approval_status === 'approved').length, color: 'emerald' },
+                  { label: 'Rejected', count: myExpenses.filter(e => e.approval_status === 'rejected').length, color: 'red' },
+                ].map(s => (
+                  <div key={s.label} className={cn('rounded-xl border bg-white p-4 shadow-card', `border-${s.color}-100`)}>
+                    <p className={cn('text-2xl font-bold', `text-${s.color}-600`)}>{s.count}</p>
+                    <p className="text-xs font-medium text-gray-500 mt-0.5">{s.label}</p>
+                  </div>
+                ))}
+              </div>
+
+              <div className="rounded-xl border border-gray-200 bg-white shadow-card overflow-hidden">
+                <div className="px-5 py-4 border-b border-gray-100">
+                  <h3 className="text-sm font-semibold text-gray-900">Your Expense Approval Status</h3>
+                  <p className="text-xs text-gray-500 mt-0.5">Track expense submissions and their approval progress</p>
+                </div>
+                {myExpLoading ? (
+                  <div className="divide-y divide-gray-100">{[1,2,3].map(i => <SkeletonRow key={i} />)}</div>
+                ) : myExpenses.length === 0 ? (
+                  <div className="py-14 text-center">
+                    <Receipt size={24} className="mx-auto mb-3 text-gray-300" />
+                    <p className="font-semibold text-gray-700">No expenses yet</p>
+                    <p className="mt-1 text-sm text-gray-500">Add expenses from the Expenses page</p>
+                  </div>
+                ) : (
+                  <div className="divide-y divide-gray-100">
+                    {myExpenses.map(exp => {
+                      const status = exp.approval_status || 'draft'
+                      const statusConfig = {
+                        draft:     { icon: Clock,       color: 'text-gray-500',   bg: 'bg-gray-50',    border: 'border-gray-200', label: 'Draft' },
+                        submitted: { icon: Send,        color: 'text-amber-600',  bg: 'bg-amber-50',   border: 'border-amber-200', label: 'Pending Approval' },
+                        approved:  { icon: CheckCircle, color: 'text-emerald-600',bg: 'bg-emerald-50', border: 'border-emerald-200', label: 'Approved' },
+                        rejected:  { icon: XCircle,     color: 'text-red-600',    bg: 'bg-red-50',     border: 'border-red-200', label: 'Rejected' },
+                      }
+                      const st = statusConfig[status] || statusConfig.draft
+                      const StIcon = st.icon
+                      return (
+                        <div key={exp.id} className="flex flex-col gap-3 px-5 py-4 hover:bg-gray-50/50 transition-colors sm:flex-row sm:items-center sm:gap-4">
+                          <div className={cn('flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border', st.bg, st.border)}>
+                            <StIcon size={16} className={st.color} />
+                          </div>
+                          <div className="min-w-0 flex-1">
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <p className="text-sm font-semibold text-gray-900">{exp.description || exp.category || 'Expense'}</p>
+                              <span className={cn('inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-semibold', st.bg, st.color, st.border)}>
+                                <span className={cn('h-1.5 w-1.5 rounded-full', st.color.replace('text-', 'bg-'))} />
+                                {st.label}
+                              </span>
+                            </div>
+                            <div className="flex items-center gap-3 mt-1 flex-wrap text-xs text-gray-500">
+                              {exp.category && <span className="capitalize">{exp.category}</span>}
+                              <span className="font-semibold text-gray-700">₹{Number(exp.amount || exp.invoice_amount || 0).toLocaleString('en-IN')}</span>
+                              {exp.date && <span>{exp.date}</span>}
+                              {exp.approver_name && status === 'submitted' && (
+                                <span className="flex items-center gap-1 text-amber-600">
+                                  <ArrowRight size={10} /> Pending with <strong>{exp.approver_name}</strong>
+                                </span>
+                              )}
+                              {exp.approver_name && status === 'approved' && (
+                                <span className="flex items-center gap-1 text-emerald-600">
+                                  <CheckCircle size={10} /> Approved by <strong>{exp.approver_name}</strong>
+                                </span>
+                              )}
+                              {exp.approval_comments && status === 'rejected' && (
+                                <span className="text-red-500">Reason: {exp.approval_comments}</span>
+                              )}
+                            </div>
+                          </div>
+                          {/* Submit button for draft expenses */}
+                          {status === 'draft' && (
+                            <button onClick={() => handleSubmitForApproval(exp.id)} disabled={submittingExp === exp.id}
+                              className="flex items-center gap-1.5 rounded-lg border border-blue-200 bg-blue-50 px-3.5 py-2 text-xs font-semibold text-blue-700 transition-colors hover:bg-blue-100 disabled:opacity-50 shrink-0">
+                              {submittingExp === exp.id ? <Spinner size="xs" /> : <Send size={13} />}
+                              Submit for Approval
+                            </button>
+                          )}
+                        </div>
+                      )
+                    })}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
         </>
       )}
 
-      {/* ── Manager approval view ─────────── */}
-      {view === 'manager' && <>
+      {/* ── Tab Switcher (manager only) ──── */}
+      {view === 'manager' && (
+        <div className="flex gap-1 rounded-lg bg-gray-100 p-1 w-fit">
+          {[{ key: 'travel', label: 'Travel Requests' }, { key: 'expenses', label: 'Expense Approvals' }].map(t => (
+            <button key={t.key} onClick={() => setTab(t.key)}
+              className={cn('rounded-md px-4 py-1.5 text-xs font-semibold transition-all',
+                tab === t.key ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700')}>
+              {t.label}
+              {t.key === 'expenses' && pendingExpenses.length > 0 && tab !== 'expenses' && (
+                <span className="ml-1.5 inline-flex h-4 w-4 items-center justify-center rounded-full bg-red-500 text-[9px] font-bold text-white">{pendingExpenses.length}</span>
+              )}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {/* ── Manager approval view — Travel Requests ─── */}
+      {view === 'manager' && tab === 'travel' && <>
       {/* Stats */}
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
         <StatCard icon={<Clock size={20} />} value={loading ? '—' : pendingList.length} label="Awaiting Approval" accentColor="orange" className="rounded-xl border border-gray-200 bg-white shadow-card" loading={loading} />
@@ -237,6 +424,93 @@ export default function Approvals() {
         document.body
       )}
       </>}
+
+      {/* ── Manager approval view — Expense Approvals ── */}
+      {view === 'manager' && tab === 'expenses' && (
+        <div className="rounded-xl border border-gray-200 bg-white shadow-card overflow-hidden">
+          <div className="px-5 py-4 border-b border-gray-100 flex items-center justify-between">
+            <h3 className="text-sm font-semibold text-gray-900">Pending Expense Approvals</h3>
+            {pendingExpenses.length > 0 && (
+              <span className="rounded-full bg-amber-100 border border-amber-200 px-2 py-0.5 text-[10px] font-bold text-amber-700">
+                {pendingExpenses.length} awaiting
+              </span>
+            )}
+          </div>
+          {expLoading ? (
+            <div className="p-5 space-y-3">{[1,2,3].map(i => <SkeletonRow key={i} />)}</div>
+          ) : pendingExpenses.length === 0 ? (
+            <div className="py-12 text-center">
+              <CheckCircle size={28} className="mx-auto mb-2 text-emerald-200" />
+              <p className="text-sm font-medium text-gray-500">All caught up</p>
+              <p className="text-xs text-gray-400 mt-0.5">No expense approvals pending</p>
+            </div>
+          ) : (
+            <div className="divide-y divide-gray-100">
+              {pendingExpenses.map(exp => (
+                <div key={exp.id} className="flex flex-col gap-3 px-5 py-4 transition-colors hover:bg-gray-50/50 sm:flex-row sm:items-center sm:gap-4">
+                  <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-amber-50 border border-amber-100">
+                    <IndianRupee size={16} className="text-amber-600" />
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <p className="text-sm font-semibold text-gray-900">{exp.description || exp.category || 'Expense'}</p>
+                    <div className="flex items-center gap-3 mt-1 flex-wrap text-xs text-gray-500">
+                      <span className="flex items-center gap-1 font-medium">
+                        <User size={11} className="text-gray-400" /> {exp.employee_name || 'Employee'}
+                      </span>
+                      {exp.employee_dept && <span>· {exp.employee_dept}</span>}
+                      {exp.category && <span className="capitalize">· {exp.category}</span>}
+                      <span className="font-semibold text-gray-700">₹{Number(exp.amount || 0).toLocaleString('en-IN')}</span>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <button onClick={() => handleApproveExpense(exp.id)} disabled={processing === exp.id}
+                      className="flex items-center gap-1.5 rounded-lg border border-emerald-200 bg-emerald-50 px-3.5 py-2 text-xs font-semibold text-emerald-700 transition-colors hover:bg-emerald-100 disabled:opacity-50">
+                      {processing === exp.id ? <Spinner size="xs" /> : <CheckCircle size={13} />}
+                      Approve
+                    </button>
+                    <button onClick={() => { setExpSelected(exp); setExpReason(''); setExpRejectModal(true) }} disabled={processing === exp.id}
+                      className="flex items-center gap-1.5 rounded-lg border border-red-200 bg-red-50 px-3.5 py-2 text-xs font-semibold text-red-700 transition-colors hover:bg-red-100 disabled:opacity-50">
+                      <XCircle size={13} /> Reject
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Expense Reject Modal */}
+      {expRejectModal && ReactDOM.createPortal(
+        <div className="fixed inset-0 z-[9999] flex items-center justify-center overflow-y-auto p-4"
+          onClick={(e) => { if (e.target === e.currentTarget) setExpRejectModal(false) }}
+          style={{ background: 'rgba(15,23,42,0.6)', backdropFilter: 'blur(6px)' }}>
+          <div className="relative w-full max-w-md rounded-2xl bg-white shadow-2xl">
+            <div className="border-b border-gray-100 px-6 py-4">
+              <h3 className="text-base font-semibold text-gray-900">Reject Expense</h3>
+              <p className="text-xs text-gray-500">{expSelected?.description} — ₹{Number(expSelected?.amount || 0).toLocaleString('en-IN')}</p>
+            </div>
+            <div className="px-6 py-5 space-y-4">
+              <div>
+                <label className="mb-1 block text-[11px] font-semibold uppercase tracking-wide text-gray-500">Rejection Reason</label>
+                <textarea rows={3} placeholder="Enter reason for rejection..."
+                  value={expReason} onChange={(e) => setExpReason(e.target.value)}
+                  className={cn(inputBase, 'resize-none')} />
+              </div>
+            </div>
+            <div className="flex justify-end gap-2 border-t border-gray-100 px-6 py-4">
+              <button onClick={() => setExpRejectModal(false)}
+                className="rounded-lg border border-gray-200 px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50">Cancel</button>
+              <button onClick={handleRejectExpense} disabled={!!processing || !expReason.trim()}
+                className="flex items-center gap-2 rounded-lg bg-gradient-to-r from-red-600 to-rose-500 px-4 py-2 text-sm font-semibold text-white disabled:opacity-60">
+                {processing ? <Spinner size="xs" color="white" /> : <XCircle size={14} />}
+                Reject Expense
+              </button>
+            </div>
+          </div>
+        </div>,
+        document.body
+      )}
     </div>
   )
 }

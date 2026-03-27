@@ -56,7 +56,10 @@ class Config:
     # Core
     SECRET_KEY = _get_env_or_secret("FLASK_SECRET_KEY", default="change-this-in-production")
     DEBUG = os.getenv("DEBUG", "True").lower() == "true"
-    PORT = int(os.getenv("PORT", 3399))
+    try:
+        PORT = int(os.getenv("PORT", 3399))
+    except (ValueError, TypeError):
+        PORT = 3399
 
     # Warn loudly if using the default secret in production
     if _is_gcp() and SECRET_KEY == "change-this-in-production":
@@ -72,7 +75,8 @@ class Config:
     REACT_BUILD = os.path.join(PROJECT_ROOT, "frontend", "dist")
     MAX_CONTENT_LENGTH = 20 * 1024 * 1024  # 20MB
     ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "pdf", "doc", "docx",
-                          "xls", "xlsx", "csv", "txt", "zip"}
+                          "xls", "xlsx", "csv", "txt", "zip",
+                          "ogg", "mp3", "wav", "m4a", "webm", "aac", "opus", "amr"}
 
     # AI & APIs — fetched from Secret Manager when running on GCP
     ANTHROPIC_API_KEY     = _get_env_or_secret("ANTHROPIC_API_KEY")
@@ -92,7 +96,10 @@ class Config:
 
     # Notifications — Email (SMTP)
     SMTP_HOST          = _get_env_or_secret("SMTP_HOST")
-    SMTP_PORT          = int(os.getenv("SMTP_PORT", "587"))
+    try:
+        SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+    except (ValueError, TypeError):
+        SMTP_PORT = 587
     SMTP_USER          = _get_env_or_secret("SMTP_USER")
     SMTP_PASSWORD      = _get_env_or_secret("SMTP_PASSWORD")
     SMTP_FROM_EMAIL    = os.getenv("SMTP_FROM_EMAIL")
@@ -105,17 +112,100 @@ class Config:
     ZOHO_CLIQ_REFRESH_TOKEN = _get_env_or_secret("ZOHO_CLIQ_REFRESH_TOKEN")
     ZOHO_CLIQ_ACCESS_TOKEN  = _get_env_or_secret("ZOHO_CLIQ_ACCESS_TOKEN")
 
+    # Notifications — Slack
+    SLACK_WEBHOOK_URL = _get_env_or_secret("SLACK_WEBHOOK_URL")
+    SLACK_BOT_TOKEN   = _get_env_or_secret("SLACK_BOT_TOKEN")
+    SLACK_CHANNEL     = os.getenv("SLACK_CHANNEL", "#travel-notifications")
+
     # Database — Cloud SQL PostgreSQL in prod (via DATABASE_URL), SQLite in dev
     DATABASE_URL = _get_env_or_secret("DATABASE_URL")
 
     # JWT
     JWT_SECRET_KEY  = _get_env_or_secret("JWT_SECRET_KEY", default=SECRET_KEY)
-    JWT_ACCESS_TTL  = int(os.getenv("JWT_ACCESS_TTL_MINUTES", "1440"))   # 24 h
-    JWT_REFRESH_TTL = int(os.getenv("JWT_REFRESH_TTL_DAYS", "30"))
+    try:
+        JWT_ACCESS_TTL = int(os.getenv("JWT_ACCESS_TTL_MINUTES", "1440"))
+    except (ValueError, TypeError):
+        JWT_ACCESS_TTL = 1440
+    try:
+        JWT_REFRESH_TTL = int(os.getenv("JWT_REFRESH_TTL_DAYS", "30"))
+    except (ValueError, TypeError):
+        JWT_REFRESH_TTL = 30
 
     # GCP
     GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID") or os.getenv("GOOGLE_CLOUD_PROJECT")
     GCS_BUCKET     = os.getenv("GCS_BUCKET")
+
+    # ── OTIS Voice Agent Configuration ────────────────────────────────────────
+    OTIS_ENABLED = os.getenv("OTIS_ENABLED", "False").lower() == "true"
+    OTIS_ADMIN_ONLY = os.getenv("OTIS_ADMIN_ONLY", "True").lower() == "true"
+    OTIS_DEBUG = os.getenv("OTIS_DEBUG", "False").lower() == "true"
+
+    # OTIS API Keys
+    PORCUPINE_ACCESS_KEY = _get_env_or_secret("PORCUPINE_ACCESS_KEY")
+    DEEPGRAM_API_KEY     = _get_env_or_secret("DEEPGRAM_API_KEY")
+    ELEVENLABS_API_KEY   = _get_env_or_secret("ELEVENLABS_API_KEY")
+
+    # OTIS Voice Settings
+    OTIS_VOICE_ID = os.getenv("OTIS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")
+    OTIS_VOICE_GENDER = os.getenv("OTIS_VOICE_GENDER", "female")
+    OTIS_VOICE_LANGUAGE = os.getenv("OTIS_VOICE_LANGUAGE", "en-IN")
+
+    try:
+        OTIS_VOICE_SPEED = float(os.getenv("OTIS_VOICE_SPEED", "1.0"))
+    except (ValueError, TypeError):
+        OTIS_VOICE_SPEED = 1.0
+
+    try:
+        OTIS_VOICE_PITCH = float(os.getenv("OTIS_VOICE_PITCH", "0.0"))
+    except (ValueError, TypeError):
+        OTIS_VOICE_PITCH = 0.0
+
+    try:
+        OTIS_VOICE_STABILITY = float(os.getenv("OTIS_VOICE_STABILITY", "0.5"))
+    except (ValueError, TypeError):
+        OTIS_VOICE_STABILITY = 0.5
+
+    try:
+        OTIS_VOICE_SIMILARITY = float(os.getenv("OTIS_VOICE_SIMILARITY", "0.75"))
+    except (ValueError, TypeError):
+        OTIS_VOICE_SIMILARITY = 0.75
+
+    # OTIS Behavior
+    OTIS_WAKE_WORD = os.getenv("OTIS_WAKE_WORD", "Hey Otis")
+    OTIS_AUTO_EXECUTE = os.getenv("OTIS_AUTO_EXECUTE", "False").lower() == "true"
+    OTIS_REQUIRE_CONFIRMATION = os.getenv("OTIS_REQUIRE_CONFIRMATION", "True").lower() == "true"
+
+    try:
+        OTIS_MAX_SESSION_DURATION = int(os.getenv("OTIS_MAX_SESSION_DURATION", "600"))
+    except (ValueError, TypeError):
+        OTIS_MAX_SESSION_DURATION = 600
+
+    try:
+        OTIS_IDLE_TIMEOUT = int(os.getenv("OTIS_IDLE_TIMEOUT", "30"))
+    except (ValueError, TypeError):
+        OTIS_IDLE_TIMEOUT = 30
+
+    # OTIS Rate Limiting
+    try:
+        OTIS_MAX_SESSIONS_PER_HOUR = int(os.getenv("OTIS_MAX_SESSIONS_PER_HOUR", "10"))
+    except (ValueError, TypeError):
+        OTIS_MAX_SESSIONS_PER_HOUR = 10
+
+    try:
+        OTIS_MAX_COMMANDS_PER_SESSION = int(os.getenv("OTIS_MAX_COMMANDS_PER_SESSION", "50"))
+    except (ValueError, TypeError):
+        OTIS_MAX_COMMANDS_PER_SESSION = 50
+
+    # OTIS Cost Management
+    try:
+        OTIS_MONTHLY_BUDGET_USD = float(os.getenv("OTIS_MONTHLY_BUDGET_USD", "500"))
+    except (ValueError, TypeError):
+        OTIS_MONTHLY_BUDGET_USD = 500.0
+
+    try:
+        OTIS_WARN_AT_PERCENT = int(os.getenv("OTIS_WARN_AT_PERCENT", "80"))
+    except (ValueError, TypeError):
+        OTIS_WARN_AT_PERCENT = 80
 
     @classmethod
     def services_status(cls) -> dict:
@@ -131,6 +221,12 @@ class Config:
             "whatsapp":          bool(cls.TWILIO_ACCOUNT_SID and cls.TWILIO_AUTH_TOKEN),
             "email_smtp":        bool(cls.SMTP_HOST and cls.SMTP_USER),
             "zoho_cliq":         bool(cls.ZOHO_CLIQ_API_ENDPOINT and cls.ZOHO_CLIQ_REFRESH_TOKEN),
+            "slack":             bool(cls.SLACK_WEBHOOK_URL or cls.SLACK_BOT_TOKEN),
+            "otis_voice":        bool(cls.OTIS_ENABLED and cls.PORCUPINE_ACCESS_KEY and
+                                     cls.DEEPGRAM_API_KEY and cls.ELEVENLABS_API_KEY),
+            "otis_wake_word":    bool(cls.PORCUPINE_ACCESS_KEY),
+            "otis_stt":          bool(cls.DEEPGRAM_API_KEY),
+            "otis_tts":          bool(cls.ELEVENLABS_API_KEY),
         }
 
     @classmethod

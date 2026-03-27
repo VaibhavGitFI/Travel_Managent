@@ -7,6 +7,7 @@ from flask import Blueprint, request, jsonify
 from auth import get_current_user
 from agents.weather_agent import get_travel_weather
 from services.weather_service import weather as weather_service
+from extensions import limiter
 
 logger = logging.getLogger(__name__)
 
@@ -14,6 +15,7 @@ weather_bp = Blueprint("weather", __name__, url_prefix="/api")
 
 
 @weather_bp.route("/weather", methods=["POST"])
+@limiter.limit("30 per minute")
 def forecast():
     """POST /api/weather — travel weather forecast for a city and date range."""
     user = get_current_user()

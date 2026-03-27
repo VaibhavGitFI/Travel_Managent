@@ -1,34 +1,11 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Eye, EyeOff, Layers, Lock, Mail, Play, Star, User, Users, ArrowLeft, Building } from 'lucide-react'
+import { Eye, EyeOff, Layers, Lock, Mail, ArrowLeft, Building, User } from 'lucide-react'
 import toast from 'react-hot-toast'
 import { login, register, verifyEmail, forgotPassword, resetPassword } from '../api/auth'
+import { getMyOrganization } from '../api/organizations'
 import useStore from '../store/useStore'
 
-const demoUsers = [
-  { username: 'vaibhav', password: 'admin123', role: 'admin' },
-  { username: 'rohit', password: 'admin123', role: 'admin' },
-  { username: 'manager1', password: 'mgr123', role: 'manager' },
-  { username: 'employee1', password: 'emp123', role: 'employee' },
-]
-
-const roleBadgeStyles = {
-  admin: 'border-blue-200 bg-blue-50 text-blue-700',
-  manager: 'border-violet-200 bg-violet-50 text-violet-700',
-  employee: 'border-emerald-200 bg-emerald-50 text-emerald-700',
-}
-
-const roleAvatarStyles = {
-  admin: 'bg-blue-50 text-blue-700',
-  manager: 'bg-violet-50 text-violet-700',
-  employee: 'bg-emerald-50 text-emerald-700',
-}
-
-const roleIcons = {
-  admin: Star,
-  manager: Users,
-  employee: User,
-}
 
 // Input component — defined outside Login to prevent re-creation on every render
 function FormInput({ id, label, icon: Icon, type = 'text', value, onChange, placeholder, error, autoComplete, autoFocus, showToggle, showPwState, setShowPwState }) {
@@ -104,6 +81,11 @@ export default function Login() {
       const u = data.user || { id: 0, username: form.username, name: form.username, role: 'employee' }
       if (!u.name && u.full_name) u.name = u.full_name
       setUser(u)
+      // Load org context after login
+      try {
+        const orgData = await getMyOrganization()
+        useStore.getState().setOrg(orgData.organization || null)
+      } catch { /* no org yet — that's fine */ }
       toast.success(`Welcome back, ${data.user?.name || form.username}!`)
       navigate('/dashboard', { replace: true })
     } catch (error) {
@@ -128,7 +110,10 @@ export default function Login() {
     if (!regForm.email.trim()) nextErrors.email = 'Email is required'
     if (!regForm.email.includes('@')) nextErrors.email = 'Invalid email'
     if (!regForm.password) nextErrors.password = 'Password is required'
-    if (regForm.password.length < 6) nextErrors.password = 'Min 6 characters'
+    else if (regForm.password.length < 8) nextErrors.password = 'Min 8 characters'
+    else if (!/[A-Z]/.test(regForm.password)) nextErrors.password = 'Needs an uppercase letter'
+    else if (!/[a-z]/.test(regForm.password)) nextErrors.password = 'Needs a lowercase letter'
+    else if (!/\d/.test(regForm.password)) nextErrors.password = 'Needs a number'
     if (Object.keys(nextErrors).length) { setErrors(nextErrors); return }
 
     setErrors({})
@@ -201,12 +186,6 @@ export default function Login() {
     } finally {
       setLoading(false)
     }
-  }
-
-  const fillDemo = (user) => {
-    setForm({ username: user.username, password: user.password })
-    setErrors({})
-    setView('login')
   }
 
   const switchView = (v) => { setView(v); setErrors({}) }
@@ -297,7 +276,7 @@ export default function Login() {
         </section>
 
         {/* Right form panel */}
-        <section className="w-full overflow-y-auto bg-[#fff] p-6 sm:p-7 md:w-[400px] md:min-w-[400px] md:p-[28px_36px]">
+        <section className="w-full overflow-y-auto bg-white p-6 sm:p-7 md:w-[400px] md:min-w-[400px] md:p-[28px_36px]">
           {/* Logo */}
           <div className="mb-4 flex items-center gap-[10px]">
             <div className="flex h-10 w-10 items-center justify-center rounded-[10px] bg-[linear-gradient(135deg,#1a56db,#0891b2)] text-white shadow-md">
@@ -355,36 +334,6 @@ export default function Login() {
                 </button>
               </div>
 
-              <div className="relative my-4">
-                <div className="absolute inset-0 flex items-center"><div className="w-full border-t border-gray-200" /></div>
-                <div className="relative flex justify-center"><span className="bg-white px-3 text-[0.7rem] text-gray-400">or use demo</span></div>
-              </div>
-
-              <button type="button" onClick={() => { fillDemo(demoUsers[0]); }}
-                className="flex h-[38px] w-full items-center justify-center gap-2 rounded-lg border-[1.5px] border-gray-200 bg-gray-50 text-[0.78rem] font-semibold text-gray-700 transition-all hover:border-blue-600 hover:bg-blue-50 hover:text-blue-700">
-                <Play size={14} /> Quick Demo Login
-              </button>
-
-              <div className="mt-[10px] overflow-hidden rounded-[10px] border border-gray-200">
-                <div className="border-b border-gray-200 bg-gray-50 px-3 py-2 text-[0.62rem] font-bold uppercase tracking-[0.09em] text-gray-400">
-                  Demo credentials - click to fill
-                </div>
-                {demoUsers.map((user, index) => (
-                  <button key={user.username} type="button" onClick={() => fillDemo(user)}
-                    className={`flex w-full items-center gap-2.5 px-3 py-2 text-left transition-colors hover:bg-gray-100 ${index < demoUsers.length - 1 ? 'border-b border-gray-200' : ''}`}>
-                    <div className={`flex h-6 w-6 items-center justify-center rounded-md ${roleAvatarStyles[user.role]}`}>
-                      {(() => { const Icon = roleIcons[user.role]; return Icon ? <Icon size={12} /> : null })()}
-                    </div>
-                    <div className="min-w-0 flex-1">
-                      <div className="truncate text-[0.76rem] font-semibold text-gray-900">{user.username}</div>
-                      <div className="truncate text-[0.67rem] text-gray-500">{user.password}</div>
-                    </div>
-                    <span className={`rounded-full border px-2 py-[2px] text-[0.58rem] font-bold uppercase tracking-[0.04em] ${roleBadgeStyles[user.role]}`}>
-                      {user.role}
-                    </span>
-                  </button>
-                ))}
-              </div>
             </>
           )}
 

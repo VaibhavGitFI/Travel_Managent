@@ -27,7 +27,7 @@ SOURCE_LABELS = {
 }
 
 
-def add_meeting(data: dict, user_id: int) -> dict:
+def add_meeting(data: dict, user_id: int, org_id: int = None) -> dict:
     """Add a client meeting from any source."""
     required = ["client_name"]
     for field in required:
@@ -45,11 +45,11 @@ def add_meeting(data: dict, user_id: int) -> dict:
 
         db.execute(
             """INSERT INTO client_meetings
-               (user_id, destination, client_name, company, contact_number, email,
+               (user_id, org_id, destination, client_name, company, contact_number, email,
                 meeting_date, meeting_time, venue, agenda, notes, source_type, status)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
-                user_id,
+                user_id, org_id,
                 data.get("destination", ""),
                 data["client_name"],
                 data.get("company", ""),
@@ -194,6 +194,9 @@ def suggest_nearby_venues(destination: str, client_locations: list) -> dict:
         coord = maps.geocode(destination)
     else:
         coord = maps.geocode(client_locations[0])
+
+    if not coord or "lat" not in coord or "lng" not in coord:
+        return {"venues": venues, "error": "Could not geocode location"}
 
     location = {"lat": coord["lat"], "lng": coord["lng"]}
 

@@ -7,7 +7,7 @@ import {
   Phone, TrendingUp, TrendingDown, ArrowUpRight, PieChart, BarChart3,
 } from 'lucide-react'
 import toast from 'react-hot-toast'
-import { getExpenses, submitExpense, uploadAndExtract, getExpenseAnomalies } from '../api/expenses'
+import { getExpenses, submitExpense, uploadAndExtract, getExpenseAnomalies, submitExpenseForApproval } from '../api/expenses'
 import useStore from '../store/useStore'
 import useAutoRefresh from '../hooks/useAutoRefresh'
 import Badge from '../components/ui/Badge'
@@ -69,10 +69,23 @@ export default function Expenses() {
   const norm = useMemo(() => expenses.map(e => ({
     ...e,
     status: String(e.status || 'pending').toLowerCase().replace(/_/g, '-'),
+    approval_status: String(e.approval_status || 'draft').toLowerCase(),
     category: String(e.category || 'other').toLowerCase(),
     dateValue: e.expense_date || e.date || '',
     amount: Number(e.amount || 0),
   })), [expenses])
+
+  const handleSubmitForApproval = async (expenseId) => {
+    try {
+      const data = await submitExpenseForApproval(expenseId)
+      if (data.success) {
+        toast.success('Expense submitted for approval')
+        refresh()
+      } else {
+        toast.error(data.error || 'Failed to submit')
+      }
+    } catch { toast.error('Failed to submit for approval') }
+  }
 
   const summary = useMemo(() => {
     const tot = norm.reduce((s, i) => s + i.amount, 0)
@@ -306,7 +319,7 @@ export default function Expenses() {
               <table className="w-full">
                 <thead className="bg-gray-50">
                   <tr>
-                    {['Description', 'Category', 'Date', 'Amount', 'Status'].map(h => (
+                    {['Description', 'Category', 'Source', 'Date', 'Amount', 'Status', 'Approval'].map(h => (
                       <th key={h} className="px-5 py-3 text-left text-[11px] font-semibold uppercase tracking-wide text-gray-500">{h}</th>
                     ))}
                   </tr>
@@ -332,9 +345,36 @@ export default function Expenses() {
                             {cat?.label || title(e.category)}
                           </span>
                         </td>
+                        <td className="px-5 py-3.5">
+                          {e.source === 'whatsapp' ? (
+                            <span className="inline-flex items-center gap-1 rounded-md bg-green-50 border border-green-200 px-2 py-0.5 text-[10px] font-semibold text-green-700" title="Submitted via WhatsApp">
+                              <Phone size={10} /> WhatsApp
+                            </span>
+                          ) : e.source === 'cliq' ? (
+                            <span className="inline-flex items-center gap-1 rounded-md bg-purple-50 border border-purple-200 px-2 py-0.5 text-[10px] font-semibold text-purple-700" title="Submitted via Zoho Cliq">
+                              <MessageSquare size={10} /> Cliq
+                            </span>
+                          ) : (
+                            <span className="inline-flex items-center gap-1 rounded-md bg-blue-50 border border-blue-200 px-2 py-0.5 text-[10px] font-semibold text-blue-700" title="Submitted via Web">
+                              <svg className="w-2.5 h-2.5" fill="currentColor" viewBox="0 0 20 20"><path d="M10 0C4.477 0 0 4.477 0 10s4.477 10 10 10 10-4.477 10-10S15.523 0 10 0zm7.542 9.458H13.05c-.124-2.05-.571-3.832-1.215-5.194 2.418.824 4.287 2.876 4.707 5.194zM10 17.917c-1.092 0-2.375-1.917-2.708-5.417h5.416c-.333 3.5-1.616 5.417-2.708 5.417zM7.292 10.5c-.011-.167-.017-.334-.017-.5s.006-.333.017-.5h5.416c.011.167.017.334.017.5s-.006.333-.017.5H7.292zm.49-8.236C7.133 3.626 6.676 5.408 6.55 7.458H2.458c.42-2.318 2.289-4.37 4.707-5.194h.617zM2.083 9.458h4.492c-.011.167-.017.334-.017.5s.006.333.017.5H2.083c-.05-.333-.083-.667-.083-1s.033-.667.083-1zm.375 3.542h4.092c.126 2.05.583 3.832 1.228 5.194-2.418-.824-4.287-2.876-4.707-5.194h.387zm9.324 5.194c.644-1.362 1.102-3.144 1.228-5.194h4.092c-.42 2.318-2.289 4.37-4.707 5.194h-.613z"/></svg> Web
+                            </span>
+                          )}
+                        </td>
                         <td className="px-5 py-3.5 text-sm text-gray-500">{fmtDate(e.dateValue)}</td>
                         <td className="px-5 py-3.5 text-sm font-bold text-gray-900">{fmt(e.amount)}</td>
                         <td className="px-5 py-3.5"><Badge status={e.status} dot>{title(e.status)}</Badge></td>
+                        <td className="px-5 py-3.5">
+                          {e.approval_status === 'draft' || !e.approval_status ? (
+                            <button onClick={() => handleSubmitForApproval(e.id)}
+                              className="rounded-md bg-blue-50 border border-blue-200 px-2.5 py-1 text-[10px] font-semibold text-blue-700 hover:bg-blue-100 transition-colors">
+                              Submit
+                            </button>
+                          ) : (
+                            <Badge status={e.approval_status === 'approved' ? 'approved' : e.approval_status === 'rejected' ? 'rejected' : 'pending'} dot>
+                              {title(e.approval_status)}
+                            </Badge>
+                          )}
+                        </td>
                       </tr>
                     )
                   })}
@@ -535,10 +575,23 @@ function MobileRow({ expense: e }) {
         </div>
         <p className="shrink-0 text-sm font-bold text-gray-900">{fmt(e.amount)}</p>
       </div>
-      <div className="flex items-center gap-2">
+      <div className="flex items-center gap-2 flex-wrap">
         <span className={cn('inline-flex rounded-md border px-2 py-0.5 text-[10px] font-semibold', cat?.color || 'bg-gray-50 text-gray-600 border-gray-100')}>
           {cat?.label || title(e.category)}
         </span>
+        {e.source === 'whatsapp' ? (
+          <span className="inline-flex items-center gap-1 rounded-md bg-green-50 border border-green-200 px-2 py-0.5 text-[10px] font-semibold text-green-700">
+            <Phone size={10} /> WhatsApp
+          </span>
+        ) : e.source === 'cliq' ? (
+          <span className="inline-flex items-center gap-1 rounded-md bg-purple-50 border border-purple-200 px-2 py-0.5 text-[10px] font-semibold text-purple-700">
+            <MessageSquare size={10} /> Cliq
+          </span>
+        ) : e.source === 'web' ? (
+          <span className="inline-flex items-center gap-1 rounded-md bg-blue-50 border border-blue-200 px-2 py-0.5 text-[10px] font-semibold text-blue-700">
+            <svg className="w-2.5 h-2.5" fill="currentColor" viewBox="0 0 20 20"><path d="M10 0C4.477 0 0 4.477 0 10s4.477 10 10 10 10-4.477 10-10S15.523 0 10 0zm7.542 9.458H13.05c-.124-2.05-.571-3.832-1.215-5.194 2.418.824 4.287 2.876 4.707 5.194zM10 17.917c-1.092 0-2.375-1.917-2.708-5.417h5.416c-.333 3.5-1.616 5.417-2.708 5.417zM7.292 10.5c-.011-.167-.017-.334-.017-.5s.006-.333.017-.5h5.416c.011.167.017.334.017.5s-.006.333-.017.5H7.292zm.49-8.236C7.133 3.626 6.676 5.408 6.55 7.458H2.458c.42-2.318 2.289-4.37 4.707-5.194h.617zM2.083 9.458h4.492c-.011.167-.017.334-.017.5s.006.333.017.5H2.083c-.05-.333-.083-.667-.083-1s.033-.667.083-1zm.375 3.542h4.092c.126 2.05.583 3.832 1.228 5.194-2.418-.824-4.287-2.876-4.707-5.194h.387zm9.324 5.194c.644-1.362 1.102-3.144 1.228-5.194h4.092c-.42 2.318-2.289 4.37-4.707 5.194h-.613z"/></svg> Web
+          </span>
+        ) : null}
         <Badge status={e.status} dot>{title(e.status)}</Badge>
         {Number(e.ocr_confidence) > 0 && (
           <span className="ml-auto flex items-center gap-1 text-[10px] text-emerald-600 font-medium">

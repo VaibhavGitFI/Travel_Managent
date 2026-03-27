@@ -7,7 +7,7 @@ import logging
 import os
 from flask import Blueprint, request, jsonify
 from werkzeug.utils import secure_filename
-from auth import get_current_user
+from auth import get_current_user, get_current_org
 from config import Config
 from agents.expense_agent import (
     add_expense,
@@ -15,6 +15,8 @@ from agents.expense_agent import (
     upload_and_extract,
 )
 from agents.anomaly_agent import detect_anomalies
+from extensions import limiter
+from validators import ValidationError, validate_string, validate_float, validate_currency, validate_enum
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +33,9 @@ def list_expenses():
     trip_id = request.args.get("trip_id", "").strip()
 
     try:
-        result = get_expenses(trip_id or None, user_id=user["id"])
+        org = get_current_org()
+        oid = org["org_id"] if org else None
+        result = get_expenses(trip_id or None, user_id=user["id"], org_id=oid)
         expenses = result.get("expenses", []) if isinstance(result, dict) else result
 
         # Search filter
@@ -60,7 +64,6 @@ def list_expenses():
         out = result if isinstance(result, dict) else {"success": True}
         out.update({
             "expenses": items,
-            "items": items,
             "total": total,
             "page": page,
             "per_page": per_page,
@@ -73,6 +76,7 @@ def list_expenses():
 
 
 @expenses_bp.route("/expenses", methods=["POST"])
+@limiter.limit("30 per minute")
 def submit_expense():
     """POST /api/expenses — submit a new expense or advance an existing one through stages."""
     user = get_current_user()
@@ -81,6 +85,19 @@ def submit_expense():
 
     data = request.get_json(silent=True) or {}
     data["user_id"] = user["id"]
+    org = get_current_org()
+    if org:
+        data["org_id"] = org["org_id"]
+
+    # Validate expense fields (skip for stage-advancement which has expense_id)
+    if not data.get("expense_id"):
+        try:
+            validate_string(data, "category", max_len=50, required=False)
+            validate_string(data, "description", max_len=500, required=False)
+            validate_float(data, "invoice_amount", min_val=0, max_val=50000000, required=False, default=0)
+            validate_currency(data, "currency_code", required=False)
+        except ValidationError as e:
+            return jsonify({"success": False, "error": e.message}), 400
 
     try:
         result = add_expense(data)
@@ -128,6 +145,7 @@ def expense_summary():
 
 @expenses_bp.route("/expense/upload-and-extract", methods=["POST"])
 @expenses_bp.route("/expenses/upload-and-extract", methods=["POST"])
+@limiter.limit("10 per minute")
 def upload_and_extract_route():
     """POST /api/expense/upload-and-extract — multipart upload + instant OCR extraction."""
     user = get_current_user()

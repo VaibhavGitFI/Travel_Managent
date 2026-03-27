@@ -8,8 +8,10 @@ import os
 import logging
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import time as _time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from services.gemini_service import gemini
+from agents.registry import registry
 
 logger = logging.getLogger(__name__)
 
@@ -142,19 +144,61 @@ def _run_agents_parallel(trip_details: dict, user_id: int) -> dict:
         return "meetings", get_meetings_for_destination(destination, user_id, travel_dates)
 
     results = {}
+    agent_map = {
+        "run_hotels": "hotel_agent",
+        "run_travel": "travel_mode_agent",
+        "run_weather": "weather_agent",
+        "run_checklist": "checklist_agent",
+        "run_guide": "guide_agent",
+        "run_meetings": "meeting_agent",
+    }
     tasks = [run_hotels, run_travel, run_weather, run_checklist, run_guide, run_meetings]
 
     with ThreadPoolExecutor(max_workers=6) as executor:
-        futures = {executor.submit(task): task.__name__ for task in tasks}
-        for future in as_completed(futures, timeout=30):
-            try:
-                key, value = future.result(timeout=25)
-                results[key] = value
-            except Exception as e:
-                task_name = futures[future]
-                logger.warning("[Orchestrator] Agent %s failed: %s", task_name, e)
-                results[task_name.replace("run_", "")] = {"error": str(e)}
+        start_times = {}
+        futures = {}
+        for task in tasks:
+            agent_name = agent_map.get(task.__name__, task.__name__)
+            # Skip if circuit breaker is open
+            if not registry.allow_request(agent_name):
+                logger.info("[Orchestrator] Skipping %s (circuit open)", agent_name)
+                agent_info = registry.get(agent_name)
+                results[task.__name__.replace("run_", "")] = {
+                    "error": "Service temporarily unavailable (circuit open)",
+                    "agent_version": agent_info.version if agent_info else "unknown",
+                }
+                continue
+            f = executor.submit(task)
+            futures[f] = task.__name__
+            start_times[f] = _time.time()
 
+        try:
+            for future in as_completed(futures, timeout=30):
+                task_name = futures[future]
+                agent_name = agent_map.get(task_name, task_name)
+                elapsed_ms = (_time.time() - start_times[future]) * 1000
+                try:
+                    key, value = future.result(timeout=25)
+                    if isinstance(value, dict):
+                        agent_info = registry.get(agent_name)
+                        value["_agent_version"] = agent_info.version if agent_info else "unknown"
+                        value["_agent_latency_ms"] = round(elapsed_ms, 1)
+                    results[key] = value
+                    registry.record_success(agent_name, latency_ms=elapsed_ms)
+                except Exception as e:
+                    logger.warning("[Orchestrator] Agent %s failed: %s", task_name, e)
+                    results[task_name.replace("run_", "")] = {"error": str(e)}
+                    registry.record_failure(agent_name, error=str(e))
+        except TimeoutError:
+            logger.warning("[Orchestrator] Agent execution timed out after 30s")
+            for future, task_name in futures.items():
+                if not future.done():
+                    agent_name = agent_map.get(task_name, task_name)
+                    results[task_name.replace("run_", "")] = {"error": "Agent timed out"}
+                    registry.record_failure(agent_name, error="timeout")
+
+    # Record orchestrator itself
+    registry.record_success("orchestrator")
     return results
 
 

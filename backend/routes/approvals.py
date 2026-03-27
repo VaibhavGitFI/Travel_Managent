@@ -5,8 +5,9 @@ Manager-facing approval queue: list pending, approve, reject.
 import logging
 from datetime import datetime
 from flask import Blueprint, request, jsonify
-from auth import get_current_user
+from auth import get_current_user, get_current_org
 from agents.request_agent import get_pending_approvals, process_approval
+from extensions import limiter
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +33,7 @@ def _notify_requester(request_id: str, title: str, message: str, notif_type: str
                 action_url="/requests",
             )
     except Exception:
-        pass
+        logger.debug("[Approvals] _notify_requester failed silently")
 
 approvals_bp = Blueprint("approvals", __name__, url_prefix="/api/approvals")
 
@@ -55,7 +56,7 @@ def _serialize_approval(row: dict) -> dict:
 
 def _require_manager(user):
     """Return a 403 response tuple if user is not a manager or admin, else None."""
-    if user.get("role") not in ("admin", "manager"):
+    if user.get("role") not in ("admin", "manager", "super_admin"):
         return jsonify({"success": False, "error": "Manager or admin access required"}), 403
     return None
 
@@ -71,8 +72,8 @@ def list_approvals():
         role = user.get("role", "employee")
 
         # Managers/admins see the full approval queue
-        if role in ("admin", "manager"):
-            if role == "admin":
+        if role in ("admin", "manager", "super_admin"):
+            if role in ("admin", "super_admin"):
                 rows = get_pending_approvals()
             else:
                 rows = get_pending_approvals(approver_id=user["id"])
@@ -121,6 +122,7 @@ def list_approvals():
 
 
 @approvals_bp.route("/<string:request_id>/approve", methods=["POST"])
+@limiter.limit("20 per minute")
 def approve_request(request_id):
     """POST /api/approvals/<id>/approve — approve a travel request."""
     user = get_current_user()
@@ -181,6 +183,7 @@ def approve_request(request_id):
 
 
 @approvals_bp.route("/<string:request_id>/reject", methods=["POST"])
+@limiter.limit("20 per minute")
 def reject_request(request_id):
     """POST /api/approvals/<id>/reject — reject a travel request with a reason."""
     user = get_current_user()

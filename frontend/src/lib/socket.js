@@ -19,7 +19,7 @@ const socket = io(SOCKET_URL, {
   reconnectionDelay: 1000,
   reconnectionDelayMax: 10000,
   randomizationFactor: 0.3,
-  transports: ['websocket', 'polling'],
+  transports: ['polling', 'websocket'],
 })
 
 export default socket

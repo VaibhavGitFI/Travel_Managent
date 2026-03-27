@@ -5,7 +5,7 @@ expiring requests, and budget warnings.
 """
 import logging
 from datetime import datetime, timedelta
-from database import get_db
+from database import get_db, table_columns
 
 logger = logging.getLogger(__name__)
 
@@ -28,8 +28,7 @@ def get_user_alerts(user: dict) -> list:
 
         # 1. Upcoming trips (within 3 days, approved/booked)
         try:
-            cols_info = db.execute("PRAGMA table_info(travel_requests)").fetchall()
-            cols = {r[1] for r in cols_info}
+            cols = table_columns(db, "travel_requests")
             if "start_date" in cols and "status" in cols:
                 upcoming = db.execute(
                     """SELECT request_id, destination, start_date, status
@@ -73,8 +72,7 @@ def get_user_alerts(user: dict) -> list:
 
         # 3. Expiring requests (travel date approaching, still pending)
         try:
-            cols_info = db.execute("PRAGMA table_info(travel_requests)").fetchall()
-            cols = {r[1] for r in cols_info}
+            cols = table_columns(db, "travel_requests")
             if "start_date" in cols:
                 seven_days = (now + timedelta(days=7)).strftime("%Y-%m-%d")
                 expiring = db.execute(
@@ -109,7 +107,7 @@ def get_user_alerts(user: dict) -> list:
                            FROM expenses_db WHERE user_id = ? AND created_at >= ?""",
                         (user["id"], month_start),
                     ).fetchone()
-                    spent = dict(spent_row).get("total", 0)
+                    spent = float(dict(spent_row).get("total", 0)) if spent_row else 0
                     pct = round((spent / budget) * 100)
                     if pct >= 80:
                         alerts.append({

@@ -6,6 +6,7 @@ import logging
 from flask import Blueprint, jsonify
 from auth import get_current_user
 from flask import request as flask_request
+from extensions import limiter
 from agents.analytics_agent import (
     get_dashboard_stats,
     get_spend_analysis,
@@ -21,6 +22,7 @@ analytics_bp = Blueprint("analytics", __name__, url_prefix="/api/analytics")
 
 
 @analytics_bp.route("/dashboard", methods=["GET"])
+@limiter.limit("30 per minute")
 def dashboard():
     """GET /api/analytics/dashboard — real-time dashboard statistics."""
     user = get_current_user()

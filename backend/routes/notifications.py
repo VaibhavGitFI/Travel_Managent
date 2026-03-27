@@ -6,6 +6,7 @@ import logging
 from flask import Blueprint, request, jsonify
 from auth import get_current_user
 from database import get_db
+from extensions import limiter
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +20,10 @@ def list_notifications():
     if not user:
         return jsonify({"success": False, "error": "Authentication required"}), 401
 
-    limit = min(int(request.args.get("limit", 30)), 100)
+    try:
+        limit = min(int(request.args.get("limit", 30)), 100)
+    except (ValueError, TypeError):
+        limit = 30
     unread_only = request.args.get("unread_only", "false").lower() == "true"
 
     try:

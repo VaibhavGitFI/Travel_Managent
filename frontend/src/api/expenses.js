@@ -30,3 +30,25 @@ export const getExpenseAnomalies = async () => {
   const { data } = await client.get('/expenses/anomalies')
   return data
 }
+
+// ── Expense Approval Workflow ─────────────────────────────────────────────────
+
+export const submitExpenseForApproval = async (expenseId) => {
+  const { data } = await client.post(`/expenses/${expenseId}/submit`)
+  return data
+}
+
+export const approveExpense = async (expenseId, comments = '') => {
+  const { data } = await client.post(`/expenses/${expenseId}/approve`, { comments })
+  return data
+}
+
+export const rejectExpense = async (expenseId, reason) => {
+  const { data } = await client.post(`/expenses/${expenseId}/reject`, { reason })
+  return data
+}
+
+export const getPendingExpenseApprovals = async () => {
+  const { data } = await client.get('/expenses/pending-approvals')
+  return data
+}

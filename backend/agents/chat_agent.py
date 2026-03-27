@@ -17,31 +17,49 @@ from services.gemini_service import gemini
 from services.weather_service import weather
 from services.currency_service import currency
 from services.search_service import search
-from database import get_db
+from database import get_db, table_columns
 
 logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = """You are TravelSync Pro, an intelligent corporate travel assistant powered by real-time data.
+SYSTEM_PROMPT = """You are TravelSync Pro, an AI corporate travel assistant.
 
-You help with:
-- Flight and hotel search with live pricing from Google Places and flight APIs
+## Capabilities
+- Flight and hotel search (live pricing via Amadeus and Google Places)
 - Trip planning for business visits across India and internationally
-- Expense tracking and receipt verification via OCR
-- Travel policy compliance checking
-- Client meeting scheduling and coordination
-- Live weather forecasts via OpenWeatherMap
-- Currency conversion via real-time exchange rates
-- Team coordination for multi-city and multi-timezone travel
+- Expense tracking, receipt OCR verification
+- Travel policy compliance, approval workflows
+- Client meeting scheduling, venue suggestions
+- Live weather forecasts (OpenWeatherMap)
+- Currency conversion (real-time exchange rates)
 
-Rules:
-- Be concise, professional, and practical.
-- Do NOT use emojis anywhere in your response. Plain text only.
-- Use markdown formatting: **bold** for emphasis, bullet lists, tables, and headings where helpful.
-- Prefer factual and actionable responses. Cite actual values when they appear in context.
-- When real-time web search results are provided in context, use them to give accurate, current answers.
-- If data is unavailable, say so clearly and suggest the right tab/action to get it.
-- NEVER fabricate booking references, flight numbers, or specific prices that aren't in the context.
-- If the user asks something outside travel, politely redirect.
+## Response Rules
+- Be concise and professional. Short paragraphs, no filler.
+- Use markdown: **bold** for key info, bullet lists, tables where helpful.
+- For comparisons, ALWAYS use markdown tables with clear columns.
+- Structure longer responses with ### headings.
+- Do NOT use emojis. Plain text only.
+- When real-time search results are provided in context, cite them accurately.
+- When NO search results are provided, use your general knowledge to give helpful, detailed answers. Do NOT say "I don't have access to data" — instead, provide typical/general information clearly labeled as general guidance.
+- NEVER fabricate specific booking references, flight numbers, or exact prices. But DO provide typical price ranges, duration estimates, and practical comparisons from general knowledge.
+- If the user asks something outside travel, say: "I focus on corporate travel. How can I help with your trip?"
+
+## Origin / Destination
+- "A to B" or "from A to B" means origin = A, destination = B. NEVER reverse this.
+- "Pune to Mumbai" = departing Pune, arriving Mumbai. Always.
+
+## Conversation Memory
+- You are in a focused chat session. All messages in your history are from the SAME conversation.
+- Track trip details mentioned earlier: origin, destination, dates, budget, purpose, number of travelers.
+- When the user provides partial info (just a date like "26th April", or "3 days"), merge it with previously discussed trip details. Never ask the user to repeat what they already told you.
+- Summarize the confirmed trip details before asking the next question.
+
+## Multi-Turn Flow for Trip Planning
+When the user wants to plan a trip, gather these details across turns (don't ask all at once):
+1. Origin and destination (often provided first)
+2. Travel dates or duration
+3. Purpose (business/personal)
+4. Budget preference (if relevant)
+Then confirm the plan and offer to search flights/hotels.
 """
 
 
@@ -60,8 +78,7 @@ def _build_user_context(user: dict) -> str:
 
         # Recent travel requests (last 5)
         try:
-            cols_info = db.execute("PRAGMA table_info(travel_requests)").fetchall()
-            cols = {r[1] for r in cols_info}
+            cols = table_columns(db, "travel_requests")
             select = ["request_id", "destination", "status"]
             if "origin" in cols:
                 select.append("origin")
@@ -136,17 +153,81 @@ def _build_user_context(user: dict) -> str:
         except Exception as e:
             logger.debug("[Chat Context] Meetings query error: %s", e)
 
-        # Recent expenses summary
+        # Detailed expenses with approval status breakdown
         try:
+            ecols = table_columns(db, "expenses_db")
+            amt_expr = "COALESCE(verified_amount, invoice_amount, payment_amount, 0)" if "verified_amount" in ecols else "COALESCE(invoice_amount, 0)"
+            has_approval = "approval_status" in ecols
+
+            # Total summary
             expenses = db.execute(
-                "SELECT COUNT(*) as cnt, SUM(COALESCE(verified_amount, invoice_amount, payment_amount, 0)) as total FROM expenses_db WHERE user_id = ?",
+                f"SELECT COUNT(*) as cnt, SUM({amt_expr}) as total FROM expenses_db WHERE user_id = ?",
                 (user["id"],),
             ).fetchone()
             ed = dict(expenses)
+
             if ed.get("cnt", 0) > 0:
                 context_parts.append(f"Total expenses: {ed['cnt']} items, ₹{ed.get('total', 0):,.0f}")
+
+                # Approval status breakdown
+                if has_approval:
+                    status_rows = db.execute(
+                        f"SELECT COALESCE(approval_status, 'draft') as status, COUNT(*) as cnt, SUM({amt_expr}) as total "
+                        f"FROM expenses_db WHERE user_id = ? GROUP BY COALESCE(approval_status, 'draft')",
+                        (user["id"],),
+                    ).fetchall()
+                    status_parts = []
+                    for sr in status_rows:
+                        sd = dict(sr)
+                        status_parts.append(f"{sd['status']}: {sd['cnt']} items (₹{sd.get('total', 0):,.0f})")
+                    if status_parts:
+                        context_parts.append("  Expense breakdown: " + " | ".join(status_parts))
+
+                # By category
+                cat_rows = db.execute(
+                    f"SELECT category, COUNT(*) as cnt, SUM({amt_expr}) as total FROM expenses_db WHERE user_id = ? GROUP BY category ORDER BY total DESC LIMIT 5",
+                    (user["id"],),
+                ).fetchall()
+                if cat_rows:
+                    cat_parts = [f"{dict(c).get('category', 'other')}: ₹{dict(c).get('total', 0):,.0f}" for c in cat_rows]
+                    context_parts.append("  By category: " + " | ".join(cat_parts))
+
+                # Recent 5 expenses with status
+                select_cols = ["id", "category", "description", f"{amt_expr} as amount"]
+                if has_approval:
+                    select_cols.append("approval_status")
+                if "date" in ecols:
+                    select_cols.append("date")
+                recent_exp = db.execute(
+                    f"SELECT {', '.join(select_cols)} FROM expenses_db WHERE user_id = ? ORDER BY created_at DESC LIMIT 5",
+                    (user["id"],),
+                ).fetchall()
+                if recent_exp:
+                    exp_lines = []
+                    for e in recent_exp:
+                        ed2 = dict(e)
+                        line = f"  - #{ed2.get('id', '?')}: {ed2.get('category', '?')} — ₹{ed2.get('amount', 0):,.0f}"
+                        if ed2.get('description'):
+                            line += f" ({ed2['description'][:40]})"
+                        if has_approval:
+                            line += f" | Status: {ed2.get('approval_status', 'draft')}"
+                        if ed2.get('date'):
+                            line += f" | Date: {ed2['date']}"
+                        exp_lines.append(line)
+                    context_parts.append("Recent expenses:\n" + "\n".join(exp_lines))
             else:
                 context_parts.append("Total expenses: None recorded")
+
+            # Pending expense approvals (for managers)
+            if has_approval and user.get("role") in ("manager", "admin"):
+                pending_exp = db.execute(
+                    f"SELECT COUNT(*) as cnt, SUM({amt_expr}) as total FROM expenses_db WHERE approver_id = ? AND approval_status = 'submitted'",
+                    (user["id"],),
+                ).fetchone()
+                pe = dict(pending_exp)
+                if pe.get("cnt", 0) > 0:
+                    context_parts.append(f"Expense approvals pending for you: {pe['cnt']} items (₹{pe.get('total', 0):,.0f})")
+
         except Exception as e:
             logger.debug("[Chat Context] Expenses query error: %s", e)
 
@@ -164,6 +245,30 @@ def _build_user_context(user: dict) -> str:
         except Exception:
             pass
 
+        # Active SOS events
+        try:
+            sos = db.execute(
+                "SELECT COUNT(*) as cnt FROM sos_events WHERE user_id = ? AND resolved = 0",
+                (user["id"],),
+            ).fetchone()
+            sos_cnt = dict(sos).get("cnt", 0)
+            if sos_cnt > 0:
+                context_parts.append(f"Active SOS alerts: {sos_cnt}")
+        except Exception:
+            pass
+
+        # Notifications unread count
+        try:
+            notif = db.execute(
+                "SELECT COUNT(*) as cnt FROM notifications WHERE user_id = ? AND read = 0",
+                (user["id"],),
+            ).fetchone()
+            notif_cnt = dict(notif).get("cnt", 0)
+            if notif_cnt > 0:
+                context_parts.append(f"Unread notifications: {notif_cnt}")
+        except Exception:
+            pass
+
         db.close()
     except Exception as e:
         logger.warning("[Chat Context] DB context build failed: %s", e)
@@ -171,24 +276,33 @@ def _build_user_context(user: dict) -> str:
     return "\n".join(context_parts)
 
 
-def _get_recent_history(user_id: int, limit: int = 6) -> list:
+def _get_recent_history(user_id: int, limit: int = 20, session_id: str = None) -> list:
     """
     Get recent chat messages for multi-turn context.
+    When session_id is provided, only returns messages from that session (focused context).
     Returns Anthropic-compatible format: [{"role": "user"|"assistant", "content": str}]
     """
     try:
         db = get_db()
-        rows = db.execute(
-            "SELECT role, content FROM chat_messages WHERE user_id = ? ORDER BY created_at DESC, id DESC LIMIT ?",
-            (user_id, limit),
-        ).fetchall()
+        if session_id:
+            rows = db.execute(
+                "SELECT role, content FROM chat_messages WHERE user_id = ? AND session_id = ? ORDER BY created_at DESC, id DESC LIMIT ?",
+                (user_id, session_id, limit),
+            ).fetchall()
+        else:
+            rows = db.execute(
+                "SELECT role, content FROM chat_messages WHERE user_id = ? ORDER BY created_at DESC, id DESC LIMIT ?",
+                (user_id, limit),
+            ).fetchall()
         db.close()
 
         messages = []
         for r in reversed(rows):
             rd = dict(r)
-            role = rd["role"]  # already "user" or "assistant"
-            messages.append({"role": role, "content": rd["content"]})
+            content = rd["content"]
+            if len(content) > 2000:
+                content = content[:2000] + "... [truncated]"
+            messages.append({"role": rd["role"], "content": content})
         return messages
     except Exception as e:
         logger.debug("[Chat History] Failed to load: %s", e)
@@ -249,7 +363,7 @@ def _summarize_trip_results(results: dict) -> dict:
     return summary
 
 
-def process_message(message: str, user: dict = None, model=None, context: dict = None) -> dict:
+def process_message(message: str, user: dict = None, model=None, context: dict = None, session_id: str = None) -> dict:
     """
     Process a chat message and return AI response with intent and action cards.
     """
@@ -260,6 +374,94 @@ def process_message(message: str, user: dict = None, model=None, context: dict =
 
     intent = _detect_intent(message)
     entities = _extract_entities(message, context=context)
+
+    # Try query engine first for data-specific queries
+    if user and any(keyword in message.lower() for keyword in ["show", "list", "from", "in", "this", "last", "pending", "approved", "rejected", "how many", "how much"]):
+        try:
+            from agents.query_engine import handle_query
+
+            query_result = handle_query(user, message)
+
+            if query_result and query_result.get("data", {}).get("success"):
+                data = query_result["data"]
+                query_type = query_result["type"]
+
+                # Format structured response for in-app chat
+                if query_type == "expenses" and data.get("expenses"):
+                    expenses = data["expenses"][:15]  # More items for web
+                    scope_label = {"self": "Your", "team": "Team", "org": "Organization"}[data.get("scope", "self")]
+                    reply_lines = [f"### {scope_label} Expenses\n"]
+                    reply_lines.append(f"**Total:** {data['count']} items, ₹{data.get('total_amount', 0):,.0f}\n")
+                    reply_lines.append("| Date | Category | Amount | Source | Description |")
+                    reply_lines.append("|------|----------|--------|--------|-------------|")
+                    for exp in expenses:
+                        cat = exp.get("category", "other").title()
+                        amt = exp.get("invoice_amount") or exp.get("verified_amount") or exp.get("payment_amount") or 0
+                        desc = exp.get("description", "")[:40]
+                        date = exp.get("date", "")
+                        source = exp.get("source", "web").upper()
+                        reply_lines.append(f"| {date} | {cat} | ₹{float(amt):,.0f} | {source} | {desc} |")
+                    return {
+                        "reply": "\n".join(reply_lines),
+                        "intent": "expense",
+                        "entities": entities,
+                        "action_cards": [],
+                        "ai_powered": True,
+                        "query_data": data,
+                    }
+
+                elif query_type == "trips" and data.get("trips"):
+                    trips = data["trips"][:15]
+                    scope_label = {"self": "Your", "team": "Team", "org": "Organization"}[data.get("scope", "self")]
+                    reply_lines = [f"### {scope_label} Travel Requests\n"]
+                    reply_lines.append(f"**Total:** {data['count']} trips\n")
+                    reply_lines.append("| Route | Dates | Status | Budget |")
+                    reply_lines.append("|-------|-------|--------|--------|")
+                    for trip in trips:
+                        route = f"{trip.get('origin', '?')} → {trip.get('destination', '?')}"
+                        dates = f"{trip.get('start_date', '')} to {trip.get('end_date', '')}" if trip.get("start_date") else "TBD"
+                        status = trip.get("status", "pending").upper()
+                        budget = f"₹{trip['estimated_total']:,.0f}" if trip.get("estimated_total") else "TBD"
+                        reply_lines.append(f"| {route} | {dates} | {status} | {budget} |")
+                    return {
+                        "reply": "\n".join(reply_lines),
+                        "intent": "status",
+                        "entities": entities,
+                        "action_cards": [],
+                        "ai_powered": True,
+                        "query_data": data,
+                    }
+
+                elif query_type == "analytics" and data.get("success"):
+                    scope_label = {"self": "Your", "team": "Team", "org": "Organization"}[data.get("scope", "self")]
+                    exp_data = data.get("expenses", {})
+                    trip_data = data.get("trips", {})
+                    reply_lines = [f"### {scope_label} Analytics\n"]
+                    reply_lines.append(f"**Expenses:** {exp_data.get('count', 0)} items, ₹{exp_data.get('total_amount', 0):,.0f}")
+                    reply_lines.append(f"**Trips:** {trip_data.get('count', 0)} trips, ₹{trip_data.get('total_budget', 0):,.0f}\n")
+
+                    if exp_data.get("by_category"):
+                        reply_lines.append("**By Category:**")
+                        for cat in exp_data["by_category"][:5]:
+                            reply_lines.append(f"- **{cat.get('category', 'other').title()}:** ₹{cat.get('total', 0):,.0f} ({cat.get('count', 0)} items)")
+
+                    if exp_data.get("by_source"):
+                        reply_lines.append("\n**By Source:**")
+                        for src in exp_data["by_source"]:
+                            reply_lines.append(f"- **{src.get('source', 'web').upper()}:** ₹{src.get('total', 0):,.0f} ({src.get('count', 0)} items)")
+
+                    return {
+                        "reply": "\n".join(reply_lines),
+                        "intent": "status",
+                        "entities": entities,
+                        "action_cards": [],
+                        "ai_powered": True,
+                        "query_data": data,
+                    }
+
+        except Exception as e:
+            logger.warning("[Chat] Query engine failed: %s", e)
+            # Continue with normal AI processing
 
     # If plan_trip intent with a destination, run the orchestrator
     trip_results = None
@@ -281,7 +483,7 @@ def process_message(message: str, user: dict = None, model=None, context: dict =
 
     full_system_prompt = build_system_prompt(user)
     user_id = user.get("id") if user else None
-    history = _get_recent_history(user_id, limit=6) if user_id else []
+    history = _get_recent_history(user_id, limit=20, session_id=session_id) if user_id else []
 
     # Append attachment context to the message if present
     enriched_message = message
@@ -377,11 +579,13 @@ def _detect_intent(message: str) -> str:
 
 
 def _extract_entities(message: str, context: dict = None) -> dict:
-    """Extract cities, dates, amounts from message."""
+    """Extract cities, dates, amounts from message — position-aware."""
     context = context or {}
     default_cities = [
         "mumbai", "delhi", "bangalore", "bengaluru", "hyderabad", "chennai", "kolkata", "pune",
         "ahmedabad", "jaipur", "surat", "lucknow", "kochi", "goa", "varanasi", "amritsar",
+        "indore", "nagpur", "bhopal", "chandigarh", "coimbatore", "mysore", "udaipur", "jodhpur",
+        "thiruvananthapuram", "visakhapatnam", "dehradun", "shimla", "manali", "rishikesh",
         "london", "paris", "berlin", "frankfurt", "amsterdam", "zurich", "madrid", "barcelona",
         "new york", "los angeles", "san francisco", "chicago", "toronto", "vancouver",
         "dubai", "abu dhabi", "doha", "riyadh", "singapore", "bangkok", "tokyo", "osaka",
@@ -389,13 +593,61 @@ def _extract_entities(message: str, context: dict = None) -> dict:
     ]
     known_cities = context.get("known_cities", default_cities)
     msg_lower = message.lower()
-    found_cities = [c.title() for c in known_cities if c in msg_lower]
 
+    # Find cities with their POSITION in the message (not list order)
+    city_positions = []
+    for c in known_cities:
+        idx = msg_lower.find(c)
+        if idx != -1:
+            city_positions.append((idx, c.title()))
+    city_positions.sort(key=lambda x: x[0])
+    found_cities = [cp[1] for cp in city_positions]
+
+    # Explicit "X to Y" / "from X to Y" pattern takes priority
+    origin = None
+    destination = None
+    escaped = [re.escape(c) for c in known_cities]
+    to_pattern = re.search(
+        r'(?:from\s+)?(' + '|'.join(escaped) + r')\s+to\s+(' + '|'.join(escaped) + r')',
+        msg_lower
+    )
+    if to_pattern:
+        origin = to_pattern.group(1).title()
+        destination = to_pattern.group(2).title()
+    elif len(found_cities) >= 2:
+        origin = found_cities[0]
+        destination = found_cities[1]
+    elif len(found_cities) == 1:
+        destination = found_cities[0]
+
+    # Amount extraction
     amount_match = re.search(r"(?:₹|rs\.?\s*|inr\s*|\$|€|£|aed\s*|usd\s*|eur\s*)([0-9,]+(?:\.[0-9]{1,2})?)", msg_lower, re.IGNORECASE)
     amount = float(amount_match.group(1).replace(",", "")) if amount_match else None
 
-    date_match = re.search(r"\b(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}-\d{2}-\d{2})\b", message)
-    date = date_match.group(1) if date_match else None
+    # Date extraction — handles "26th April", "April 26", "26/04/2026", "2026-04-26", "next week"
+    date = None
+    month_map = {"jan": "01", "feb": "02", "mar": "03", "apr": "04", "may": "05", "jun": "06",
+                 "jul": "07", "aug": "08", "sep": "09", "oct": "10", "nov": "11", "dec": "12"}
+    # "26th April 2026" or "26 Apr"
+    dm = re.search(r'\b(\d{1,2})(?:st|nd|rd|th)?\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*(?:\s+(\d{4}))?\b', msg_lower)
+    if dm:
+        day = dm.group(1).zfill(2)
+        mon = month_map.get(dm.group(2)[:3], "01")
+        year = dm.group(3) or str(datetime.now().year)
+        date = f"{year}-{mon}-{day}"
+    else:
+        # "April 26, 2026" or "Apr 26"
+        md = re.search(r'\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+(\d{1,2})(?:st|nd|rd|th)?(?:[,\s]+(\d{4}))?\b', msg_lower)
+        if md:
+            day = md.group(2).zfill(2)
+            mon = month_map.get(md.group(1)[:3], "01")
+            year = md.group(3) or str(datetime.now().year)
+            date = f"{year}-{mon}-{day}"
+        else:
+            # Numeric formats: 26/04/2026, 2026-04-26
+            nd = re.search(r'\b(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}-\d{2}-\d{2})\b', message)
+            if nd:
+                date = nd.group(1)
 
     currency_codes = re.findall(r"\b(INR|USD|EUR|GBP|AED|SAR|JPY|CAD|AUD|SGD|CHF|CNY)\b", message.upper())
     countries = re.findall(
@@ -405,8 +657,8 @@ def _extract_entities(message: str, context: dict = None) -> dict:
 
     return {
         "cities": found_cities,
-        "origin": found_cities[0] if found_cities else None,
-        "destination": found_cities[-1] if len(found_cities) > 1 else found_cities[0] if found_cities else None,
+        "origin": origin,
+        "destination": destination,
         "amount": amount,
         "date": date,
         "currencies": currency_codes,

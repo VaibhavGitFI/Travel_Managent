@@ -8,10 +8,23 @@ const client = axios.create({
   },
 })
 
-// Request interceptor
+// Helper to read a cookie by name
+function getCookie(name) {
+  const match = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'))
+  return match ? decodeURIComponent(match[2]) : null
+}
+
+// Request interceptor — attach CSRF token for state-changing requests
 client.interceptors.request.use(
   (config) => {
     config.withCredentials = true
+    const method = (config.method || 'get').toLowerCase()
+    if (['post', 'put', 'patch', 'delete'].includes(method)) {
+      const csrfToken = getCookie('csrf_token')
+      if (csrfToken) {
+        config.headers['X-CSRF-Token'] = csrfToken
+      }
+    }
     return config
   },
   (error) => Promise.reject(error)
