@@ -160,11 +160,11 @@ class DeepgramProvider(STTProviderBase):
     def _initialize_deepgram(self):
         """Initialize Deepgram SDK."""
         try:
-            from deepgram import DeepgramClient, PrerecordedOptions
+            from deepgram import DeepgramClient
 
-            # v6 SDK requires api_key as keyword argument
+            # Deepgram SDK v6 exposes prerecorded transcription at
+            # client.listen.v1.media.transcribe_file(...)
             self._deepgram = DeepgramClient(api_key=Config.DEEPGRAM_API_KEY)
-            self._PrerecordedOptions = PrerecordedOptions
 
             logger.info("[STT Deepgram] ✅ Deepgram SDK initialized successfully")
         except ImportError:
@@ -196,13 +196,10 @@ class DeepgramProvider(STTProviderBase):
         start_time = time.time()
 
         try:
-            # Prepare audio payload
-            payload = {
-                "buffer": audio_data
-            }
-
-            # Configure Deepgram options for Indian English
-            options = self._PrerecordedOptions(
+            # Deepgram SDK v6 accepts the audio bytes directly and the
+            # transcription options as keyword arguments.
+            response = self._deepgram.listen.v1.media.transcribe_file(
+                request=audio_data,
                 model="nova-2",              # Latest model
                 language="en-IN",            # Indian English
                 punctuate=True,              # Add punctuation
@@ -211,38 +208,53 @@ class DeepgramProvider(STTProviderBase):
                 diarize=False,               # No speaker diarization
             )
 
-            # Transcribe
-            response = self._deepgram.listen.prerecorded.v("1").transcribe_file(
-                payload, options
-            )
+            # Deepgram SDK v6 returns typed response objects. Older versions
+            # expose dict-like payloads, so we support both shapes.
+            if hasattr(response, "results"):
+                channels = getattr(response.results, "channels", []) or []
+                raw_alternatives = getattr(channels[0], "alternatives", []) if channels else []
+                metadata_duration = float(getattr(getattr(response, "metadata", None), "duration", 0) or 0)
+                if not raw_alternatives:
+                    return TranscriptionResult(
+                        text="",
+                        confidence=0.0,
+                        is_final=True,
+                        provider=STTProvider.DEEPGRAM,
+                        latency_ms=(time.time() - start_time) * 1000
+                    )
 
-            # Extract transcription
-            result = response.to_dict()
+                alternative = raw_alternatives[0]
+                transcript = (getattr(alternative, "transcript", "") or "").strip()
+                confidence = float(getattr(alternative, "confidence", 0.0) or 0.0)
+                other_alternatives = [
+                    (getattr(alt, "transcript", "") or "").strip()
+                    for alt in raw_alternatives[1:3]
+                    if getattr(alt, "transcript", "")
+                ]
+            else:
+                result = response.to_dict() if hasattr(response, "to_dict") else response
+                if not isinstance(result, dict) or "results" not in result:
+                    raise RuntimeError("Invalid response from Deepgram")
+                channels = result["results"].get("channels", [])
+                raw_alternatives = channels[0]["alternatives"] if channels else []
+                metadata_duration = result.get("metadata", {}).get("duration", 0)
+                if not raw_alternatives:
+                    return TranscriptionResult(
+                        text="",
+                        confidence=0.0,
+                        is_final=True,
+                        provider=STTProvider.DEEPGRAM,
+                        latency_ms=(time.time() - start_time) * 1000
+                    )
 
-            if not result or "results" not in result:
-                raise RuntimeError("Invalid response from Deepgram")
-
-            channels = result["results"]["channels"]
-            if not channels or not channels[0]["alternatives"]:
-                return TranscriptionResult(
-                    text="",
-                    confidence=0.0,
-                    is_final=True,
-                    provider=STTProvider.DEEPGRAM,
-                    latency_ms=(time.time() - start_time) * 1000
-                )
-
-            # Get best alternative
-            alternative = channels[0]["alternatives"][0]
-            transcript = alternative.get("transcript", "").strip()
-            confidence = alternative.get("confidence", 0.0)
-
-            # Get other alternatives
-            other_alternatives = [
-                alt.get("transcript", "")
-                for alt in channels[0]["alternatives"][1:3]
-                if alt.get("transcript")
-            ]
+                alternative = raw_alternatives[0]
+                transcript = alternative.get("transcript", "").strip()
+                confidence = alternative.get("confidence", 0.0)
+                other_alternatives = [
+                    alt.get("transcript", "")
+                    for alt in raw_alternatives[1:3]
+                    if alt.get("transcript")
+                ]
 
             latency_ms = (time.time() - start_time) * 1000
 
@@ -261,7 +273,7 @@ class DeepgramProvider(STTProviderBase):
                 alternatives=other_alternatives,
                 metadata={
                     "model": "nova-2",
-                    "duration": result.get("metadata", {}).get("duration", 0)
+                    "duration": metadata_duration
                 }
             )
 

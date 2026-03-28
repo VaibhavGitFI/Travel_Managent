@@ -6,7 +6,7 @@ import json
 import os
 import uuid
 import logging
-from datetime import datetime
+from datetime import date, datetime
 from flask import Blueprint, request, jsonify, Response, stream_with_context
 from werkzeug.utils import secure_filename
 from auth import get_current_user
@@ -14,6 +14,7 @@ from extensions import limiter
 from agents.chat_agent import (
     process_message,
     build_system_prompt,
+    format_structured_chat_response,
     _detect_intent,
     _extract_entities,
     _build_action_cards,
@@ -21,6 +22,7 @@ from agents.chat_agent import (
     _pattern_reply,
     _get_recent_history,
 )
+from agents.query_engine import handle_query, should_use_structured_query
 from services.anthropic_service import claude
 from services.gemini_service import gemini
 from database import get_db, table_columns
@@ -125,6 +127,36 @@ def _insert_chat_message(db, user_id: int, role: str, content: str, intent: str 
     )
 
 
+def _persist_chat_exchange(user_id: int, session_id: str, message: str, reply: str, intent: str, action_cards=None):
+    db = None
+    try:
+        db = get_db()
+        _insert_chat_message(db, user_id, "user", message, intent, session_id=session_id)
+        _insert_chat_message(db, user_id, "assistant", reply, intent, action_cards, session_id=session_id)
+        msg_count = db.execute("SELECT COUNT(*) as cnt FROM chat_messages WHERE session_id = ?", (session_id,)).fetchone()
+        cnt = msg_count["cnt"] if isinstance(msg_count, dict) else msg_count[0]
+        if cnt <= 2:
+            title = _auto_title(message)
+            db.execute("UPDATE chat_sessions SET title = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (title, session_id))
+        else:
+            db.execute("UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?", (session_id,))
+        db.commit()
+    finally:
+        if db:
+            db.close()
+
+
+def _json_safe(value):
+    """Recursively convert stream payloads into JSON-safe values."""
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    return value
+
+
 @chat_bp.route("", methods=["POST"])
 @limiter.limit("30 per minute")
 def chat():
@@ -184,24 +216,18 @@ def chat():
         result["session_id"] = session_id
 
         # Persist message + reply
-        db = get_db()
         try:
             user_content = original_message or "Sent an attachment"
-            _insert_chat_message(db, user["id"], "user", user_content, result.get("intent", "general"), session_id=session_id)
-            _insert_chat_message(db, user["id"], "assistant", reply, result.get("intent", "general"), result.get("action_cards"), session_id=session_id)
-            # Update session timestamp + auto-title on first message
-            msg_count = db.execute("SELECT COUNT(*) as cnt FROM chat_messages WHERE session_id = ?", (session_id,)).fetchone()
-            cnt = msg_count["cnt"] if isinstance(msg_count, dict) else msg_count[0]
-            if cnt <= 2:
-                title = _auto_title(original_message or message)
-                db.execute("UPDATE chat_sessions SET title = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (title, session_id))
-            else:
-                db.execute("UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?", (session_id,))
-            db.commit()
+            _persist_chat_exchange(
+                user["id"],
+                session_id,
+                user_content,
+                reply,
+                result.get("intent", "general"),
+                result.get("action_cards"),
+            )
         except Exception as persist_err:
             logger.warning("[Chat] Failed to persist chat messages: %s", persist_err)
-        finally:
-            db.close()
 
         return jsonify({"success": True, **result}), 200
     except Exception as e:
@@ -239,6 +265,53 @@ def chat_stream():
     intent = _detect_intent(message)
     entities = _extract_entities(message, context=context)
     action_cards = _build_action_cards(intent, entities)
+
+    try:
+        if should_use_structured_query(message):
+            query_result = handle_query(user, message, strict=True)
+            structured_result = format_structured_chat_response(query_result, entities)
+        else:
+            structured_result = None
+    except Exception as e:
+        logger.warning("[Chat Stream] Query engine failed: %s", e)
+        structured_result = None
+
+    if structured_result:
+        reply = structured_result.get("reply", "")
+        stream_intent = structured_result.get("intent", intent)
+        stream_action_cards = structured_result.get("action_cards", action_cards)
+
+        def generate_structured():
+            yield f"data: {json.dumps({'token': reply})}\n\n"
+            try:
+                _persist_chat_exchange(
+                    user["id"],
+                    session_id,
+                    message,
+                    reply,
+                    stream_intent,
+                    stream_action_cards,
+                )
+            except Exception as persist_err:
+                logger.warning("[Chat Stream] Persist error: %s", persist_err)
+
+            done_event = {
+                "done": True,
+                "action_cards": stream_action_cards,
+                "intent": stream_intent,
+                "ai_powered": True,
+                "model": structured_result.get("model", "structured_query"),
+                "data_source": structured_result.get("data_source", "structured_query"),
+                "session_id": session_id,
+                "query_data": structured_result.get("query_data"),
+            }
+            yield f"data: {json.dumps(_json_safe(done_event))}\n\n"
+
+        return Response(
+            stream_with_context(generate_structured()),
+            content_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     # Run orchestrator for plan_trip intent with destination (before streaming)
     trip_results = None
@@ -325,30 +398,15 @@ def chat_stream():
             yield f"data: {json.dumps({'token': extra})}\n\n"
 
         # Persist user message + assistant reply
-        db = None
         try:
-            db = get_db()
-            _insert_chat_message(db, user["id"], "user", message, intent, session_id=session_id)
-            _insert_chat_message(db, user["id"], "assistant", enriched, intent, action_cards, session_id=session_id)
-            # Auto-title on first message pair
-            msg_count = db.execute("SELECT COUNT(*) as cnt FROM chat_messages WHERE session_id = ?", (session_id,)).fetchone()
-            cnt = msg_count["cnt"] if isinstance(msg_count, dict) else msg_count[0]
-            if cnt <= 2:
-                title = _auto_title(message)
-                db.execute("UPDATE chat_sessions SET title = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (title, session_id))
-            else:
-                db.execute("UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?", (session_id,))
-            db.commit()
+            _persist_chat_exchange(user["id"], session_id, message, enriched, intent, action_cards)
         except Exception as persist_err:
             logger.warning("[Chat Stream] Persist error: %s", persist_err)
-        finally:
-            if db:
-                db.close()
 
         done_event = {'done': True, 'action_cards': action_cards, 'intent': intent, 'ai_powered': ai_powered, 'model': model_used, 'session_id': session_id}
         if trip_results:
             done_event['trip_results'] = trip_results
-        yield f"data: {json.dumps(done_event)}\n\n"
+        yield f"data: {json.dumps(_json_safe(done_event))}\n\n"
 
     return Response(
         stream_with_context(generate()),
@@ -534,4 +592,3 @@ def delete_session(session_id):
     except Exception:
         logger.exception("[Chat] delete session failed")
         return jsonify({"success": False, "error": "Failed to delete session"}), 500
-

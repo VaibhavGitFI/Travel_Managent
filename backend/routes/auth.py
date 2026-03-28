@@ -8,7 +8,7 @@ import time
 from flask import Blueprint, request, jsonify, session
 from werkzeug.security import generate_password_hash
 from auth import (login_user, logout_user, get_current_user, verify_token,
-                generate_tokens, _get_user_by_id, generate_csrf_token)
+                generate_tokens, _get_user_by_id, generate_csrf_token, get_user_org)
 from database import get_db
 from extensions import limiter
 from validators import ValidationError, validate_email, validate_password, validate_string
@@ -75,19 +75,30 @@ def refresh():
     if not user:
         return jsonify({"success": False, "error": "User not found"}), 401
 
-    tokens = generate_tokens(user_id)
+    membership = get_user_org(user_id)
+    tokens = generate_tokens(
+        user_id,
+        org_id=membership.get("org_id") if membership else None,
+        org_role=membership.get("org_role") if membership else None,
+    )
     return jsonify({"success": True, **tokens}), 200
 
 
 @auth_bp.route("/me", methods=["GET"])
 def me():
     """GET /api/auth/me — return current logged-in user from session."""
+    from flask import session as flask_session
     user = get_current_user()
     if not user:
         return jsonify({"success": False, "error": "Not authenticated"}), 401
     # Strip password_hash before returning
     safe_user = {k: v for k, v in user.items() if k != "password_hash"}
-    return jsonify({"success": True, "user": safe_user}), 200
+    # Include the CSRF token in the body so the frontend can cache it in memory
+    # (after_request will also set it as a cookie and X-CSRF-Token header)
+    csrf_token = flask_session.get("_csrf_token")
+    if not csrf_token:
+        csrf_token = generate_csrf_token()
+    return jsonify({"success": True, "user": safe_user, "csrf_token": csrf_token}), 200
 
 
 @auth_bp.route("/register", methods=["POST"])

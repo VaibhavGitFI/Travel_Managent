@@ -449,7 +449,8 @@ export default function Layout() {
           type="button"
           onClick={openSos}
           aria-label="SOS Emergency"
-          className="fixed bottom-6 right-6 z-50 flex h-14 w-14 items-center justify-center rounded-full bg-red-600 text-white shadow-lg ring-4 ring-red-200 transition-transform hover:scale-110 hover:bg-red-700 active:scale-95 animate-pulse-slow"
+          className="fixed z-50 flex h-12 w-12 items-center justify-center rounded-full bg-red-600 text-white shadow-lg ring-4 ring-red-200 transition-transform hover:scale-110 hover:bg-red-700 active:scale-95 animate-pulse-slow"
+          style={{ bottom: '96px', right: '28px' }}
         >
           <span className="text-xs font-black tracking-tighter">SOS</span>
         </button>

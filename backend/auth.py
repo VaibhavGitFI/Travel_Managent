@@ -156,6 +156,57 @@ def get_user_org(user_id: int) -> dict | None:
         return None
 
 
+def _attach_org_context(user: dict | None) -> dict | None:
+    """Return a copy of the user payload enriched with active org context."""
+    if not user:
+        return None
+
+    enriched = dict(user)
+    if enriched.get("org_id") and enriched.get("org_role"):
+        return enriched
+
+    org_id = None
+    org_role = None
+    org_name = None
+    org_slug = None
+
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:].strip()
+        try:
+            import jwt
+            payload = jwt.decode(token, _jwt_secret(), algorithms=["HS256"])
+            if payload.get("org_id"):
+                org_id = int(payload["org_id"])
+                org_role = payload.get("org_role")
+        except Exception:
+            pass
+
+    if not org_id:
+        org_id = session.get("org_id")
+        org_role = session.get("org_role", org_role)
+
+    membership = get_user_org(enriched.get("id")) if enriched.get("id") else None
+    if membership:
+        if not org_id:
+            org_id = membership.get("org_id")
+        if not org_role:
+            org_role = membership.get("org_role")
+        org_name = membership.get("org_name")
+        org_slug = membership.get("org_slug")
+
+    if org_id:
+        enriched["org_id"] = org_id
+        if org_role:
+            enriched["org_role"] = org_role
+        if org_name:
+            enriched["org_name"] = org_name
+        if org_slug:
+            enriched["org_slug"] = org_slug
+
+    return enriched
+
+
 def get_current_org() -> dict | None:
     """Return current user's org context. Checks JWT claims first, then DB."""
     # 1. JWT may carry org_id directly
@@ -252,13 +303,13 @@ def get_current_user():
         token = auth_header[7:].strip()
         user_id = verify_token(token, "access")
         if user_id:
-            return _get_user_by_id(user_id)
+            return _attach_org_context(_get_user_by_id(user_id))
 
     # 2. Session cookie (existing browser SPA flow)
     user_id = session.get("user_id")
     if not user_id:
         return None
-    return _get_user_by_id(user_id)
+    return _attach_org_context(_get_user_by_id(user_id))
 
 
 def login_required(f):

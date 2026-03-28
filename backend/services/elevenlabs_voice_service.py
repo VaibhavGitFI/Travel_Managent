@@ -180,8 +180,8 @@ class ElevenLabsProvider(TTSProviderBase):
         start_time = time.time()
 
         try:
-            # Get voice ID from config (Indian English female by default)
-            voice_id = Config.OTIS_VOICE_ID or "EXAVITQu4vr4xnSDxMaL"
+            # Get voice ID from config (male default for a consistent Jarvis persona)
+            voice_id = Config.OTIS_VOICE_ID or "pNInz6obpgDQGcFmaJgB"
 
             # Generate speech
             response = self._client.text_to_speech.convert(
@@ -300,11 +300,10 @@ class GoogleTTSProvider(TTSProviderBase):
             # Set input text
             synthesis_input = self._texttospeech.SynthesisInput(text=text)
 
-            # Configure voice (Indian English female)
+            # Configure voice (prefer Indian English male for Jarvis consistency)
             voice = self._texttospeech.VoiceSelectionParams(
                 language_code="en-IN",
-                name="en-IN-Wavenet-D",  # Indian English female
-                ssml_gender=self._texttospeech.SsmlVoiceGender.FEMALE
+                ssml_gender=self._texttospeech.SsmlVoiceGender.MALE
             )
 
             # Configure audio
@@ -341,7 +340,7 @@ class GoogleTTSProvider(TTSProviderBase):
                 audio_format="mp3",
                 sample_rate=24000,
                 duration_seconds=duration_seconds,
-                metadata={"voice": "en-IN-Wavenet-D"}
+                metadata={"voice_gender": "male", "language": "en-IN"}
             )
 
             self.update_stats(result, success=True)
@@ -496,8 +495,9 @@ class BeepProvider(TTSProviderBase):
         start_time = time.time()
 
         try:
-            import struct
             import math
+            import struct
+            import wave
 
             # Generate a pleasant beep (440Hz sine wave, 0.3 seconds)
             sample_rate = 22050
@@ -514,8 +514,14 @@ class BeepProvider(TTSProviderBase):
                 sample = int(32767 * envelope * math.sin(2 * math.pi * frequency * t))
                 samples.append(sample)
 
-            # Convert to WAV bytes (simplified WAV header)
-            audio_data = struct.pack(f"{len(samples)}h", *samples)
+            pcm_data = struct.pack(f"{len(samples)}h", *samples)
+            wav_buffer = io.BytesIO()
+            with wave.open(wav_buffer, "wb") as wav_file:
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(sample_rate)
+                wav_file.writeframes(pcm_data)
+            audio_data = wav_buffer.getvalue()
 
             latency_ms = (time.time() - start_time) * 1000
 
@@ -529,7 +535,7 @@ class BeepProvider(TTSProviderBase):
                 text=text,
                 provider=TTSProvider.BEEP,
                 latency_ms=latency_ms,
-                audio_format="raw_pcm",
+                audio_format="wav",
                 sample_rate=22050,
                 duration_seconds=duration,
                 metadata={"note": "Beep fallback - TTS not available"}

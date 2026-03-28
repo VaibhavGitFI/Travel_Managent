@@ -32,14 +32,53 @@ from extensions import limiter
 from database import get_db, table_columns
 from config import Config
 from otis_security import require_otis, audit_otis, OtisCommandSecurity, check_otis_permission
+from agents.query_engine import handle_query, format_query_result_for_voice, should_use_structured_query
 
 otis_bp = Blueprint("otis", __name__, url_prefix="/api/otis")
 logger = logging.getLogger(__name__)
 
 
+def _rollback_db_safely(db) -> None:
+    """Clear a failed transaction so later OTIS queries can continue."""
+    try:
+        db.rollback()
+    except Exception:
+        pass
+
+
 def _check_otis_permission(user: dict) -> tuple[bool, str]:
     """Thin wrapper preserved for /status endpoint (no decorator needed there)."""
     return check_otis_permission(user)
+
+
+def _get_service_status() -> dict:
+    """Resolve the actual active OTIS providers without making network calls."""
+    services = {
+        "wake_word": "available" if Config.PORCUPINE_ACCESS_KEY else "unavailable",
+        "stt": "fallback",
+        "tts": "fallback",
+        "llm": "gemini" if Config.GEMINI_API_KEY else "unavailable",
+    }
+
+    try:
+        from services.deepgram_service import SpeechToTextService
+        stt = SpeechToTextService()
+        provider = stt.get_active_provider()
+        if provider:
+            services["stt"] = provider.value
+    except Exception as e:
+        logger.debug("[OTIS Routes] STT status probe failed: %s", e)
+
+    try:
+        from services.elevenlabs_voice_service import TextToSpeechService
+        tts = TextToSpeechService()
+        provider = tts.get_active_provider()
+        if provider:
+            services["tts"] = provider.value
+    except Exception as e:
+        logger.debug("[OTIS Routes] TTS status probe failed: %s", e)
+
+    return services
 
 
 @otis_bp.route("/status", methods=["GET"])
@@ -77,13 +116,7 @@ def get_status():
 
     allowed, reason = _check_otis_permission(user)
 
-    # Check service availability
-    services = {
-        "wake_word": "available" if Config.PORCUPINE_ACCESS_KEY else "unavailable",
-        "stt": "deepgram" if Config.DEEPGRAM_API_KEY else "fallback",
-        "tts": "elevenlabs" if Config.ELEVENLABS_API_KEY else "fallback",
-        "llm": "gemini" if Config.GEMINI_API_KEY else "unavailable"
-    }
+    services = _get_service_status()
 
     # Check for active session
     active_session = None
@@ -101,11 +134,12 @@ def get_status():
     except Exception as e:
         logger.debug(f"[OTIS Routes] Status check error: {e}")
 
+    elevated_roles = ("admin", "manager", "super_admin")
     permissions = {
         "can_use": allowed,
-        "can_approve_trips": user.get("role") in ("admin", "manager"),
-        "can_view_analytics": user.get("role") in ("admin", "manager"),
-        "can_execute_functions": user.get("role") in ("admin", "manager")
+        "can_approve_trips": user.get("role") in elevated_roles,
+        "can_view_analytics": user.get("role") in elevated_roles,
+        "can_execute_functions": user.get("role") in elevated_roles
     }
 
     return jsonify({
@@ -154,9 +188,9 @@ def start_session(user):
 
         # End any existing active sessions for this user
         db.execute(
-            "UPDATE otis_sessions SET status = 'ended', ended_at = CURRENT_TIMESTAMP "
+            "UPDATE otis_sessions SET status = 'ended', ended_at = ? "
             "WHERE user_id = ? AND status = 'active'",
-            (user["id"],)
+            (now, user["id"])
         )
 
         # Create new session
@@ -360,9 +394,9 @@ def get_session(user, session_id):
 
         session = dict(session_row)
 
-        # Get conversation history
+        # Get conversation history (otis_conversations uses 'timestamp' not 'created_at')
         conversation_rows = db.execute(
-            """SELECT turn_number, role, content, created_at
+            """SELECT turn_number, role, content, timestamp as created_at
                FROM otis_conversations
                WHERE session_id = ?
                ORDER BY turn_number ASC""",
@@ -769,38 +803,44 @@ def _build_otis_context(user: dict, db) -> dict:
     }
 
     try:
-        # Pending expenses
+        # Pending expenses — use actual schema columns
         rows = db.execute(
-            """SELECT id, amount, category, status, merchant, created_at
+            """SELECT id, invoice_amount, category, verification_status, approval_status, created_at
                FROM expenses_db WHERE user_id = ? ORDER BY created_at DESC LIMIT 10""",
             (user["id"],)
         ).fetchall()
         expenses = [dict(r) for r in rows]
-        pending = [e for e in expenses if e.get("status") in ("pending", "submitted")]
+        pending = [
+            e for e in expenses
+            if e.get("approval_status") in ("draft", "submitted")
+            or e.get("verification_status") == "pending"
+        ]
         ctx["pending_expenses"] = pending
         ctx["total_expenses"] = len(expenses)
         ctx["pending_expense_count"] = len(pending)
-        ctx["pending_expense_total"] = sum(float(e.get("amount", 0)) for e in pending)
-    except Exception:
-        pass
+        ctx["pending_expense_total"] = sum(float(e.get("invoice_amount", 0)) for e in pending)
+    except Exception as e:
+        logger.debug("[OTIS Context] expenses query failed: %s", e)
+        _rollback_db_safely(db)
 
     try:
-        # Recent travel requests
+        # Recent travel requests — use actual schema columns
         rows = db.execute(
-            """SELECT id, destination, purpose, status, departure_date, return_date, estimated_budget
+            """SELECT id, destination, purpose, status, start_date, end_date, estimated_total
                FROM travel_requests WHERE user_id = ? ORDER BY created_at DESC LIMIT 5""",
             (user["id"],)
         ).fetchall()
         ctx["recent_trips"] = [dict(r) for r in rows]
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("[OTIS Context] trips query failed: %s", e)
+        _rollback_db_safely(db)
 
     try:
-        # Pending approvals (if manager/admin)
+        # Pending approvals (if manager/admin) — use actual schema columns
         if user.get("role") in ("admin", "manager", "super_admin"):
             rows = db.execute(
                 """SELECT tr.id, tr.destination, tr.purpose, u.name as requester_name,
-                          tr.estimated_budget, tr.status
+                          tr.estimated_total, tr.status
                    FROM travel_requests tr
                    JOIN users u ON u.id = tr.user_id
                    WHERE tr.org_id = ? AND tr.status = 'submitted'
@@ -809,22 +849,133 @@ def _build_otis_context(user: dict, db) -> dict:
             ).fetchall()
             ctx["pending_approvals"] = [dict(r) for r in rows]
             ctx["pending_approval_count"] = len(ctx["pending_approvals"])
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("[OTIS Context] approvals query failed: %s", e)
+        _rollback_db_safely(db)
 
     try:
-        # Upcoming meetings
+        # Upcoming meetings — use actual schema columns (no title/location)
+        today = datetime.now().date().isoformat()
         rows = db.execute(
-            """SELECT title, client_name, meeting_date, location, status
+            """SELECT client_name, company, meeting_date, venue, status
                FROM client_meetings WHERE user_id = ?
-               AND meeting_date >= date('now') ORDER BY meeting_date ASC LIMIT 5""",
-            (user["id"],)
+               AND meeting_date >= ? ORDER BY meeting_date ASC LIMIT 5""",
+            (user["id"], today)
         ).fetchall()
         ctx["upcoming_meetings"] = [dict(r) for r in rows]
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("[OTIS Context] meetings query failed: %s", e)
+        _rollback_db_safely(db)
 
     return ctx
+
+
+def _resolve_structured_otis_query(user: dict, command_text: str) -> dict | None:
+    """
+    Try to answer OTIS data questions directly from the shared query engine.
+    Returns None when the message is not a supported structured query.
+    """
+    try:
+        if not should_use_structured_query(command_text):
+            return None
+        query_result = handle_query(user, command_text, strict=True)
+        data = query_result.get("data", {}) if query_result else {}
+        if not data.get("success"):
+            return None
+
+        response_text = format_query_result_for_voice(query_result, command_text)
+        if not response_text:
+            return None
+
+        return {
+            "response_text": response_text,
+            "query_type": query_result.get("type"),
+            "query_data": data,
+            "data_source": "structured_query",
+        }
+    except Exception as e:
+        logger.warning("[OTIS Structured Query] Failed for '%s': %s", command_text[:80], e)
+        return None
+
+
+def _resolve_otis_session_id(db, user_id: int, requested_session_id: str | None) -> str | None:
+    """
+    Resolve the session OTIS should use for this command.
+    Reuses the requested session when valid, otherwise falls back to the
+    user's current active session so follow-up turns keep their memory.
+    """
+    if requested_session_id:
+        row = db.execute(
+            "SELECT session_id FROM otis_sessions WHERE session_id = ? AND user_id = ?",
+            (requested_session_id, user_id)
+        ).fetchone()
+        if row:
+            return row["session_id"]
+
+    active = db.execute(
+        "SELECT session_id FROM otis_sessions WHERE user_id = ? AND status = 'active' "
+        "ORDER BY started_at DESC LIMIT 1",
+        (user_id,)
+    ).fetchone()
+    return active["session_id"] if active else None
+
+
+def _load_otis_conversation_history(db, session_id: str, max_turns: int = 5) -> list[dict]:
+    """
+    Load recent OTIS conversation turns in a history shape Gemini can use.
+    This is resilient to older malformed rows so follow-up questions still
+    inherit the latest valid context.
+    """
+    if not session_id:
+        return []
+
+    rows = db.execute(
+        """SELECT role, content FROM (
+               SELECT role, content, turn_number
+               FROM otis_conversations
+               WHERE session_id = ?
+               ORDER BY turn_number DESC
+               LIMIT ?
+           ) recent
+           ORDER BY turn_number ASC""",
+        (session_id, max_turns * 2)
+    ).fetchall()
+
+    history = []
+    pending_user = None
+
+    for row in rows:
+        role = (row["role"] or "").strip().lower()
+        content = (row["content"] or "").strip()
+        if not content:
+            continue
+
+        if role == "user":
+            if pending_user:
+                history.append({
+                    "user_input": pending_user,
+                    "assistant_response": "",
+                })
+            pending_user = content
+            continue
+
+        if role == "assistant":
+            if pending_user is not None:
+                history.append({
+                    "user_input": pending_user,
+                    "assistant_response": content,
+                })
+                pending_user = None
+            elif history and not history[-1].get("assistant_response"):
+                history[-1]["assistant_response"] = content
+
+    if pending_user:
+        history.append({
+            "user_input": pending_user,
+            "assistant_response": "",
+        })
+
+    return history[-max_turns:]
 
 
 @otis_bp.route("/command", methods=["POST"])
@@ -847,7 +998,7 @@ def process_command_rest(user):
     """
     data = request.get_json(silent=True) or {}
     command_text = data.get("command", "").strip()
-    session_id = data.get("session_id")
+    requested_session_id = data.get("session_id")
 
     if not command_text:
         return jsonify({"success": False, "error": "command is required"}), 400
@@ -856,42 +1007,36 @@ def process_command_rest(user):
     command_text = command_text[:1000]
 
     try:
-        from services.gemini_service import gemini
-
-        # Build real-time context from DB
         db = get_db()
-        context = _build_otis_context(user, db)
-        db.close()
+        try:
+            session_id = _resolve_otis_session_id(db, user["id"], requested_session_id)
+            structured_result = _resolve_structured_otis_query(user, command_text)
+            context = None
+            conversation_history = []
+            if not structured_result:
+                context = _build_otis_context(user, db)
+                conversation_history = _load_otis_conversation_history(db, session_id) if session_id else []
+        finally:
+            db.close()
 
-        # Get conversation history from session if available
-        conversation_history = []
-        if session_id:
-            try:
-                db2 = get_db()
-                rows = db2.execute(
-                    """SELECT role, content FROM otis_conversations
-                       WHERE session_id = ? ORDER BY turn_number DESC LIMIT 10""",
-                    (session_id,)
-                ).fetchall()
-                db2.close()
-                # Build history in correct format
-                turns = list(reversed([dict(r) for r in rows]))
-                for i in range(0, len(turns) - 1, 2):
-                    if i + 1 < len(turns):
-                        conversation_history.append({
-                            "user_input": turns[i].get("content", ""),
-                            "assistant_response": turns[i + 1].get("content", "")
-                        })
-            except Exception:
-                pass
+        query_type = None
+        query_data = None
+        data_source = "gemini"
 
-        # Generate response via Gemini
-        response_text = gemini.generate_voice_optimized(
-            prompt=command_text,
-            context=context,
-            conversation_history=conversation_history,
-            model_type="flash"
-        )
+        if structured_result:
+            response_text = structured_result["response_text"]
+            query_type = structured_result["query_type"]
+            query_data = structured_result["query_data"]
+            data_source = structured_result["data_source"]
+        else:
+            from services.gemini_service import gemini
+
+            response_text = gemini.generate_voice_optimized(
+                prompt=command_text,
+                context=context,
+                conversation_history=conversation_history,
+                model_type="flash"
+            )
 
         if not response_text:
             response_text = "I understand. Could you please rephrase your question?"
@@ -921,6 +1066,10 @@ def process_command_rest(user):
                        VALUES (?, ?, ?, ?, ?, ?, 1, 0)""",
                     (user.get("org_id"), user["id"], session_id, command_text, command_text, response_text)
                 )
+                db3.execute(
+                    "UPDATE otis_sessions SET total_turns = COALESCE(total_turns, 0) + 1 WHERE session_id = ?",
+                    (session_id,)
+                )
                 db3.commit()
                 db3.close()
             except Exception:
@@ -932,9 +1081,151 @@ def process_command_rest(user):
             "success": True,
             "response": response_text,
             "session_id": session_id,
-            "timestamp": datetime.now().isoformat()
+            "timestamp": datetime.now().isoformat(),
+            "data_source": data_source,
+            "query_type": query_type,
+            "query_data": query_data,
         }), 200
 
     except Exception:
         logger.exception("[OTIS REST] Command processing failed")
         return jsonify({"success": False, "error": "Failed to process command"}), 500
+
+
+# ── Audio Transcription ────────────────────────────────────────────────────────
+
+@otis_bp.route("/transcribe", methods=["POST"])
+@require_otis
+def transcribe_audio(user):
+    """
+    POST /api/otis/transcribe
+    Multipart form: audio=<file>
+
+    Transcribes voice audio using the configured OTIS STT stack.
+    Prefers Deepgram and falls back through the service chain when needed.
+
+    Returns:
+        {"success": true, "text": "transcribed text", "provider": "deepgram|google|vosk|mock|gemini"}
+    """
+    if "audio" not in request.files:
+        return jsonify({"success": False, "error": "audio file required"}), 400
+
+    audio_file   = request.files["audio"]
+    mime_type    = audio_file.content_type or audio_file.mimetype or "audio/webm"
+    audio_bytes  = audio_file.read()
+
+    if len(audio_bytes) < 400:
+        return jsonify({"success": False, "error": "Audio too short — try again"}), 400
+
+    # ── Try the OTIS STT stack first ─────────────────────────────────────────
+    try:
+        import asyncio
+        import concurrent.futures
+        from services.deepgram_service import SpeechToTextService
+        stt = SpeechToTextService()
+
+        # asyncio.run() fails inside Flask-SocketIO (gevent patches the loop).
+        # Run in a fresh thread with its own event loop instead.
+        def _run_stt():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                return loop.run_until_complete(stt.transcribe(audio_bytes))
+            finally:
+                loop.close()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            result = ex.submit(_run_stt).result(timeout=15)
+
+        if result and result.text:
+            provider = getattr(getattr(result, "provider", None), "value", "unknown")
+            logger.info(
+                f"[OTIS Transcribe] {provider} OK: '{result.text[:60]}' "
+                f"(conf={getattr(result, 'confidence', 0):.2f})"
+            )
+            return jsonify({
+                "success":    True,
+                "text":       result.text,
+                "confidence": getattr(result, "confidence", 0.9),
+                "provider":   provider,
+            }), 200
+    except Exception as e:
+        logger.warning(f"[OTIS Transcribe] STT service failed, trying Gemini: {e}")
+
+    # ── Fallback: Gemini multimodal transcription ─────────────────────────────
+    try:
+        from services.gemini_service import gemini
+        text = gemini.transcribe_audio(audio_bytes, mime_type)
+        if text:
+            logger.info(f"[OTIS Transcribe] Gemini fallback OK: '{text[:60]}'")
+            return jsonify({"success": True, "text": text, "provider": "gemini"}), 200
+    except Exception as e:
+        logger.warning(f"[OTIS Transcribe] Gemini transcription failed: {e}")
+
+    return jsonify({"success": False, "error": "Could not transcribe audio"}), 422
+
+
+# ── Text-to-Speech ────────────────────────────────────────────────────────────
+
+@otis_bp.route("/speak", methods=["POST"])
+@require_otis
+def speak_text(user):
+    """
+    POST /api/otis/speak
+    Body: {"text": "Hello, I am Jarvis."}
+
+    Synthesises speech using the OTIS TTS stack and returns playable audio.
+
+    Returns:
+        audio/* binary  — on success
+        {"success": false, "error": "..."}  — on failure
+    """
+    from flask import Response
+    data = request.get_json(silent=True) or {}
+    text = data.get("text", "").strip()[:2000]
+
+    if not text:
+        return jsonify({"success": False, "error": "text is required"}), 400
+
+    try:
+        import asyncio
+        import concurrent.futures
+        from services.elevenlabs_voice_service import TextToSpeechService
+        tts = TextToSpeechService()
+
+        # asyncio.run() fails inside Flask-SocketIO (gevent patches the loop).
+        # Run in a fresh thread with its own event loop instead.
+        def _run_tts():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                return loop.run_until_complete(tts.speak(text))
+            finally:
+                loop.close()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            result = ex.submit(_run_tts).result(timeout=10)
+
+        if result and result.audio_data:
+            provider = getattr(getattr(result, "provider", None), "value", "unknown")
+            audio_format = (getattr(result, "audio_format", "") or "").lower()
+            mimetype = {
+                "mp3": "audio/mpeg",
+                "wav": "audio/wav",
+            }.get(audio_format, "application/octet-stream")
+
+            logger.info(f"[OTIS Speak] {provider} OK — {len(result.audio_data)} bytes")
+            return Response(
+                result.audio_data,
+                mimetype=mimetype,
+                headers={
+                    "Content-Length": str(len(result.audio_data)),
+                    "X-Provider":     provider,
+                    "Cache-Control":  "no-store",
+                },
+            )
+    except Exception as e:
+        logger.exception(f"[OTIS Speak] TTS failed: {e}")
+        return jsonify({"success": False, "error": "TTS synthesis failed"}), 500
+
+    return jsonify({"success": False, "error": "TTS returned no audio"}), 500

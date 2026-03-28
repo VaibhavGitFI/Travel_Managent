@@ -95,6 +95,9 @@ class _PGAdapter:
     def commit(self):
         self._conn.commit()
 
+    def rollback(self):
+        self._conn.rollback()
+
     def close(self):
         try:
             self._cur.close()
@@ -126,6 +129,16 @@ class _PGPoolAdapter(_PGAdapter):
             self._cur.close()
         except Exception:
             pass
+        # Roll back any uncommitted transaction before returning to pool.
+        # This prevents the "set_session cannot be used inside a transaction"
+        # error on the next getconn() call and avoids leaving dirty state.
+        try:
+            if self._conn.closed == 0:
+                import psycopg2.extensions as _ext
+                if self._conn.status not in (_ext.STATUS_READY,):
+                    self._conn.rollback()
+        except Exception:
+            pass
         try:
             self._pool.putconn(self._conn)
         except Exception:
@@ -134,41 +147,163 @@ class _PGPoolAdapter(_PGAdapter):
             except Exception:
                 pass
 
+    def rollback(self):
+        try:
+            self._conn.rollback()
+        except Exception:
+            pass
+
     def __exit__(self, exc_type, *args):
         if exc_type:
-            self._conn.rollback()
+            try:
+                self._conn.rollback()
+            except Exception:
+                pass
         self.close()
 
 
 _pg_pool = None
 _pg_pool_lock = __import__('threading').Lock()
+_pg_pool_last_failure = 0.0
+
+# Pool tuning: conservative defaults so Supabase session-mode poolers do not
+# reject the app during normal UI concurrency. Can be overridden by env vars.
+_PG_MINCONN = max(1, int(os.getenv("DB_POOL_MINCONN", "1")))
+_PG_MAXCONN = max(_PG_MINCONN, int(os.getenv("DB_POOL_MAXCONN", "4")))
+_PG_ACQUIRE_RETRIES = 3   # retries before giving up on pool
+_PG_ACQUIRE_BACKOFF = 0.1  # initial back-off seconds (doubles each retry)
+_PG_POOL_FAILURE_COOLDOWN = float(os.getenv("DB_POOL_FAILURE_COOLDOWN", "15"))
 
 
 def _get_pg_pool():
     """Get or create a PostgreSQL connection pool (lazy singleton)."""
-    global _pg_pool
+    global _pg_pool, _pg_pool_last_failure
     if _pg_pool is not None:
         return _pg_pool
     with _pg_pool_lock:
         if _pg_pool is not None:
             return _pg_pool
+        import time
+        if _pg_pool_last_failure and (time.time() - _pg_pool_last_failure) < _PG_POOL_FAILURE_COOLDOWN:
+            return None
         database_url = os.getenv("DATABASE_URL")
         if not database_url:
             return None
         try:
             from psycopg2 import pool as pg_pool
             _pg_pool = pg_pool.ThreadedConnectionPool(
-                minconn=2,
-                maxconn=10,
+                minconn=_PG_MINCONN,
+                maxconn=_PG_MAXCONN,
                 dsn=database_url,
             )
-            logger.info("[DB] PostgreSQL connection pool created (2-10 connections)")
+            logger.info(
+                "[DB] PostgreSQL connection pool created (%d-%d connections)",
+                _PG_MINCONN, _PG_MAXCONN,
+            )
+            _pg_pool_last_failure = 0.0
             return _pg_pool
         except ImportError:
             logger.warning("[DB] psycopg2 not installed — falling back to SQLite")
         except Exception as exc:
-            logger.error("[DB] PostgreSQL pool creation failed: %s — falling back to SQLite", exc)
+            _pg_pool_last_failure = time.time()
+            logger.error("[DB] PostgreSQL pool creation failed: %s — falling back to direct Supabase connection", exc)
     return None
+
+
+def _ensure_clean_pg_conn(conn, pool):
+    """
+    Make sure a psycopg2 connection is in a usable state before handing it
+    to a caller.
+
+    * If the connection is closed, discard it (put back with close=True).
+    * If the connection has a pending / errored transaction left over from a
+      previous use without a proper close, roll it back.
+
+    Returns True if the connection is healthy, False if it was discarded.
+    Never executes a query (to avoid opening a new transaction prematurely).
+    """
+    try:
+        import psycopg2.extensions as _ext
+        if conn.closed != 0:
+            try:
+                pool.putconn(conn, close=True)
+            except Exception:
+                pass
+            return False
+        # Roll back any leftover transaction without opening a new one
+        if conn.status not in (_ext.STATUS_READY, _ext.STATUS_IN_TRANSACTION):
+            # STATUS_INTRANS_INERROR or unknown — reset to ready
+            conn.rollback()
+        elif conn.status == _ext.STATUS_IN_TRANSACTION:
+            conn.rollback()
+    except Exception:
+        # If we can't even check, discard the connection
+        try:
+            pool.putconn(conn, close=True)
+        except Exception:
+            pass
+        return False
+    return True
+
+
+def _pool_getconn_with_retry(pool):
+    """
+    Acquire a connection from the pool with exponential-backoff retries.
+
+    On heavy load the pool may be momentarily exhausted.  Rather than
+    immediately raising (and returning a 500 to the client), we wait a
+    short time and retry up to _PG_ACQUIRE_RETRIES times.  If the pool
+    itself is broken (e.g. Supabase restarted) we recreate it once and
+    try again before giving up.
+    """
+    import time
+    global _pg_pool
+
+    last_exc = None
+    backoff = _PG_ACQUIRE_BACKOFF
+
+    for attempt in range(_PG_ACQUIRE_RETRIES):
+        try:
+            conn = pool.getconn()
+            # Ensure the connection is clean (no stale transaction, not closed).
+            # We check connection state without executing any SQL so we do not
+            # accidentally open a transaction before the caller is ready.
+            if not _ensure_clean_pg_conn(conn, pool):
+                raise Exception("Stale connection discarded — retrying")
+            return conn
+        except Exception as exc:
+            last_exc = exc
+            logger.warning(
+                "[DB] Pool getconn attempt %d/%d failed: %s — retrying in %.2fs",
+                attempt + 1, _PG_ACQUIRE_RETRIES, exc, backoff,
+            )
+            time.sleep(backoff)
+            backoff *= 2  # exponential back-off: 0.1 → 0.2 → 0.4 s
+
+            # Second-to-last attempt: try to recreate the pool in case it is broken.
+            if attempt == _PG_ACQUIRE_RETRIES - 2:
+                with _pg_pool_lock:
+                    database_url = os.getenv("DATABASE_URL")
+                    if database_url:
+                        try:
+                            from psycopg2 import pool as pg_pool_mod
+                            try:
+                                _pg_pool.closeall()
+                            except Exception:
+                                pass
+                            _pg_pool = pg_pool_mod.ThreadedConnectionPool(
+                                minconn=_PG_MINCONN,
+                                maxconn=_PG_MAXCONN,
+                                dsn=database_url,
+                            )
+                            pool = _pg_pool
+                            logger.info("[DB] PostgreSQL pool recreated after failure")
+                        except Exception as recreate_exc:
+                            logger.error("[DB] Pool recreation failed: %s", recreate_exc)
+
+    raise RuntimeError(
+        f"Supabase PostgreSQL connection failed after {_PG_ACQUIRE_RETRIES} attempts: {last_exc}"
+    ) from last_exc
 
 
 def table_columns(db, table: str) -> set:
@@ -187,15 +322,22 @@ def table_columns(db, table: str) -> set:
 def get_db():
     """Return a database connection. Uses Supabase PostgreSQL when DATABASE_URL is set.
     Falls back to SQLite only when no DATABASE_URL is configured (local dev without Supabase).
+
+    The pool is acquired with retry + exponential backoff so that transient
+    exhaustion under heavy load does not immediately surface as a 500 error.
+    If the pool is unrecoverable a direct connection is attempted as a final
+    fallback before raising.
     """
     database_url = os.getenv("DATABASE_URL")
     if database_url:
         pool = _get_pg_pool()
         if pool:
             try:
-                conn = pool.getconn()
+                conn = _pool_getconn_with_retry(pool)
                 conn.autocommit = False
                 return _PGPoolAdapter(conn, pool)
+            except RuntimeError:
+                raise
             except Exception as exc:
                 logger.error("[DB] Supabase pool getconn failed: %s", exc)
                 raise RuntimeError(f"Supabase PostgreSQL connection failed: {exc}") from exc
@@ -210,7 +352,7 @@ def get_db():
             logger.error("[DB] Direct Supabase connection also failed: %s", exc)
             raise RuntimeError(f"Cannot connect to Supabase: {exc}") from exc
 
-    # No DATABASE_URL — local dev only
+    # No DATABASE_URL — local dev / tests use SQLite
     db = sqlite3.connect(DB_PATH)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA foreign_keys = ON")
@@ -555,7 +697,7 @@ def _create_tables(c, pg=None):
         admin_only              INTEGER DEFAULT 1,
 
         wake_word               TEXT DEFAULT 'Hey Otis',
-        voice_id                TEXT DEFAULT 'en-IN-female',
+        voice_id                TEXT DEFAULT 'en-IN-male',
         voice_speed             REAL DEFAULT 1.0,
         voice_pitch             REAL DEFAULT 1.0,
 
@@ -564,6 +706,8 @@ def _create_tables(c, pg=None):
 
         max_session_duration    INTEGER DEFAULT 600,
         idle_timeout_seconds    INTEGER DEFAULT 30,
+
+        settings_json           TEXT DEFAULT '{{}}',
 
         created_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -746,6 +890,9 @@ def _apply_migrations_pg(db):
     _add_col("organizations", "features_json", "TEXT DEFAULT '{}'")
     _add_col("organizations", "notes",         "TEXT")
 
+    # otis_settings — flexible JSON blob for custom per-user settings
+    _add_col("otis_settings", "settings_json", "TEXT DEFAULT '{}'")
+
     # Sync full_name from name for existing users
     db.execute("UPDATE users SET full_name = name WHERE full_name IS NULL OR full_name = ''")
     rows = db.execute("SELECT id, name FROM users WHERE avatar_initials IS NULL OR avatar_initials = ''").fetchall()
@@ -841,6 +988,9 @@ def _apply_migrations(db, c):
     _add_col("organizations", "status",        "TEXT DEFAULT 'active'")
     _add_col("organizations", "features_json", "TEXT DEFAULT '{}'")
     _add_col("organizations", "notes",         "TEXT")
+
+    # otis_settings — flexible JSON blob for custom per-user settings
+    _add_col("otis_settings", "settings_json", "TEXT DEFAULT '{}'")
 
     # Sync full_name from name for existing users
     c.execute("""

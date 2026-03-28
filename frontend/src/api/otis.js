@@ -206,3 +206,43 @@ export const sendOtisCommand = (socket, sessionId, command) => {
 export const stopOtisWebSocket = (socket, sessionId) => {
   socket.emit('otis:stop_session', { session_id: sessionId })
 }
+
+// ── Voice I/O (Deepgram STT + ElevenLabs TTS) ────────────────────────────────
+
+/**
+ * Transcribe a voice audio blob using Deepgram (falls back to Gemini).
+ * Mirrors the Chat page transcribeAudio pattern.
+ * @param {Blob} audioBlob - Recorded audio blob (webm/ogg/mp4)
+ * @returns {Promise<{success: boolean, text: string, provider: string}>}
+ */
+export const transcribeOtisAudio = async (audioBlob) => {
+  const formData = new FormData()
+  formData.append('audio', audioBlob, 'voice.webm')
+  const { data } = await client.post('/otis/transcribe', formData, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+  })
+  return data
+}
+
+/**
+ * Synthesise text to speech using ElevenLabs (Indian English voice).
+ * Returns an audio Blob (audio/mpeg) ready for playback, or null on failure.
+ * @param {string} text - Text to speak
+ * @returns {Promise<Blob|null>}
+ */
+export const otisSpeak = async (text) => {
+  try {
+    const response = await client.post(
+      '/otis/speak',
+      { text },
+      { responseType: 'blob' },
+    )
+    // Verify we got audio back (not a JSON error blob)
+    if (response.data && response.data.type && response.data.type.includes('audio')) {
+      return response.data
+    }
+    return null
+  } catch {
+    return null
+  }
+}

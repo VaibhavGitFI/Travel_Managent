@@ -1,4 +1,4 @@
-import client from './client'
+import client, { getCsrfToken } from './client'
 
 // ── Session CRUD ──────────────────────────────────────────────────────────────
 
@@ -65,7 +65,13 @@ export const sendStreamingMessage = async (message, context = {}, onToken, onDon
   const baseURL = '/api'
   const headers = { 'Content-Type': 'application/json' }
   const token = getAccessToken()
-  if (token) headers['Authorization'] = `Bearer ${token}`
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`
+  } else {
+    // No JWT in memory — cookie/session auth is active; must include CSRF token
+    const csrf = getCsrfToken()
+    if (csrf) headers['X-CSRF-Token'] = csrf
+  }
 
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), 90000)

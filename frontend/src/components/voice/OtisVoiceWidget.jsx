@@ -6,63 +6,134 @@ import {
   startOtisSession,
   stopOtisSession,
   sendOtisCommandRest,
+  transcribeOtisAudio,
+  otisSpeak,
 } from '../../api/otis'
 import useStore from '../../store/useStore'
 
+// ── State machine ──────────────────────────────────────────────────────────────
 const S = {
-  IDLE: 'idle',
+  IDLE:       'idle',
   CONNECTING: 'connecting',
-  READY: 'ready',        // continuously listening for wake phrase
-  LISTENING: 'listening',
+  READY:      'ready',
+  LISTENING:  'listening',
   PROCESSING: 'processing',
-  SPEAKING: 'speaking',
-  ERROR: 'error',
-}
-
-const WAKE_PHRASES = ['hey otis', 'hey jarvis', 'otis']
-
-// Orb visual config per state
-const ORB = {
-  [S.IDLE]:       { grad: 'radial-gradient(circle at 35% 30%, #60a5fa, #1d4ed8 55%, #0f172a)', glow: 'rgba(59,130,246,0.25)', dur: '3s', anim: 'ot-breathe' },
-  [S.CONNECTING]: { grad: 'radial-gradient(circle at 35% 30%, #94a3b8, #475569 55%, #0f172a)', glow: 'rgba(148,163,184,0.2)', dur: '1s', anim: 'ot-breathe' },
-  [S.READY]:      { grad: 'radial-gradient(circle at 35% 30%, #34d399, #059669 55%, #064e3b)', glow: 'rgba(52,211,153,0.18)', dur: '4s', anim: 'ot-breathe' },
-  [S.LISTENING]:  { grad: 'radial-gradient(circle at 30% 30%, rgba(96,165,250,0.95), transparent 52%), radial-gradient(circle at 72% 28%, rgba(167,139,250,0.9), transparent 52%), radial-gradient(circle at 50% 78%, rgba(244,114,182,0.85), transparent 48%), #0f0a2e', glow: 'rgba(167,139,250,0.45)', dur: '0.55s', anim: 'ot-listen' },
-  [S.PROCESSING]: { grad: 'radial-gradient(circle at 28% 28%, rgba(251,191,36,0.95), transparent 52%), radial-gradient(circle at 72% 28%, rgba(251,146,60,0.9), transparent 52%), radial-gradient(circle at 50% 78%, rgba(239,68,68,0.7), transparent 48%), #1a0800', glow: 'rgba(251,191,36,0.35)', dur: '0.9s', anim: 'ot-spin' },
-  [S.SPEAKING]:   { grad: 'radial-gradient(circle at 30% 30%, rgba(52,211,153,0.95), transparent 52%), radial-gradient(circle at 70% 30%, rgba(96,165,250,0.85), transparent 52%), radial-gradient(circle at 50% 78%, rgba(167,139,250,0.75), transparent 48%), #021a14', glow: 'rgba(52,211,153,0.4)', dur: '0.7s', anim: 'ot-speak' },
-  [S.ERROR]:      { grad: 'radial-gradient(circle at 35% 30%, #f87171, #dc2626 55%, #450a0a)', glow: 'rgba(248,113,113,0.3)', dur: '2s', anim: 'ot-breathe' },
+  SPEAKING:   'speaking',
+  ERROR:      'error',
 }
 
 const LABEL = {
-  [S.IDLE]:       'Initializing…',
+  [S.IDLE]:       'Say "Hey Jarvis" or tap the mic',
   [S.CONNECTING]: 'Connecting…',
-  [S.READY]:      'Say "Hey Otis" or tap orb',
+  [S.READY]:      'Hey, I am Jarvis. How can I help?',
   [S.LISTENING]:  'Listening…',
   [S.PROCESSING]: 'Thinking…',
   [S.SPEAKING]:   'Speaking…',
-  [S.ERROR]:      'Error — tap to retry',
+  [S.ERROR]:      'Something went wrong — tap to retry',
 }
 
-export default function OtisVoiceWidget({ onClose }) {
-  useStore()
-  const [state, setState] = useState(S.IDLE)
-  const [sessionId, setSessionId] = useState(null)
-  const [transcript, setTranscript] = useState('')
-  const [response, setResponse] = useState('')
-  const [history, setHistory] = useState([])
-  const [showHistory, setShowHistory] = useState(false)
-  const [inputText, setInputText] = useState('')
-  const [wakeLog, setWakeLog] = useState('wake: idle')  // visible debug line
+// ── Audio MIME type detection (same as Chat page) ─────────────────────────────
+const AUDIO_MIME_TYPES = [
+  'audio/webm;codecs=opus', 'audio/webm',
+  'audio/ogg;codecs=opus',  'audio/ogg',
+  'audio/mp4',
+]
+function getSupportedMimeType() {
+  if (typeof MediaRecorder === 'undefined') return null
+  for (const mime of AUDIO_MIME_TYPES) {
+    if (MediaRecorder.isTypeSupported(mime)) return mime
+  }
+  return null
+}
 
-  const recognitionRef = useRef(null)
-  const wakeRecRef = useRef(null)
-  const wakeActiveRef = useRef(false)   // true = we WANT wake listening right now
-  const stateRef = useRef(S.IDLE)
-  const sessionIdRef = useRef(null)
-  const historyEndRef = useRef(null)
+// ── Browser TTS voice picker (fallback when ElevenLabs unavailable) ───────────
+const VOICE_PRIORITY = [
+  v => v.name === 'Google UK English Male',
+  v => v.name === 'Daniel',
+  v => v.name === 'Microsoft George - English (United Kingdom)',
+  v => v.name === 'Microsoft David - English (United States)',
+  v => v.name === 'Alex',
+  v => v.name.toLowerCase().includes('daniel'),
+  v => v.name.toLowerCase().includes('david'),
+  v => v.lang === 'en-GB',
+  v => v.lang === 'en-US',
+  v => v.lang.startsWith('en'),
+]
+function pickFallbackVoice() {
+  const voices = window.speechSynthesis?.getVoices?.() || []
+  for (const test of VOICE_PRIORITY) {
+    const v = voices.find(test)
+    if (v) return v
+  }
+  return null
+}
+
+// ── Waveform bar helpers ───────────────────────────────────────────────────────
+function getBarColor(state, i, isDark) {
+  if (state === S.IDLE)       return isDark ? 'rgba(255,255,255,0.18)' : '#cbd5e1'
+  if (state === S.CONNECTING) return 'rgba(119,141,169,0.6)'
+  if (state === S.READY)      return isDark ? 'rgba(76,201,240,0.3)' : 'rgba(26,86,219,0.4)'
+  if (state === S.ERROR)      return 'rgba(239,68,68,0.5)'
+  if (state === S.PROCESSING) return isDark ? '#fbbf24' : '#d97706'
+  if (state === S.LISTENING) {
+    if (i < 4)  return '#1a56db'
+    if (i < 8)  return '#0ea5e9'
+    if (i < 12) return '#4CC9F0'
+    if (i < 16) return '#059669'
+    if (i < 20) return '#10b981'
+    if (i < 24) return '#a78bfa'
+    return '#1a56db'
+  }
+  if (state === S.SPEAKING) {
+    if (i < 7)  return '#0ea5e9'
+    if (i < 14) return '#4CC9F0'
+    if (i < 21) return '#059669'
+    return '#1a56db'
+  }
+  return isDark ? 'rgba(255,255,255,0.18)' : '#cbd5e1'
+}
+function barDuration(i) {
+  return `${(0.4 + (i % 7) * 0.043).toFixed(3)}s`
+}
+
+// ── Component ──────────────────────────────────────────────────────────────────
+export default function OtisVoiceWidget({ onClose, autoStart = false, entryMode = 'manual' }) {
+  const { theme } = useStore()
+  const isDark = theme === 'dark'
+
+  // ── State (exact same names as original) ────────────────────────────────────
+  const [state, setState]           = useState(S.IDLE)
+  const [sessionId, setSessionId]   = useState(null)
+  const [transcript, setTranscript] = useState('')
+  const [response, setResponse]     = useState('')
+  const [history, setHistory]       = useState([])
+  const [showHistory, setShowHistory] = useState(false)
+  const [inputText, setInputText]   = useState('')
+
+  // ── Refs — originals (unchanged) ────────────────────────────────────────────
+  const stateRef       = useRef(S.IDLE)
+  const sessionIdRef   = useRef(null)
+  const historyEndRef  = useRef(null)
+
+  // ── Refs — new (MediaRecorder + ElevenLabs) ──────────────────────────────────
+  const mediaRecRef     = useRef(null)   // MediaRecorder instance
+  const chunksRef       = useRef([])     // audio data chunks
+  const streamRef       = useRef(null)   // MediaStream
+  const analyserRef     = useRef(null)   // { audioCtx, analyser }
+  const animFrameRef    = useRef(null)   // requestAnimationFrame id
+  const silenceTimerRef = useRef(null)   // silence timeout id
+  const audioRef        = useRef(null)   // HTMLAudioElement (ElevenLabs playback)
+  const cancelledRef    = useRef(false)  // true = user manually stopped → discard audio
+  const bootedRef       = useRef(false)
+  const cleanupTimerRef = useRef(null)
+  const autoListenPendingRef = useRef(Boolean(autoStart))
+  const followUpPendingRef = useRef(false)
+  const followUpTimerRef = useRef(null)
 
   // Keep refs in sync
-  useEffect(() => { stateRef.current = state }, [state])
+  useEffect(() => { stateRef.current = state },       [state])
   useEffect(() => { sessionIdRef.current = sessionId }, [sessionId])
+  useEffect(() => { autoListenPendingRef.current = Boolean(autoStart) }, [autoStart])
 
   // Auto-scroll history
   useEffect(() => {
@@ -71,580 +142,651 @@ export default function OtisVoiceWidget({ onClose }) {
 
   // Bootstrap session on mount, clean up on unmount
   useEffect(() => {
-    initSession()
+    if (cleanupTimerRef.current) {
+      clearTimeout(cleanupTimerRef.current)
+      cleanupTimerRef.current = null
+    }
+
+    if (!bootedRef.current) {
+      bootedRef.current = true
+      initSession()
+    }
+
     return () => {
-      stopListening()
-      stopWakeListening()
-      if (window.speechSynthesis) window.speechSynthesis.cancel()
-      if (sessionIdRef.current) {
-        stopOtisSession(sessionIdRef.current).catch(() => {})
-      }
+      // Delay destructive cleanup by one tick so React StrictMode's
+      // dev-only mount/unmount simulation does not double-start OTIS.
+      cleanupTimerRef.current = setTimeout(() => {
+        bootedRef.current = false
+        followUpPendingRef.current = false
+        if (followUpTimerRef.current) {
+          clearTimeout(followUpTimerRef.current)
+          followUpTimerRef.current = null
+        }
+        stopListening(true)
+        stopAudio()
+        if (window.speechSynthesis) window.speechSynthesis.cancel()
+        if (sessionIdRef.current) stopOtisSession(sessionIdRef.current).catch(() => {})
+      }, 0)
     }
-  }, [])
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Start/stop background wake-word listening whenever state changes
-  useEffect(() => {
-    console.log('[OTIS Wake] state =>', state)
-    if (state === S.READY) {
-      wakeActiveRef.current = true          // mark as wanted
-      const t = setTimeout(startWakeListening, 400)
-      return () => clearTimeout(t)
-    } else {
-      stopWakeListening()                   // also sets wakeActiveRef = false
-    }
-  }, [state]) // eslint-disable-line react-hooks/exhaustive-deps
-
+  // ── Session init ─────────────────────────────────────────────────────────────
   const initSession = async () => {
     setState(S.CONNECTING)
     try {
-      const status = await getOtisStatus()
-      if (!status.available) {
-        toast.error(status.reason || 'OTIS unavailable')
-        setState(S.ERROR)
-        return
-      }
       const session = await startOtisSession()
+      const welcome = 'Hey, I am Jarvis. How can I help?'
       setSessionId(session.session_id)
       setState(S.READY)
-      setResponse("Hi! I'm OTIS. How can I help?")
-      speakAndReturn("Hi! I'm OTIS. How can I help?")
+      setTranscript('')
+      setResponse(welcome)
+      speakAndReturn(welcome)
     } catch {
+      try {
+        const status = await getOtisStatus()
+        toast.error(status.reason || 'Jarvis unavailable')
+      } catch {
+        toast.error('Jarvis unavailable')
+      }
       setState(S.ERROR)
     }
   }
 
-  // ── Wake word (continuous background listener) ────────────────────────────
-
-  const stopWakeListening = () => {
-    wakeActiveRef.current = false          // tell onend NOT to restart
-    if (wakeRecRef.current) {
-      try { wakeRecRef.current.stop() } catch {}
-      wakeRecRef.current = null
+  // ── ElevenLabs audio helpers ─────────────────────────────────────────────────
+  const stopAudio = () => {
+    if (audioRef.current) {
+      try { audioRef.current.pause() } catch {}
+      audioRef.current = null
     }
   }
 
-  const startWakeListening = () => {
-    const tag = `[OTIS Wake] startWakeListening — wakeActive:${wakeActiveRef.current} running:${!!wakeRecRef.current}`
-    console.log(tag)
-    setWakeLog(tag)
+  // ── MediaRecorder helpers ────────────────────────────────────────────────────
+  /**
+   * stopListening — halt any active recording.
+   * @param {boolean} cancel  true = discard audio (user clicked stop)
+   *                          false = process audio (silence detected)
+   */
+  const stopListening = useCallback((cancel = false) => {
+    cancelledRef.current = cancel
+    if (animFrameRef.current)    { cancelAnimationFrame(animFrameRef.current); animFrameRef.current = null }
+    if (silenceTimerRef.current) { clearTimeout(silenceTimerRef.current); silenceTimerRef.current = null }
+    if (mediaRecRef.current) {
+      try {
+        if (mediaRecRef.current.state === 'recording') mediaRecRef.current.stop()
+      } catch {}
+    }
+  }, [])
 
-    if (!wakeActiveRef.current) { setWakeLog('wake: skipped (not wanted)'); return }
-    if (wakeRecRef.current)     { setWakeLog('wake: skipped (already running)'); return }
+  /**
+   * startListening — record mic audio → Deepgram transcription → processCommand.
+   * Silence detection auto-stops after 1.8 s of quiet (same threshold as Chat page).
+   */
+  const startListening = useCallback(async () => {
+    if ([S.LISTENING, S.PROCESSING, S.CONNECTING].includes(stateRef.current)) return
+    autoListenPendingRef.current = false
+    followUpPendingRef.current = false
+    if (followUpTimerRef.current) {
+      clearTimeout(followUpTimerRef.current)
+      followUpTimerRef.current = null
+    }
 
-    const SR = window.SpeechRecognition || window.webkitSpeechRecognition
-    if (!SR) {
-      const msg = 'wake: SpeechRecognition NOT supported in this browser'
-      console.warn('[OTIS Wake]', msg)
-      setWakeLog(msg)
+    const mimeType = getSupportedMimeType()
+    if (!mimeType) {
+      toast.error('Voice recording not supported in this browser')
       return
     }
 
-    const rec = new SR()
-    rec.continuous = true
-    rec.interimResults = true
-    rec.lang = 'en-IN'
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+        video: false,
+      })
+      streamRef.current = stream
 
-    rec.onstart = () => {
-      console.log('[OTIS Wake] 👂 mic open — say "Hey Otis"')
-      setWakeLog('wake: 👂 listening — say "Hey Otis"')
-    }
+      // AudioContext for silence detection
+      const audioCtx  = new (window.AudioContext || window.webkitAudioContext)()
+      const source    = audioCtx.createMediaStreamSource(stream)
+      const analyser  = audioCtx.createAnalyser()
+      analyser.fftSize              = 512
+      analyser.smoothingTimeConstant = 0.3
+      source.connect(analyser)
+      analyserRef.current = { audioCtx, analyser }
 
-    rec.onresult = (e) => {
-      for (let i = e.resultIndex; i < e.results.length; i++) {
-        const isFinal = e.results[i].isFinal
-        const text = e.results[i][0].transcript.toLowerCase().trim()
-        console.log(`[OTIS Wake] heard (${isFinal ? 'final' : 'interim'}): "${text}"`)
-        setWakeLog(`wake: heard → "${text}"`)
-        if (WAKE_PHRASES.some(p => text.includes(p))) {
-          console.log('[OTIS Wake] ✅ WAKE PHRASE DETECTED — activating!')
-          setWakeLog('wake: ✅ wake phrase detected — activating!')
-          stopWakeListening()
-          setTimeout(() => {
-            if (stateRef.current === S.READY) startListening()
-          }, 250)
-          break
+      chunksRef.current  = []
+      cancelledRef.current = false
+      const recorder = new MediaRecorder(stream, { mimeType })
+
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) chunksRef.current.push(e.data)
+      }
+
+      recorder.onstop = async () => {
+        // Clean up stream + audio context
+        stream.getTracks().forEach(t => t.stop())
+        streamRef.current = null
+        if (analyserRef.current) {
+          analyserRef.current.audioCtx.close().catch(() => {})
+          analyserRef.current = null
+        }
+        if (animFrameRef.current)    { cancelAnimationFrame(animFrameRef.current); animFrameRef.current = null }
+        if (silenceTimerRef.current) { clearTimeout(silenceTimerRef.current); silenceTimerRef.current = null }
+        mediaRecRef.current = null
+
+        // User clicked cancel — discard
+        if (cancelledRef.current) {
+          cancelledRef.current = false
+          if (stateRef.current === S.LISTENING) setState(S.READY)
+          return
+        }
+
+        // Too short — ignore
+        const blob = new Blob(chunksRef.current, { type: mimeType })
+        if (blob.size < 250) {
+          setResponse("I didn't catch that. Please ask again.")
+          if (stateRef.current === S.LISTENING) setState(S.READY)
+          return
+        }
+
+        setState(S.PROCESSING)
+
+        // ── Deepgram STT via backend ──────────────────────────────────────────
+        try {
+          const result = await transcribeOtisAudio(blob)
+          if (result.success && result.text) {
+            setTranscript(result.text)
+            processCommand(result.text, { fromVoice: true })
+          } else {
+            toast.error(result.error || 'Could not understand audio')
+            setResponse("I couldn't understand that clearly. Please try again.")
+            setState(S.READY)
+          }
+        } catch {
+          toast.error('Transcription failed — please try again')
+          setResponse('I had trouble hearing that. Please try again.')
+          setState(S.READY)
         }
       }
-    }
 
-    rec.onerror = (e) => {
-      console.warn('[OTIS Wake] error:', e.error)
-      setWakeLog(`wake: error — ${e.error}`)
-      wakeRecRef.current = null
-      if (e.error !== 'not-allowed' && wakeActiveRef.current) {
-        setTimeout(startWakeListening, 1000)
+      recorder.onerror = () => {
+        stream.getTracks().forEach(t => t.stop())
+        streamRef.current = null
+        mediaRecRef.current = null
+        if (stateRef.current === S.LISTENING) setState(S.READY)
+        toast.error('Recording failed')
       }
-    }
 
-    rec.onend = () => {
-      console.log('[OTIS Wake] ended — wakeActive:', wakeActiveRef.current)
-      setWakeLog(`wake: ended (wantRestart:${wakeActiveRef.current})`)
-      wakeRecRef.current = null
-      if (wakeActiveRef.current) {
-        setTimeout(startWakeListening, 300)
-      }
-    }
-
-    wakeRecRef.current = rec
-    try {
-      rec.start()
-      console.log('[OTIS Wake] rec.start() called')
-      setWakeLog('wake: starting…')
-    } catch (err) {
-      console.error('[OTIS Wake] failed to start:', err)
-      setWakeLog(`wake: failed to start — ${err}`)
-      wakeRecRef.current = null
-    }
-  }
-
-  // ── Voice input ─────────────────────────────────────────────────────────────
-
-  const startListening = useCallback(() => {
-    if (stateRef.current === S.LISTENING || stateRef.current === S.PROCESSING || stateRef.current === S.CONNECTING) return
-    stopWakeListening()  // release mic before command capture (no-op if not running)
-
-    const SR = window.SpeechRecognition || window.webkitSpeechRecognition
-    if (!SR) {
-      toast.error('Speech recognition not supported in this browser')
-      return
-    }
-
-    const rec = new SR()
-    rec.continuous = false
-    rec.interimResults = true
-    rec.lang = 'en-IN'
-    rec.maxAlternatives = 1
-
-    rec.onstart = () => {
+      mediaRecRef.current = recorder
+      recorder.start(200)      // collect chunks every 200 ms
       setState(S.LISTENING)
       setTranscript('')
-    }
 
-    rec.onresult = (e) => {
-      let interim = ''
-      let final = ''
-      for (let i = e.resultIndex; i < e.results.length; i++) {
-        const t = e.results[i][0].transcript
-        if (e.results[i].isFinal) final += t
-        else interim += t
+      // ── Silence detection ─────────────────────────────────────────────────
+      const dataArr   = new Uint8Array(analyser.frequencyBinCount)
+      let silentSince = 0
+      let heardSpeech = false
+      const startedAt = Date.now()
+
+      const checkSilence = () => {
+        if (!mediaRecRef.current || mediaRecRef.current.state !== 'recording') return
+        if (Date.now() - startedAt > 60000) { stopListening(); return }   // 60 s max
+        analyser.getByteFrequencyData(dataArr)
+        const avg = dataArr.reduce((s, v) => s + v, 0) / dataArr.length
+        if (avg >= 18) {
+          heardSpeech = true
+          silentSince = 0
+        } else if (!heardSpeech) {
+          if (Date.now() - startedAt > 8000) { stopListening(); return }
+        } else {
+          if (!silentSince) silentSince = Date.now()
+          else if (Date.now() - silentSince > 2200) { stopListening(); return }
+        }
+        animFrameRef.current = requestAnimationFrame(checkSilence)
       }
-      setTranscript(final || interim)
-      if (final) {
-        recognitionRef.current = null
-        processCommand(final)
-      }
+
+      // Give the microphone a moment to stabilize before evaluating silence.
+      silenceTimerRef.current = setTimeout(
+        () => { animFrameRef.current = requestAnimationFrame(checkSilence) },
+        1200,
+      )
+
+    } catch (err) {
+      if ([S.LISTENING, S.CONNECTING].includes(stateRef.current)) setState(S.READY)
+      toast.error(err.name === 'NotAllowedError' ? 'Mic access denied' : 'Could not access microphone')
     }
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
-    rec.onerror = (e) => {
-      if (e.error !== 'no-speech' && e.error !== 'aborted') {
-        toast.error(`Mic error: ${e.error}`)
-      }
-      if (stateRef.current === S.LISTENING) setState(S.READY)
-    }
-
-    rec.onend = () => {
-      if (stateRef.current === S.LISTENING) setState(S.READY)
-    }
-
-    recognitionRef.current = rec
-    try { rec.start() } catch { setState(S.READY) }
-  }, [])
-
-  const stopListening = () => {
-    if (recognitionRef.current) {
-      try { recognitionRef.current.stop() } catch {}
-      recognitionRef.current = null
-    }
-  }
-
-  // ── Command processing ──────────────────────────────────────────────────────
-
-  const processCommand = useCallback(async (command) => {
+  // ── Command processing ───────────────────────────────────────────────────────
+  const processCommand = useCallback(async (command, { fromVoice = false } = {}) => {
     if (!command.trim()) return
-    stopListening()
+    const userText = command.trim()
     setState(S.PROCESSING)
-    setTranscript(command)
+    setTranscript(userText)
     setResponse('')
+    setHistory(h => [...h, { role: 'user', text: userText }])
 
     try {
-      const result = await sendOtisCommandRest(command, sessionIdRef.current)
-      const text = result.response || 'Done.'
+      const result = await sendOtisCommandRest(userText, sessionIdRef.current)
+      const text   = result.response || 'Done.'
+      if (result.session_id && result.session_id !== sessionIdRef.current) {
+        setSessionId(result.session_id)
+      }
+      followUpPendingRef.current = fromVoice
       setResponse(text)
-      setHistory(h => [...h, { role: 'user', text: command }, { role: 'assistant', text }])
+      setHistory(h => [...h, { role: 'assistant', text }])
       speakAndReturn(text)
     } catch (err) {
-      console.error('[OTIS] Command failed:', err)
+      console.error('[Jarvis] Command failed:', err)
       const errText = 'Sorry, something went wrong. Please try again.'
+      followUpPendingRef.current = false
       setResponse(errText)
+      setHistory(h => [...h, { role: 'assistant', text: errText }])
       setState(S.READY)
-      toast.error('OTIS command failed')
+      toast.error('Jarvis command failed')
     }
-  }, [])
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
-  const speakAndReturn = (text) => {
+  /**
+   * speakAndReturn — ElevenLabs TTS first, browser SpeechSynthesis as fallback.
+   */
+  const speakAndReturn = useCallback(async (text) => {
     setState(S.SPEAKING)
-    if (!('speechSynthesis' in window)) {
+    stopAudio()
+
+    // Safety net: never stay SPEAKING longer than 12 s — catches TTS hangs
+    const safetyTimer = setTimeout(() => {
+      if (stateRef.current === S.SPEAKING) {
+        const shouldAutoStart = autoListenPendingRef.current
+        const shouldFollowUp = followUpPendingRef.current
+        setState(S.READY)
+        if (shouldAutoStart || shouldFollowUp) {
+          followUpTimerRef.current = setTimeout(() => {
+            autoListenPendingRef.current = false
+            followUpPendingRef.current = false
+            followUpTimerRef.current = null
+            startListening()
+          }, shouldFollowUp ? 650 : 250)
+        }
+      }
+    }, 12000)
+
+    // Auto-start only once when the widget was opened by the wake word.
+    // Follow-up listening only continues after a voice-originated turn.
+    const done = () => {
+      const shouldAutoStart = autoListenPendingRef.current
+      const shouldFollowUp = followUpPendingRef.current
+      clearTimeout(safetyTimer)
       setState(S.READY)
-      setTimeout(startListening, 500)
+      if (shouldAutoStart || shouldFollowUp) {
+        if (followUpTimerRef.current) clearTimeout(followUpTimerRef.current)
+        followUpTimerRef.current = setTimeout(() => {
+          autoListenPendingRef.current = false
+          followUpPendingRef.current = false
+          followUpTimerRef.current = null
+          startListening()
+        }, shouldFollowUp ? 650 : 250)
+      }
+    }
+
+    // ── Try ElevenLabs via backend API ────────────────────────────────────────
+    try {
+      const audioBlob = await otisSpeak(text)
+      if (audioBlob) {
+        const url   = URL.createObjectURL(audioBlob)
+        const audio = new Audio(url)
+        audioRef.current = audio
+
+        audio.onended = () => { URL.revokeObjectURL(url); audioRef.current = null; done() }
+        audio.onerror = () => { URL.revokeObjectURL(url); audioRef.current = null; done() }
+        await audio.play()
+        return   // ElevenLabs handled — done
+      }
+    } catch (err) {
+      console.warn('[Jarvis] ElevenLabs TTS failed, using browser fallback:', err)
+    }
+
+    // ── Fallback: browser SpeechSynthesis ─────────────────────────────────────
+    if (!('speechSynthesis' in window)) {
+      done()
       return
     }
     window.speechSynthesis.cancel()
-    const utt = new SpeechSynthesisUtterance(text)
-    utt.lang = 'en-IN'
-    utt.rate = 1.05
-    utt.pitch = 1.0
-    utt.onend = () => {
-      setState(S.READY)
-      setTimeout(startListening, 600)
-    }
-    utt.onerror = () => {
-      setState(S.READY)
-      setTimeout(startListening, 600)
-    }
-    window.speechSynthesis.speak(utt)
-  }
 
-  // ── Text input fallback ─────────────────────────────────────────────────────
+    const doSpeak = () => {
+      const utt   = new SpeechSynthesisUtterance(text)
+      const voice = pickFallbackVoice()
+      if (voice) utt.voice = voice
+      utt.lang   = voice?.lang || 'en-GB'
+      utt.rate   = 0.95
+      utt.pitch  = 0.85
+      utt.volume = 1.0
+      utt.onend  = done
+      utt.onerror = done
+      window.speechSynthesis.speak(utt)
+    }
 
+    const voices = window.speechSynthesis.getVoices()
+    if (voices.length > 0) {
+      doSpeak()
+    } else {
+      // Voices not yet loaded — wait with a 2 s fallback so we're never stuck
+      const voiceTimer = setTimeout(() => {
+        window.speechSynthesis.onvoiceschanged = null
+        done()  // voices never loaded — skip TTS, just go READY
+      }, 2000)
+      window.speechSynthesis.onvoiceschanged = () => {
+        clearTimeout(voiceTimer)
+        window.speechSynthesis.onvoiceschanged = null
+        doSpeak()
+      }
+    }
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Text input fallback ──────────────────────────────────────────────────────
   const handleSend = () => {
     const cmd = inputText.trim()
     if (!cmd) return
     setInputText('')
-    processCommand(cmd)
+    processCommand(cmd, { fromVoice: false })
   }
 
-  // ── Orb click ───────────────────────────────────────────────────────────────
-
-  const handleOrbClick = () => {
-    if (state === S.ERROR) { initSession(); return }
-    if (state === S.LISTENING) { stopListening(); setState(S.READY); return }
-    if (state === S.READY) { startListening(); return }
-    if (state === S.SPEAKING) {
+  // ── Waveform click (error → retry, listening → cancel, ready → start mic) ──
+  const handleWaveformClick = () => {
+    if (state === S.ERROR)     { initSession(); return }
+    if (state === S.LISTENING) { stopListening(true); return }   // cancel, discard
+    if (state === S.READY)     { startListening(); return }
+    if (state === S.SPEAKING)  {
+      followUpPendingRef.current = false
+      if (followUpTimerRef.current) {
+        clearTimeout(followUpTimerRef.current)
+        followUpTimerRef.current = null
+      }
+      stopAudio()
       window.speechSynthesis?.cancel()
       setState(S.READY)
       setTimeout(startListening, 300)
     }
   }
 
-  // ── Close ───────────────────────────────────────────────────────────────────
-
+  // ── Close ─────────────────────────────────────────────────────────────────────
   const handleClose = async () => {
-    stopListening()
+    followUpPendingRef.current = false
+    if (followUpTimerRef.current) {
+      clearTimeout(followUpTimerRef.current)
+      followUpTimerRef.current = null
+    }
+    stopListening(true)
+    stopAudio()
     window.speechSynthesis?.cancel()
     if (sessionId) stopOtisSession(sessionId).catch(() => {})
     onClose()
   }
 
-  const orb = ORB[state] || ORB[S.IDLE]
-  const showRings = state === S.LISTENING || state === S.SPEAKING
+  // ── Waveform renderer ─────────────────────────────────────────────────────────
+  const renderWaveform = () => {
+    const bars     = Array.from({ length: 28 }, (_, i) => i)
+    const isActive = state === S.LISTENING || state === S.SPEAKING
 
-  return (
-    <>
-      {/* Keyframes */}
-      <style>{`
-        @keyframes ot-breathe {
-          0%,100%{transform:scale(1);opacity:.88}
-          50%{transform:scale(1.04);opacity:1}
-        }
-        @keyframes ot-listen {
-          0%{transform:scale(1);filter:brightness(1)}
-          20%{transform:scale(1.07);filter:brightness(1.12)}
-          50%{transform:scale(1.03);filter:brightness(1.18)}
-          80%{transform:scale(1.09);filter:brightness(1.12)}
-          100%{transform:scale(1);filter:brightness(1)}
-        }
-        @keyframes ot-spin {
-          0%{filter:hue-rotate(0deg) brightness(1.1)}
-          100%{filter:hue-rotate(360deg) brightness(1.1)}
-        }
-        @keyframes ot-speak {
-          0%,100%{transform:scale(1)}
-          30%{transform:scale(1.06)}
-          65%{transform:scale(0.96)}
-        }
-        @keyframes ot-ring1 {
-          0%,100%{transform:scale(1);opacity:.5}
-          50%{transform:scale(1.45);opacity:0}
-        }
-        @keyframes ot-ring2 {
-          0%,100%{transform:scale(1);opacity:.3}
-          50%{transform:scale(1.8);opacity:0}
-        }
-        .ot-input::placeholder{color:rgba(255,255,255,0.3)}
-        .ot-input:focus{outline:none;border-color:rgba(255,255,255,0.25)!important}
-        .ot-scroll::-webkit-scrollbar{width:3px}
-        .ot-scroll::-webkit-scrollbar-thumb{background:rgba(255,255,255,0.15);border-radius:2px}
-      `}</style>
-
-      {/* Widget container */}
-      <div style={{
-        position: 'fixed',
-        bottom: '32px',
-        left: '50%',
-        transform: 'translateX(-50%)',
-        zIndex: 9999,
-        width: 'min(400px, calc(100vw - 32px))',
-        background: 'rgba(8, 8, 18, 0.93)',
-        backdropFilter: 'blur(28px)',
-        WebkitBackdropFilter: 'blur(28px)',
-        borderRadius: '32px',
-        border: '1px solid rgba(255,255,255,0.09)',
-        boxShadow: `0 32px 80px rgba(0,0,0,0.6), 0 0 0 1px rgba(255,255,255,0.04), 0 0 40px ${orb.glow}`,
-        transition: 'box-shadow 0.6s ease',
-        fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", sans-serif',
-      }}>
-
-        {/* ── Header ──────────────────────────────────────────────────────── */}
-        <div style={{
+    return (
+      <div
+        onClick={handleWaveformClick}
+        style={{
+          height: '72px',
+          width: '100%',
+          padding: '20px 0 12px',
           display: 'flex',
           alignItems: 'center',
-          justifyContent: 'space-between',
-          padding: '16px 20px 0',
-        }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-            <span style={{
-              fontSize: '13px',
-              fontWeight: '700',
-              letterSpacing: '0.18em',
-              textTransform: 'uppercase',
-              background: 'linear-gradient(135deg, #60a5fa 0%, #a78bfa 50%, #f472b6 100%)',
-              WebkitBackgroundClip: 'text',
-              WebkitTextFillColor: 'transparent',
-            }}>OTIS</span>
-            <span style={{
-              padding: '2px 8px',
-              borderRadius: '100px',
-              background: 'rgba(255,255,255,0.06)',
-              border: '1px solid rgba(255,255,255,0.1)',
-              fontSize: '10px',
-              color: 'rgba(255,255,255,0.4)',
-              fontWeight: '500',
-              letterSpacing: '0.05em',
-            }}>Voice AI</span>
-          </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+          justifyContent: 'center',
+          overflow: 'hidden',
+          position: 'relative',
+          cursor: [S.READY, S.LISTENING, S.ERROR, S.SPEAKING].includes(state)
+            ? 'pointer' : 'default',
+        }}
+      >
+        {isActive && (
+          <div style={{
+            position: 'absolute', bottom: 0, left: '50%',
+            transform: 'translateX(-50%)',
+            width: '200px', height: '30px',
+            background: isDark
+              ? 'radial-gradient(ellipse 200px 30px, rgba(26,86,219,0.35), transparent)'
+              : 'radial-gradient(ellipse 200px 30px, rgba(76,201,240,0.25), transparent)',
+            pointerEvents: 'none',
+          }} />
+        )}
+
+        <div style={{ display: 'flex', alignItems: 'center', gap: '3.5px' }}>
+          {bars.map(i => {
+            let anim = 'none', height = '4px'
+            // Delay is embedded in the animation shorthand to avoid the
+            // React "conflicting shorthand / non-shorthand" warning.
+            const d = `${(i * 0.04).toFixed(2)}s`
+            const color = getBarColor(state, i, isDark)
+
+            if      (state === S.IDLE)       { anim = `jarvis-idle 3.5s ease-in-out ${d} infinite` }
+            else if (state === S.CONNECTING) { anim = `jarvis-connecting 1.2s ease-in-out ${d} infinite` }
+            else if (state === S.READY)      { anim = `jarvis-ready 4s ease-in-out ${d} infinite`; height = '5px' }
+            else if (state === S.LISTENING)  { anim = `jarvis-bar ${barDuration(i)} ease-in-out ${d} infinite` }
+            else if (state === S.SPEAKING)   { anim = `jarvis-bar ${barDuration(i)} ease-in-out ${d} infinite` }
+            else if (state === S.PROCESSING) { height = '16px'; anim = `jarvis-shimmer 1.4s ease-in-out ${d} infinite` }
+            else if (state === S.ERROR)      { anim = `jarvis-error 2.5s ease-in-out ${d} infinite` }
+
+            return (
+              <div key={i} style={{
+                width: '3px', height, borderRadius: '2px',
+                backgroundColor: color,
+                animation: anim,
+                transformOrigin: 'bottom center', flexShrink: 0,
+              }} />
+            )
+          })}
+        </div>
+      </div>
+    )
+  }
+
+  // ── Render ────────────────────────────────────────────────────────────────────
+  return (
+    <>
+      <style>{`
+        @keyframes jarvis-slide-in {
+          from { opacity: 0; transform: translateY(12px) scale(0.97); }
+          to   { opacity: 1; transform: translateY(0) scale(1); }
+        }
+        @keyframes jarvis-idle {
+          0%,100% { height: 4px; } 50% { height: 6px; }
+        }
+        @keyframes jarvis-connecting {
+          0%,100% { height: 4px; } 50% { height: 18px; }
+        }
+        @keyframes jarvis-ready {
+          0%,100% { height: 5px; } 50% { height: 10px; }
+        }
+        @keyframes jarvis-bar {
+          0%,100% { transform: scaleY(0.18); } 50% { transform: scaleY(1); }
+        }
+        @keyframes jarvis-shimmer {
+          0%,100% { filter: brightness(0.7); }
+          50%     { filter: brightness(1.6) hue-rotate(30deg); }
+        }
+        @keyframes jarvis-error {
+          0%,100% { opacity: 0.5; } 50% { opacity: 1; }
+        }
+        @keyframes jarvis-fade-in {
+          from { opacity: 0; transform: translateY(4px); }
+          to   { opacity: 1; transform: translateY(0); }
+        }
+        .jarvis-input::placeholder { opacity: 0.4; }
+        .jarvis-scroll::-webkit-scrollbar { width: 3px; }
+        .jarvis-scroll::-webkit-scrollbar-thumb {
+          border-radius: 3px;
+          background: ${isDark ? 'rgba(255,255,255,0.12)' : '#cbd5e1'};
+        }
+      `}</style>
+
+      {/* ── Widget container ─────────────────────────────────────────────────── */}
+      <div style={{
+        position: 'fixed', bottom: '96px', right: '24px',
+        width: '380px', maxWidth: 'calc(100vw - 32px)',
+        zIndex: 9999, borderRadius: '24px', overflow: 'hidden',
+        fontFamily: "'Inter', system-ui, sans-serif",
+        animation: 'jarvis-slide-in 0.25s cubic-bezier(0.4,0,0.2,1) forwards',
+        background: isDark ? 'rgba(13,34,68,0.88)' : 'rgba(255,255,255,0.92)',
+        backdropFilter: 'blur(32px) saturate(160%)',
+        WebkitBackdropFilter: 'blur(32px) saturate(160%)',
+        border: `1px solid ${isDark ? '#1e3a72' : '#e2e8f0'}`,
+        boxShadow: isDark
+          ? '0 20px 60px rgba(0,0,0,0.5), 0 4px 16px rgba(0,0,0,0.3), 0 0 0 1px rgba(255,255,255,0.04) inset'
+          : '0 20px 60px rgba(15,23,42,0.12), 0 4px 16px rgba(15,23,42,0.06), 0 0 0 1px rgba(255,255,255,0.8) inset',
+      }}>
+
+        {/* Header */}
+        <div style={{ padding: '16px 18px 0', display: 'flex', alignItems: 'center', gap: '10px' }}>
+          <span style={{
+            fontSize: '11px', fontWeight: 700, letterSpacing: '0.2em',
+            textTransform: 'uppercase',
+            background: 'linear-gradient(90deg, #1a56db, #0ea5e9, #4CC9F0)',
+            WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent', backgroundClip: 'text',
+          }}>JARVIS</span>
+
+          <span style={{
+            fontSize: '10px', fontWeight: 500, borderRadius: '20px', padding: '3px 10px',
+            background: isDark ? 'rgba(255,255,255,0.06)' : '#f1f5f9',
+            border: `1px solid ${isDark ? 'rgba(255,255,255,0.1)' : '#e2e8f0'}`,
+            color: isDark ? '#94a8c4' : '#64748b',
+          }}>Voice AI</span>
+
+          <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '6px' }}>
             <button
               onClick={() => setShowHistory(h => !h)}
               title={showHistory ? 'Hide history' : 'Show history'}
               style={{
-                padding: '5px 10px',
-                borderRadius: '10px',
-                background: 'rgba(255,255,255,0.07)',
-                border: '1px solid rgba(255,255,255,0.09)',
-                color: 'rgba(255,255,255,0.45)',
-                fontSize: '11px',
-                cursor: 'pointer',
-                display: 'flex', alignItems: 'center', gap: '4px',
-                transition: 'all 0.15s',
+                width: '24px', height: '24px', borderRadius: '8px',
+                border: 'none', background: 'transparent',
+                color: isDark ? '#94a8c4' : '#64748b',
+                cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                transition: 'background 0.15s',
               }}
+              onMouseEnter={e => e.currentTarget.style.background = isDark ? 'rgba(255,255,255,0.07)' : '#f1f5f9'}
+              onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
             >
-              {showHistory ? <ChevronDown size={12} /> : <ChevronUp size={12} />}
-              {history.length > 0 ? `${Math.floor(history.length / 2)} turns` : 'History'}
+              {showHistory ? <ChevronDown size={14} /> : <ChevronUp size={14} />}
             </button>
+
             <button
               onClick={handleClose}
               style={{
-                width: '28px', height: '28px',
-                borderRadius: '50%',
-                background: 'rgba(255,255,255,0.08)',
-                border: '1px solid rgba(255,255,255,0.1)',
-                color: 'rgba(255,255,255,0.5)',
-                cursor: 'pointer',
-                display: 'flex', alignItems: 'center', justifyContent: 'center',
-                transition: 'all 0.15s',
+                width: '28px', height: '28px', borderRadius: '50%',
+                border: 'none',
+                background: isDark ? 'rgba(255,255,255,0.07)' : '#f1f5f9',
+                color: isDark ? '#94a8c4' : '#64748b',
+                cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                transition: 'background 0.15s',
               }}
+              onMouseEnter={e => e.currentTarget.style.background = isDark ? 'rgba(255,255,255,0.12)' : '#e2e8f0'}
+              onMouseLeave={e => e.currentTarget.style.background = isDark ? 'rgba(255,255,255,0.07)' : '#f1f5f9'}
             >
               <X size={13} />
             </button>
           </div>
         </div>
 
-        {/* ── Orb + Status ─────────────────────────────────────────────────── */}
+        {/* Siri waveform */}
+        {renderWaveform()}
+
+        {/* Status label */}
         <div style={{
-          display: 'flex',
-          flexDirection: 'column',
-          alignItems: 'center',
-          padding: '28px 24px 20px',
+          padding: '4px 0 8px', textAlign: 'center',
+          fontSize: '12px', fontWeight: 400,
+          color: isDark ? '#94a8c4' : '#64748b',
         }}>
-          {/* Orb with rings */}
-          <div style={{ position: 'relative', marginBottom: '22px' }}>
-            {showRings && (
-              <>
-                <div style={{
-                  position: 'absolute', inset: '-14px', borderRadius: '50%',
-                  background: orb.glow,
-                  animation: `ot-ring1 ${parseFloat(orb.dur) * 1.5}s ease-out infinite`,
-                  pointerEvents: 'none',
-                }} />
-                <div style={{
-                  position: 'absolute', inset: '-28px', borderRadius: '50%',
-                  background: orb.glow,
-                  animation: `ot-ring2 ${parseFloat(orb.dur) * 1.5}s ease-out infinite 0.55s`,
-                  pointerEvents: 'none',
-                }} />
-              </>
-            )}
-
-            {/* Main orb */}
-            <div
-              onClick={handleOrbClick}
-              title={state === S.READY ? 'Click to speak' : state === S.LISTENING ? 'Click to stop' : ''}
-              style={{
-                width: '92px',
-                height: '92px',
-                borderRadius: '50%',
-                background: orb.grad,
-                animation: `${orb.anim} ${orb.dur} ease-in-out infinite`,
-                cursor: (state === S.READY || state === S.LISTENING || state === S.SPEAKING || state === S.ERROR) ? 'pointer' : 'default',
-                boxShadow: `0 0 28px ${orb.glow}, 0 0 56px ${orb.glow}`,
-                position: 'relative',
-                overflow: 'hidden',
-                transition: 'box-shadow 0.4s ease',
-                userSelect: 'none',
-              }}
-            >
-              {/* Specular highlight */}
-              <div style={{
-                position: 'absolute', top: '14%', left: '18%',
-                width: '32%', height: '32%',
-                borderRadius: '50%',
-                background: 'rgba(255,255,255,0.38)',
-                filter: 'blur(5px)',
-                pointerEvents: 'none',
-              }} />
-              {/* Mic icon overlay when listening */}
-              {state === S.LISTENING && (
-                <div style={{
-                  position: 'absolute', inset: 0,
-                  display: 'flex', alignItems: 'center', justifyContent: 'center',
-                  pointerEvents: 'none',
-                }}>
-                  <Mic size={28} color="rgba(255,255,255,0.9)" strokeWidth={2} />
-                </div>
-              )}
-              {/* Stop icon when processing */}
-              {state === S.PROCESSING && (
-                <div style={{
-                  position: 'absolute', inset: 0,
-                  display: 'flex', alignItems: 'center', justifyContent: 'center',
-                  pointerEvents: 'none',
-                }}>
-                  <div style={{
-                    width: '22px', height: '22px',
-                    border: '2px solid rgba(255,255,255,0.85)',
-                    borderTopColor: 'transparent',
-                    borderRadius: '50%',
-                    animation: 'ot-spin 0.7s linear infinite',
-                  }} />
-                </div>
-              )}
-            </div>
-          </div>
-
-          {/* Status label */}
-          <div style={{
-            fontSize: '13px',
-            color: 'rgba(255,255,255,0.5)',
-            fontWeight: '500',
-            letterSpacing: '0.02em',
-            marginBottom: transcript || response ? '12px' : '0',
-            transition: 'all 0.3s',
-          }}>
-            {LABEL[state]}
-          </div>
-
-          {/* Transcript (what user said) */}
-          {transcript && state !== S.IDLE && state !== S.CONNECTING && (
-            <div style={{
-              maxWidth: '340px',
-              textAlign: 'center',
-              fontSize: '15px',
-              fontWeight: '600',
-              color: 'rgba(255,255,255,0.9)',
-              padding: '0 8px',
-              lineHeight: 1.4,
-              marginBottom: '8px',
-            }}>
-              &ldquo;{transcript}&rdquo;
-            </div>
-          )}
-
-          {/* Response (what OTIS said) */}
-          {response && (
-            <div style={{
-              maxWidth: '340px',
-              textAlign: 'center',
-              fontSize: '13px',
-              color: 'rgba(255,255,255,0.52)',
-              padding: '0 8px',
-              lineHeight: 1.55,
-              transition: 'all 0.3s',
-            }}>
-              {response.length > 140 ? response.slice(0, 140) + '…' : response}
-            </div>
-          )}
+          {LABEL[state]}
         </div>
 
-        {/* ── History panel ──────────────────────────────────────────────────── */}
-        {showHistory && history.length > 0 && (
-          <div className="ot-scroll" style={{
-            maxHeight: '190px',
-            overflowY: 'auto',
-            padding: '0 16px 8px',
-            borderTop: '1px solid rgba(255,255,255,0.06)',
-          }}>
-            {history.map((msg, i) => (
-              <div key={i} style={{
-                display: 'flex',
-                justifyContent: msg.role === 'user' ? 'flex-end' : 'flex-start',
-                marginTop: '10px',
+        {/* Transcript + response */}
+        {((transcript && state !== S.IDLE && state !== S.CONNECTING) || response) && (
+          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', animation: 'jarvis-fade-in 0.2s ease' }}>
+            {transcript && state !== S.IDLE && state !== S.CONNECTING && (
+              <div style={{
+                margin: '0 16px 6px', padding: '8px 14px',
+                borderRadius: '20px 20px 6px 20px', fontSize: '13px', fontWeight: 500,
+                background: isDark ? 'rgba(26,86,219,0.15)' : '#eff6ff',
+                border: `1px solid ${isDark ? 'rgba(26,86,219,0.3)' : '#bfdbfe'}`,
+                color: isDark ? '#93c5fd' : '#1e40af',
               }}>
-                <div style={{
-                  maxWidth: '78%',
-                  padding: '8px 13px',
-                  borderRadius: msg.role === 'user' ? '18px 18px 6px 18px' : '18px 18px 18px 6px',
-                  background: msg.role === 'user'
-                    ? 'rgba(96,165,250,0.22)'
-                    : 'rgba(255,255,255,0.07)',
-                  border: '1px solid rgba(255,255,255,0.06)',
-                  color: 'rgba(255,255,255,0.82)',
-                  fontSize: '12px',
-                  lineHeight: 1.45,
-                }}>
-                  {msg.text}
-                </div>
+                &ldquo;{transcript}&rdquo;
               </div>
-            ))}
-            <div ref={historyEndRef} />
+            )}
+            {response && (
+              <div style={{
+                margin: '0 16px 10px', fontSize: '13px', lineHeight: 1.5,
+                textAlign: 'center', color: isDark ? '#94a8c4' : '#64748b',
+                display: '-webkit-box', WebkitLineClamp: 2,
+                WebkitBoxOrient: 'vertical', overflow: 'hidden',
+              }}>
+                {response}
+              </div>
+            )}
           </div>
         )}
 
-        {/* ── Wake debug bar (remove once wake word is confirmed working) ────── */}
+        {/* History panel */}
+        {showHistory && history.length > 0 && (
+          <div style={{ borderTop: `1px solid ${isDark ? '#1e3a72' : '#e2e8f0'}` }}>
+            <div className="jarvis-scroll" style={{
+              padding: '10px 14px', maxHeight: '180px', overflowY: 'auto',
+              display: 'flex', flexDirection: 'column', gap: '8px',
+            }}>
+              {history.map((msg, i) => (
+                <div key={i} style={{
+                  alignSelf: msg.role === 'user' ? 'flex-end' : 'flex-start',
+                  maxWidth: msg.role === 'user' ? '80%' : '85%',
+                  padding: '7px 12px', fontSize: '12px', lineHeight: 1.45,
+                  borderRadius: msg.role === 'user' ? '16px 16px 4px 16px' : '16px 16px 16px 4px',
+                  ...(msg.role === 'user' ? {
+                    background: isDark ? 'rgba(26,86,219,0.18)' : '#eff6ff',
+                    color: isDark ? '#93c5fd' : '#1e40af',
+                  } : {
+                    background: isDark ? 'rgba(255,255,255,0.05)' : '#f1f5f9',
+                    border: `1px solid ${isDark ? 'rgba(255,255,255,0.08)' : '#e2e8f0'}`,
+                    color: isDark ? '#f0f1ed' : '#0f172a',
+                  }),
+                }}>
+                  {msg.text}
+                </div>
+              ))}
+              <div ref={historyEndRef} />
+            </div>
+          </div>
+        )}
+
+        {/* Voice hint bar */}
         <div style={{
-          padding: '4px 16px 6px',
-          fontFamily: 'monospace',
-          fontSize: '10px',
-          color: wakeLog.includes('👂') ? '#34d399'
-               : wakeLog.includes('✅') ? '#fbbf24'
-               : wakeLog.includes('error') || wakeLog.includes('failed') ? '#f87171'
-               : 'rgba(255,255,255,0.3)',
-          borderTop: '1px solid rgba(255,255,255,0.04)',
-          whiteSpace: 'nowrap',
-          overflow: 'hidden',
-          textOverflow: 'ellipsis',
+          padding: '6px 16px', fontFamily: 'monospace', fontSize: '10px',
+          borderTop: `1px solid ${isDark ? 'rgba(255,255,255,0.04)' : '#e2e8f0'}`,
+          background: isDark ? 'rgba(0,0,0,0.2)' : '#f1f5f9',
+          whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+          color: state === S.LISTENING
+            ? '#059669'
+            : state === S.SPEAKING
+              ? '#fbbf24'
+              : isDark ? '#94a8c4' : '#64748b',
         }}>
-          {wakeLog}
+          {state === S.LISTENING
+            ? 'Hands-free mode active. Speak naturally.'
+            : 'Say "Hey Jarvis" to wake, or tap the mic to talk.'}
         </div>
 
-        {/* ── Text input ─────────────────────────────────────────────────────── */}
+        {/* Text input row */}
         <div style={{
-          display: 'flex',
-          gap: '8px',
-          padding: '12px 16px 20px',
-          borderTop: '1px solid rgba(255,255,255,0.06)',
+          padding: '12px 14px 16px', display: 'flex', gap: '8px', alignItems: 'center',
+          borderTop: `1px solid ${isDark ? '#1e3a72' : '#e2e8f0'}`,
         }}>
           <input
-            className="ot-input"
+            className="jarvis-input"
             type="text"
             value={inputText}
             onChange={e => setInputText(e.target.value)}
@@ -652,38 +794,57 @@ export default function OtisVoiceWidget({ onClose }) {
             placeholder="Or type a command…"
             disabled={state === S.PROCESSING || state === S.CONNECTING}
             style={{
-              flex: 1,
-              padding: '11px 15px',
-              borderRadius: '16px',
-              background: 'rgba(255,255,255,0.07)',
-              border: '1px solid rgba(255,255,255,0.12)',
-              color: 'rgba(255,255,255,0.88)',
-              fontSize: '13px',
+              flex: 1, borderRadius: '20px', padding: '10px 14px',
+              fontSize: '13px', fontFamily: "'Inter', system-ui, sans-serif",
+              outline: 'none', transition: 'border-color 0.15s, box-shadow 0.15s',
+              background: isDark ? 'rgba(255,255,255,0.05)' : '#f1f5f9',
+              border: `1px solid ${isDark ? 'rgba(255,255,255,0.1)' : '#e2e8f0'}`,
+              color: isDark ? '#f0f1ed' : '#0f172a',
+            }}
+            onFocus={e => {
+              e.target.style.borderColor = isDark ? 'rgba(76,201,240,0.5)' : '#1a56db'
+              e.target.style.boxShadow   = isDark ? '0 0 0 3px rgba(76,201,240,0.1)' : '0 0 0 3px rgba(26,86,219,0.15)'
+            }}
+            onBlur={e => {
+              e.target.style.borderColor = isDark ? 'rgba(255,255,255,0.1)' : '#e2e8f0'
+              e.target.style.boxShadow   = 'none'
             }}
           />
+
+          {/* Mic / Send button */}
           <button
-            onClick={state === S.LISTENING ? () => { stopListening(); setState(S.READY) } : (inputText.trim() ? handleSend : startListening)}
+            onClick={
+              state === S.LISTENING
+                ? () => stopListening(true)   // cancel recording
+                : inputText.trim() ? handleSend : startListening
+            }
             disabled={state === S.PROCESSING || state === S.CONNECTING}
-            style={{
-              width: '44px', height: '44px',
-              borderRadius: '14px',
-              background: state === S.LISTENING
-                ? 'rgba(239,68,68,0.8)'
-                : inputText.trim()
-                  ? 'linear-gradient(135deg, #3b82f6, #8b5cf6)'
-                  : 'rgba(255,255,255,0.09)',
-              border: 'none',
-              color: 'rgba(255,255,255,0.9)',
-              cursor: (state === S.PROCESSING || state === S.CONNECTING) ? 'not-allowed' : 'pointer',
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-              transition: 'all 0.2s',
-              flexShrink: 0,
-            }}
             title={state === S.LISTENING ? 'Stop' : inputText.trim() ? 'Send' : 'Tap to speak'}
+            style={{
+              width: '40px', height: '40px', borderRadius: '50%', flexShrink: 0,
+              border: (state === S.LISTENING || inputText.trim())
+                ? 'none'
+                : `1px solid ${isDark ? 'rgba(255,255,255,0.1)' : '#e2e8f0'}`,
+              cursor: (state === S.PROCESSING || state === S.CONNECTING)
+                ? 'not-allowed' : 'pointer',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              transition: 'all 0.15s ease',
+              ...(state === S.LISTENING
+                ? { background: '#ef4444', color: 'white' }
+                : inputText.trim()
+                  ? { background: 'linear-gradient(135deg, #1a56db, #0ea5e9)', color: 'white' }
+                  : { background: isDark ? 'rgba(255,255,255,0.07)' : '#f1f5f9',
+                      color: isDark ? '#4CC9F0' : '#1a56db' }
+              ),
+            }}
           >
-            {state === S.LISTENING ? <MicOff size={18} /> : inputText.trim() ? <Send size={16} /> : <Mic size={18} />}
+            {state === S.LISTENING
+              ? <MicOff size={16} />
+              : inputText.trim() ? <Send size={16} /> : <Mic size={16} />
+            }
           </button>
         </div>
+
       </div>
     </>
   )

@@ -146,8 +146,8 @@ class Config:
     ELEVENLABS_API_KEY   = _get_env_or_secret("ELEVENLABS_API_KEY")
 
     # OTIS Voice Settings
-    OTIS_VOICE_ID = os.getenv("OTIS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")
-    OTIS_VOICE_GENDER = os.getenv("OTIS_VOICE_GENDER", "female")
+    OTIS_VOICE_ID = os.getenv("OTIS_VOICE_ID", "pNInz6obpgDQGcFmaJgB")
+    OTIS_VOICE_GENDER = os.getenv("OTIS_VOICE_GENDER", "male")
     OTIS_VOICE_LANGUAGE = os.getenv("OTIS_VOICE_LANGUAGE", "en-IN")
 
     try:

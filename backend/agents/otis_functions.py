@@ -312,10 +312,6 @@ class OtisFunctionRegistry:
                 params = ", ".join([f"{k}: {v}" for k, v in func.parameters.items()])
                 desc += f"\n  Parameters: {params}"
 
-            if func.examples:
-                examples = ", ".join([f'"{ex}"' for ex in func.examples[:2]])
-                desc += f"\n  Examples: {examples}"
-
             descriptions.append(desc)
 
         return "\n".join(descriptions)

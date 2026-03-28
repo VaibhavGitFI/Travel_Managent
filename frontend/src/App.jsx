@@ -1,7 +1,7 @@
 import { useEffect, Suspense, lazy } from 'react'
 import { Routes, Route, Navigate } from 'react-router-dom'
 import useStore from './store/useStore'
-import { getMe } from './api/auth'
+import { getMe, refreshTokens } from './api/auth'
 import { getMyOrganization } from './api/organizations'
 import Layout from './components/layout/Layout'
 import Spinner from './components/ui/Spinner'
@@ -40,19 +40,28 @@ function ProtectedRoute({ children }) {
 export default function App() {
   const { auth, setUser, setLoading, setOrg } = useStore()
 
-  // Re-validate session on mount
+  // Re-validate session on mount — also restores JWT access token from sessionStorage
+  // so that raw fetch() calls (e.g. streaming) have a Bearer token and bypass CSRF.
   useEffect(() => {
     if (!auth.isLoggedIn || auth.user) return
     setLoading(true)
-    getMe()
-      .then((data) => {
-        setUser(data.user || data)
-        // Load org context
-        getMyOrganization()
-          .then((orgData) => setOrg(orgData.organization || null))
-          .catch(() => {})
-      })
-      .catch(() => setUser(null))
+
+    const restore = async () => {
+      // Silently try to restore access token from stored refresh token first.
+      // This ensures raw fetch() calls (chat streaming) send Bearer auth instead
+      // of falling back to cookie/session auth which requires CSRF headers.
+      if (sessionStorage.getItem('ts_refresh')) {
+        try { await refreshTokens() } catch { /* fall through to cookie auth */ }
+      }
+      const data = await getMe()
+      setUser(data.user || data)
+      try {
+        const orgData = await getMyOrganization()
+        setOrg(orgData.organization || null)
+      } catch { /* org is optional */ }
+    }
+
+    restore().catch(() => setUser(null))
   }, [auth.isLoggedIn, auth.user, setLoading, setUser, setOrg])
 
   return (

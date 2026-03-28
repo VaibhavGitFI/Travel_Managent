@@ -41,7 +41,8 @@ SYSTEM_PROMPT = """You are TravelSync Pro, an AI corporate travel assistant.
 - When real-time search results are provided in context, cite them accurately.
 - When NO search results are provided, use your general knowledge to give helpful, detailed answers. Do NOT say "I don't have access to data" — instead, provide typical/general information clearly labeled as general guidance.
 - NEVER fabricate specific booking references, flight numbers, or exact prices. But DO provide typical price ranges, duration estimates, and practical comparisons from general knowledge.
-- If the user asks something outside travel, say: "I focus on corporate travel. How can I help with your trip?"
+- When the user asks about live TravelSync data, including org data, user counts, approvals, analytics, or admin summaries, answer from the provided context or structured query results. Do not redirect them to a dashboard when the data is available here.
+- If the user asks something outside TravelSync or corporate travel and no live app data applies, say: "I focus on corporate travel. How can I help with your trip?"
 
 ## Origin / Destination
 - "A to B" or "from A to B" means origin = A, destination = B. NEVER reverse this.
@@ -72,9 +73,36 @@ def _build_user_context(user: dict) -> str:
     now = datetime.now()
     context_parts.append(f"Current date/time: {now.strftime('%A, %B %d, %Y at %I:%M %p')}")
     context_parts.append(f"User: {user.get('name', '')} (role: {user.get('role', 'employee')}, department: {user.get('department', 'N/A')})")
+    if user.get("org_id"):
+        org_name = user.get("org_name") or f"Organization {user['org_id']}"
+        org_role = user.get("org_role", "member")
+        context_parts.append(
+            f"Active organization: {org_name} (org id: {user['org_id']}, org role: {org_role})"
+        )
 
     try:
         db = get_db()
+
+        if user.get("org_id") and user.get("role") in ("admin", "super_admin"):
+            try:
+                member_row = db.execute(
+                    "SELECT COUNT(*) as cnt FROM org_members WHERE org_id = ?",
+                    (user["org_id"],),
+                ).fetchone()
+                member_count = dict(member_row).get("cnt", 0)
+                context_parts.append(f"Organization members: {member_count}")
+            except Exception as e:
+                logger.debug("[Chat Context] Org member count error: %s", e)
+
+            try:
+                org_pending = db.execute(
+                    "SELECT COUNT(*) as cnt FROM travel_requests WHERE org_id = ? AND status = 'submitted'",
+                    (user["org_id"],),
+                ).fetchone()
+                pending_count = dict(org_pending).get("cnt", 0)
+                context_parts.append(f"Organization submitted travel requests awaiting review: {pending_count}")
+            except Exception as e:
+                logger.debug("[Chat Context] Org approvals count error: %s", e)
 
         # Recent travel requests (last 5)
         try:
@@ -119,7 +147,7 @@ def _build_user_context(user: dict) -> str:
             logger.debug("[Chat Context] Requests query error: %s", e)
 
         # Pending approvals (for managers)
-        if user.get("role") in ("manager", "admin"):
+        if user.get("role") in ("manager", "admin", "super_admin"):
             try:
                 pending = db.execute(
                     "SELECT COUNT(*) as cnt FROM approvals WHERE approver_id = ? AND status = 'pending'",
@@ -219,7 +247,7 @@ def _build_user_context(user: dict) -> str:
                 context_parts.append("Total expenses: None recorded")
 
             # Pending expense approvals (for managers)
-            if has_approval and user.get("role") in ("manager", "admin"):
+            if has_approval and user.get("role") in ("manager", "admin", "super_admin"):
                 pending_exp = db.execute(
                     f"SELECT COUNT(*) as cnt, SUM({amt_expr}) as total FROM expenses_db WHERE approver_id = ? AND approval_status = 'submitted'",
                     (user["id"],),
@@ -326,6 +354,203 @@ def build_system_prompt(user: dict = None) -> str:
     return SYSTEM_PROMPT
 
 
+def format_structured_chat_response(query_result: dict, entities: dict | None = None) -> dict | None:
+    """Format shared query-engine output for the web chat UI."""
+    entities = entities or {}
+    if not query_result or not query_result.get("data", {}).get("success"):
+        return None
+
+    data = query_result["data"]
+    query_type = query_result["type"]
+
+    if query_type == "expenses":
+        expenses = data.get("expenses", [])[:15]
+        scope_label = {
+            "self": "Your",
+            "team": "Team",
+            "org": data.get("org_name") or "Organization",
+            "all": "Platform",
+        }.get(data.get("scope", "self"), "Expense")
+        reply_lines = [f"### {scope_label} Expenses\n"]
+        reply_lines.append(f"**Total:** {data.get('count', 0)} items, ₹{data.get('total_amount', 0):,.0f}\n")
+        if expenses:
+            reply_lines.append("| Date | Category | Amount | Source | Description |")
+            reply_lines.append("|------|----------|--------|--------|-------------|")
+            for exp in expenses:
+                cat = exp.get("category", "other").title()
+                amt = exp.get("invoice_amount") or exp.get("verified_amount") or exp.get("payment_amount") or 0
+                desc = exp.get("description", "")[:40]
+                date = exp.get("date", "")
+                source = exp.get("source", "web").upper()
+                reply_lines.append(f"| {date} | {cat} | ₹{float(amt):,.0f} | {source} | {desc} |")
+        return {
+            "reply": "\n".join(reply_lines),
+            "intent": "expense",
+            "entities": entities,
+            "action_cards": [],
+            "ai_powered": True,
+            "model": "structured_query",
+            "data_source": "structured_query",
+            "query_data": data,
+        }
+
+    if query_type == "trips":
+        trips = data.get("trips", [])[:15]
+        scope_label = {
+            "self": "Your",
+            "team": "Team",
+            "org": data.get("org_name") or "Organization",
+            "all": "Platform",
+        }.get(data.get("scope", "self"), "Travel")
+        reply_lines = [f"### {scope_label} Travel Requests\n"]
+        reply_lines.append(f"**Total:** {data.get('count', 0)} trips\n")
+        if trips:
+            reply_lines.append("| Route | Dates | Status | Budget |")
+            reply_lines.append("|-------|-------|--------|--------|")
+            for trip in trips:
+                route = f"{trip.get('origin', '?')} → {trip.get('destination', '?')}"
+                dates = f"{trip.get('start_date', '')} to {trip.get('end_date', '')}" if trip.get("start_date") else "TBD"
+                status = trip.get("status", "pending").upper()
+                budget = f"₹{trip['estimated_total']:,.0f}" if trip.get("estimated_total") else "TBD"
+                reply_lines.append(f"| {route} | {dates} | {status} | {budget} |")
+        return {
+            "reply": "\n".join(reply_lines),
+            "intent": "status",
+            "entities": entities,
+            "action_cards": [],
+            "ai_powered": True,
+            "model": "structured_query",
+            "data_source": "structured_query",
+            "query_data": data,
+        }
+
+    if query_type == "users":
+        scope_label = {
+            "self": "Your Account",
+            "team": "Your Team",
+            "org": data.get("org_name") or "Your Organization",
+            "all": "Platform Users",
+        }.get(data.get("scope", "self"), "Users")
+        reply_lines = [f"### {scope_label}\n"]
+        reply_lines.append(f"**Total:** {data.get('count', 0)} users")
+
+        role_breakdown = data.get("role_breakdown") or []
+        if role_breakdown:
+            reply_lines.append("\n**Role Breakdown:**")
+            for role_row in role_breakdown:
+                role_name = (role_row.get("role") or "user").replace("_", " ").title()
+                reply_lines.append(f"- **{role_name}:** {role_row.get('count', 0)}")
+
+        if data.get("verified_count") is not None:
+            reply_lines.append(f"\n**Verified Email Accounts:** {data.get('verified_count', 0)}")
+
+        users_preview = data.get("users") or []
+        if users_preview:
+            reply_lines.append("\n**Recent Users:**")
+            reply_lines.append("| Name | Email | Role | Department |")
+            reply_lines.append("|------|-------|------|------------|")
+            for user_row in users_preview[:10]:
+                name = user_row.get("full_name") or user_row.get("name") or user_row.get("username") or "Unknown"
+                email = user_row.get("email") or "-"
+                role = (user_row.get("role") or "user").replace("_", " ").title()
+                dept = user_row.get("department") or "-"
+                reply_lines.append(f"| {name} | {email} | {role} | {dept} |")
+
+        return {
+            "reply": "\n".join(reply_lines),
+            "intent": "status",
+            "entities": entities,
+            "action_cards": [],
+            "ai_powered": True,
+            "model": "structured_query",
+            "data_source": "structured_query",
+            "query_data": data,
+        }
+
+    if query_type == "analytics":
+        scope_label = {
+            "self": "Your",
+            "team": "Team",
+            "org": data.get("org_name") or "Organization",
+            "all": "Platform",
+        }.get(data.get("scope", "self"), "Analytics")
+        exp_data = data.get("expenses", {})
+        trip_data = data.get("trips", {})
+        reply_lines = [f"### {scope_label} Analytics\n"]
+        reply_lines.append(f"**Expenses:** {exp_data.get('count', 0)} items, ₹{exp_data.get('total_amount', 0):,.0f}")
+        reply_lines.append(f"**Trips:** {trip_data.get('count', 0)} trips, ₹{trip_data.get('total_budget', 0):,.0f}\n")
+
+        if exp_data.get("by_category"):
+            reply_lines.append("**By Category:**")
+            for cat in exp_data["by_category"][:5]:
+                reply_lines.append(f"- **{cat.get('category', 'other').title()}:** ₹{cat.get('total', 0):,.0f} ({cat.get('count', 0)} items)")
+
+        if exp_data.get("by_source"):
+            reply_lines.append("\n**By Source:**")
+            for src in exp_data["by_source"]:
+                reply_lines.append(f"- **{src.get('source', 'web').upper()}:** ₹{src.get('total', 0):,.0f} ({src.get('count', 0)} items)")
+
+        return {
+            "reply": "\n".join(reply_lines),
+            "intent": "status",
+            "entities": entities,
+            "action_cards": [],
+            "ai_powered": True,
+            "model": "structured_query",
+            "data_source": "structured_query",
+            "query_data": data,
+        }
+
+    if query_type == "approvals":
+        approvals = data.get("approvals") or []
+        reply_lines = ["### Pending Approvals\n", f"**Total:** {data.get('count', 0)} approvals\n"]
+        if approvals:
+            reply_lines.append("| Requester | Destination | Status | Budget |")
+            reply_lines.append("|-----------|-------------|--------|--------|")
+            for approval in approvals[:10]:
+                requester = approval.get("requester_name") or "-"
+                destination = approval.get("destination") or "-"
+                status = (approval.get("status") or "pending").upper()
+                budget = f"₹{float(approval.get('estimated_total') or 0):,.0f}" if approval.get("estimated_total") else "TBD"
+                reply_lines.append(f"| {requester} | {destination} | {status} | {budget} |")
+        return {
+            "reply": "\n".join(reply_lines),
+            "intent": "status",
+            "entities": entities,
+            "action_cards": [],
+            "ai_powered": True,
+            "model": "structured_query",
+            "data_source": "structured_query",
+            "query_data": data,
+        }
+
+    if query_type == "meetings":
+        meetings = data.get("meetings") or []
+        reply_lines = ["### Upcoming Meetings\n", f"**Total:** {data.get('count', 0)} meetings\n"]
+        if meetings:
+            reply_lines.append("| Client | Company | Date | Venue | Status |")
+            reply_lines.append("|--------|---------|------|-------|--------|")
+            for meeting in meetings[:10]:
+                client = meeting.get("client_name") or "-"
+                company = meeting.get("company") or "-"
+                date = meeting.get("meeting_date") or "-"
+                venue = meeting.get("venue") or "-"
+                status = (meeting.get("status") or "scheduled").upper()
+                reply_lines.append(f"| {client} | {company} | {date} | {venue} | {status} |")
+        return {
+            "reply": "\n".join(reply_lines),
+            "intent": "meeting",
+            "entities": entities,
+            "action_cards": [],
+            "ai_powered": True,
+            "model": "structured_query",
+            "data_source": "structured_query",
+            "query_data": data,
+        }
+
+    return None
+
+
 def _summarize_trip_results(results: dict) -> dict:
     """Extract top flights, hotels, and weather from orchestrator results for inline display."""
     summary = {}
@@ -375,89 +600,16 @@ def process_message(message: str, user: dict = None, model=None, context: dict =
     intent = _detect_intent(message)
     entities = _extract_entities(message, context=context)
 
-    # Try query engine first for data-specific queries
-    if user and any(keyword in message.lower() for keyword in ["show", "list", "from", "in", "this", "last", "pending", "approved", "rejected", "how many", "how much"]):
+    # Try the shared query engine first for live TravelSync data questions.
+    if user:
         try:
-            from agents.query_engine import handle_query
+            from agents.query_engine import handle_query, should_use_structured_query
 
-            query_result = handle_query(user, message)
-
-            if query_result and query_result.get("data", {}).get("success"):
-                data = query_result["data"]
-                query_type = query_result["type"]
-
-                # Format structured response for in-app chat
-                if query_type == "expenses" and data.get("expenses"):
-                    expenses = data["expenses"][:15]  # More items for web
-                    scope_label = {"self": "Your", "team": "Team", "org": "Organization"}[data.get("scope", "self")]
-                    reply_lines = [f"### {scope_label} Expenses\n"]
-                    reply_lines.append(f"**Total:** {data['count']} items, ₹{data.get('total_amount', 0):,.0f}\n")
-                    reply_lines.append("| Date | Category | Amount | Source | Description |")
-                    reply_lines.append("|------|----------|--------|--------|-------------|")
-                    for exp in expenses:
-                        cat = exp.get("category", "other").title()
-                        amt = exp.get("invoice_amount") or exp.get("verified_amount") or exp.get("payment_amount") or 0
-                        desc = exp.get("description", "")[:40]
-                        date = exp.get("date", "")
-                        source = exp.get("source", "web").upper()
-                        reply_lines.append(f"| {date} | {cat} | ₹{float(amt):,.0f} | {source} | {desc} |")
-                    return {
-                        "reply": "\n".join(reply_lines),
-                        "intent": "expense",
-                        "entities": entities,
-                        "action_cards": [],
-                        "ai_powered": True,
-                        "query_data": data,
-                    }
-
-                elif query_type == "trips" and data.get("trips"):
-                    trips = data["trips"][:15]
-                    scope_label = {"self": "Your", "team": "Team", "org": "Organization"}[data.get("scope", "self")]
-                    reply_lines = [f"### {scope_label} Travel Requests\n"]
-                    reply_lines.append(f"**Total:** {data['count']} trips\n")
-                    reply_lines.append("| Route | Dates | Status | Budget |")
-                    reply_lines.append("|-------|-------|--------|--------|")
-                    for trip in trips:
-                        route = f"{trip.get('origin', '?')} → {trip.get('destination', '?')}"
-                        dates = f"{trip.get('start_date', '')} to {trip.get('end_date', '')}" if trip.get("start_date") else "TBD"
-                        status = trip.get("status", "pending").upper()
-                        budget = f"₹{trip['estimated_total']:,.0f}" if trip.get("estimated_total") else "TBD"
-                        reply_lines.append(f"| {route} | {dates} | {status} | {budget} |")
-                    return {
-                        "reply": "\n".join(reply_lines),
-                        "intent": "status",
-                        "entities": entities,
-                        "action_cards": [],
-                        "ai_powered": True,
-                        "query_data": data,
-                    }
-
-                elif query_type == "analytics" and data.get("success"):
-                    scope_label = {"self": "Your", "team": "Team", "org": "Organization"}[data.get("scope", "self")]
-                    exp_data = data.get("expenses", {})
-                    trip_data = data.get("trips", {})
-                    reply_lines = [f"### {scope_label} Analytics\n"]
-                    reply_lines.append(f"**Expenses:** {exp_data.get('count', 0)} items, ₹{exp_data.get('total_amount', 0):,.0f}")
-                    reply_lines.append(f"**Trips:** {trip_data.get('count', 0)} trips, ₹{trip_data.get('total_budget', 0):,.0f}\n")
-
-                    if exp_data.get("by_category"):
-                        reply_lines.append("**By Category:**")
-                        for cat in exp_data["by_category"][:5]:
-                            reply_lines.append(f"- **{cat.get('category', 'other').title()}:** ₹{cat.get('total', 0):,.0f} ({cat.get('count', 0)} items)")
-
-                    if exp_data.get("by_source"):
-                        reply_lines.append("\n**By Source:**")
-                        for src in exp_data["by_source"]:
-                            reply_lines.append(f"- **{src.get('source', 'web').upper()}:** ₹{src.get('total', 0):,.0f} ({src.get('count', 0)} items)")
-
-                    return {
-                        "reply": "\n".join(reply_lines),
-                        "intent": "status",
-                        "entities": entities,
-                        "action_cards": [],
-                        "ai_powered": True,
-                        "query_data": data,
-                    }
+            if should_use_structured_query(message):
+                query_result = handle_query(user, message, strict=True)
+                structured_result = format_structured_chat_response(query_result, entities)
+                if structured_result:
+                    return structured_result
 
         except Exception as e:
             logger.warning("[Chat] Query engine failed: %s", e)
@@ -672,11 +824,19 @@ def _enrich_reply(reply: str, intent: str, entities: dict) -> str:
 
     if intent == "weather" and destination:
         try:
-            w = weather.get_current(destination)
-            weather_snippet = (f"\n\n**Live Weather in {destination}**: "
-                               f"{w.get('temp')}°C, {w.get('description')}, "
-                               f"Humidity: {w.get('humidity')}%")
-            reply += weather_snippet
+            normalized_reply = reply.lower()
+            destination_lower = destination.lower()
+            already_has_weather_block = (
+                f"live weather in {destination_lower}" in normalized_reply
+                or f"current weather in {destination_lower}" in normalized_reply
+                or ("forecast" in normalized_reply and destination_lower in normalized_reply)
+            )
+            if not already_has_weather_block:
+                w = weather.get_current(destination)
+                weather_snippet = (f"\n\n**Live Weather in {destination}**: "
+                                   f"{w.get('temp')}°C, {w.get('description')}, "
+                                   f"Humidity: {w.get('humidity')}%")
+                reply += weather_snippet
         except Exception as e:
             logger.warning("[Chat] Weather enrich failed: %s", e)
 

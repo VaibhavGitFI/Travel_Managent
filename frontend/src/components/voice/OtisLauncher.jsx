@@ -3,30 +3,25 @@ import OtisVoiceWidget from './OtisVoiceWidget'
 import useStore from '../../store/useStore'
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Wake-word phrases to match (all lower-case, partial-match)
+// Wake-word phrases (all lower-case, partial-match)
 // ─────────────────────────────────────────────────────────────────────────────
-const WAKE_PHRASES = ['hey otis', 'otis', 'hi otis', 'hey jarvis', 'jarvis']
+const WAKE_PHRASES = ['hey jarvis', 'jarvis', 'hey otis', 'hi otis', 'otis']
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Module-level SR guard — Chrome only allows one SpeechRecognition at a time.
-// React StrictMode (dev) double-mounts effects, which would start two instances
-// simultaneously and cause an endless aborted→restart loop.
-// This flag serialises access: if one instance is active, the next backs off.
 // ─────────────────────────────────────────────────────────────────────────────
 let _srBusy = false
-
-// ─────────────────────────────────────────────────────────────────────────────
-// useWakeWord — self-restarting speech-recognition loop
-// ─────────────────────────────────────────────────────────────────────────────
-// Max consecutive aborts before giving up (Chrome blocking mic)
 const MAX_ABORTS = 5
 
+// ─────────────────────────────────────────────────────────────────────────────
+// useWakeWord — self-restarting speech-recognition loop (unchanged)
+// ─────────────────────────────────────────────────────────────────────────────
 function useWakeWord(phrases, onDetected, enabled) {
-  const [listening, setListening]   = useState(false)
-  const recRef       = useRef(null)
-  const activeRef    = useRef(false)
+  const [listening, setListening] = useState(false)
+  const recRef        = useRef(null)
+  const activeRef     = useRef(false)
   const abortCountRef = useRef(0)
-  const timerRef     = useRef(null)
+  const timerRef      = useRef(null)
 
   const clearTimer = () => {
     if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = null }
@@ -46,18 +41,10 @@ function useWakeWord(phrases, onDetected, enabled) {
   const start = useCallback(() => {
     if (!activeRef.current) return
     if (recRef.current)     return
-
-    // Back off if another instance is already running (StrictMode / widget conflict)
-    if (_srBusy) {
-      timerRef.current = setTimeout(start, 600)
-      return
-    }
+    if (_srBusy) { timerRef.current = setTimeout(start, 600); return }
 
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition
-    if (!SR) {
-      console.warn('[OTIS] SpeechRecognition not available in this browser')
-      return
-    }
+    if (!SR) { console.warn('[Jarvis] SpeechRecognition not available'); return }
 
     _srBusy = true
     const rec = new SR()
@@ -67,9 +54,9 @@ function useWakeWord(phrases, onDetected, enabled) {
     rec.maxAlternatives = 3
 
     rec.onstart = () => {
-      abortCountRef.current = 0   // successful start resets the backoff counter
+      abortCountRef.current = 0
       setListening(true)
-      console.log('[OTIS] 👂 wake mic open')
+      console.log('[Jarvis] 👂 wake mic open')
     }
 
     rec.onresult = (e) => {
@@ -77,7 +64,7 @@ function useWakeWord(phrases, onDetected, enabled) {
         for (let j = 0; j < e.results[i].length; j++) {
           const text = e.results[i][j].transcript.toLowerCase()
           if (phrases.some(p => text.includes(p))) {
-            console.log('[OTIS] ✅ wake phrase matched:', text)
+            console.log('[Jarvis] ✅ wake phrase matched:', text)
             stop()
             onDetected()
             return
@@ -89,33 +76,25 @@ function useWakeWord(phrases, onDetected, enabled) {
     rec.onerror = (e) => {
       _srBusy = false
       if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
-        console.warn('[OTIS] mic permission denied — stopping wake listener')
+        console.warn('[Jarvis] mic permission denied — stopping wake listener')
         stop()
         return
       }
-      if (e.error === 'aborted') {
-        abortCountRef.current++
-      }
-      // onend fires after onerror and handles the restart
+      if (e.error === 'aborted') abortCountRef.current++
     }
 
     rec.onend = () => {
       _srBusy = false
       recRef.current = null
       setListening(false)
-
       if (!activeRef.current) return
-
       const aborts = abortCountRef.current
       if (aborts >= MAX_ABORTS) {
-        console.warn('[OTIS] too many consecutive aborts — wake listener paused (tab may be hidden or mic blocked)')
-        // Reset counter so it can retry when re-enabled
+        console.warn('[Jarvis] too many consecutive aborts — wake listener paused')
         abortCountRef.current = 0
         stop()
         return
       }
-
-      // Exponential back-off: 800ms, 1.6s, 3.2s … capped at 8s
       const delay = aborts > 0 ? Math.min(800 * Math.pow(2, aborts - 1), 8000) : 800
       timerRef.current = setTimeout(start, delay)
     }
@@ -124,16 +103,14 @@ function useWakeWord(phrases, onDetected, enabled) {
     try {
       rec.start()
     } catch (err) {
-      console.error('[OTIS] failed to start wake recognition:', err)
+      console.error('[Jarvis] failed to start wake recognition:', err)
       _srBusy = false
       recRef.current = null
-      if (activeRef.current) {
-        timerRef.current = setTimeout(start, 2000)
-      }
+      if (activeRef.current) timerRef.current = setTimeout(start, 2000)
     }
   }, [phrases, onDetected, stop])
 
-  // Pause/resume on tab visibility so Chrome doesn't keep aborting in the background
+  // Pause on tab hidden, resume on tab visible
   useEffect(() => {
     const onVisible = () => {
       if (enabled && activeRef.current && !recRef.current) {
@@ -151,14 +128,9 @@ function useWakeWord(phrases, onDetected, enabled) {
       _srBusy = false
       setListening(false)
     }
-    document.addEventListener('visibilitychange', () => {
-      document.hidden ? onHidden() : onVisible()
-    })
-    return () => {
-      document.removeEventListener('visibilitychange', () => {
-        document.hidden ? onHidden() : onVisible()
-      })
-    }
+    const handler = () => { document.hidden ? onHidden() : onVisible() }
+    document.addEventListener('visibilitychange', handler)
+    return () => document.removeEventListener('visibilitychange', handler)
   }, [enabled, start])
 
   useEffect(() => {
@@ -176,15 +148,20 @@ function useWakeWord(phrases, onDetected, enabled) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// OtisLauncher — floating orb that opens the widget on click or voice
+// OtisLauncher — Siri-style JARVIS floating launcher
 // ─────────────────────────────────────────────────────────────────────────────
 export default function OtisLauncher() {
-  const { auth }  = useStore()
+  const { auth, theme } = useStore()
+  const isDark = theme === 'dark'
   const [isOpen, setIsOpen] = useState(false)
+  const [hovered, setHovered] = useState(false)
+  const [openMode, setOpenMode] = useState('manual')
 
-  const handleDetected = useCallback(() => setIsOpen(true), [])
+  const handleDetected = useCallback(() => {
+    setOpenMode('wake')
+    setIsOpen(true)
+  }, [])
 
-  // Wake word active when logged in and widget is closed
   const wakeEnabled = auth.isLoggedIn && !isOpen
   const listening   = useWakeWord(WAKE_PHRASES, handleDetected, wakeEnabled)
 
@@ -192,57 +169,143 @@ export default function OtisLauncher() {
 
   return (
     <>
+      <style>{`
+        @keyframes jarvis-ring {
+          0%,100% { transform: scale(1); opacity: 0.7; }
+          50%     { transform: scale(1.5); opacity: 0; }
+        }
+        @keyframes jarvis-fade-in {
+          from { opacity: 0; transform: translateY(-50%) translateX(6px); }
+          to   { opacity: 1; transform: translateY(-50%) translateX(0); }
+        }
+        @keyframes jarvis-launcher-glow {
+          0%,100% { box-shadow: ${isDark
+            ? '0 4px 20px rgba(76,201,240,0.3), 0 2px 8px rgba(0,0,0,0.4)'
+            : '0 4px 16px rgba(26,86,219,0.35), 0 2px 6px rgba(0,0,0,0.12)'}; }
+          50%     { box-shadow: ${isDark
+            ? '0 4px 30px rgba(76,201,240,0.5), 0 2px 8px rgba(0,0,0,0.4)'
+            : '0 4px 24px rgba(14,165,233,0.6), 0 2px 6px rgba(0,0,0,0.12)'}; }
+        }
+      `}</style>
+
+      {/* ── Launcher button ───────────────────────────────────────────────── */}
       {!isOpen && (
-        <>
-          <style>{`
-            @keyframes otl-ring  { 0%,100%{transform:scale(1);opacity:.55} 50%{transform:scale(1.5);opacity:0} }
-            @keyframes otl-ring2 { 0%,100%{transform:scale(1);opacity:.3}  50%{transform:scale(1.9);opacity:0} }
-            @keyframes otl-glow  { 0%,100%{opacity:.85} 50%{opacity:1} }
-            .otl-btn:hover { transform:scale(1.08)!important }
-            .otl-btn:hover .otl-label { opacity:1!important; transform:translateX(-4px)!important }
-          `}</style>
+        <div style={{
+          position: 'fixed',
+          bottom: '28px',
+          right: '28px',
+          zIndex: 9998,
+          width: '56px',
+          height: '56px',
+        }}>
+          {/* Pulsing rings — only while wake mic is open */}
+          {listening && (
+            <>
+              <div style={{
+                position: 'absolute',
+                inset: '-10px',
+                borderRadius: '50%',
+                background: isDark ? 'rgba(76,201,240,0.25)' : 'rgba(14,165,233,0.2)',
+                animation: 'jarvis-ring 2s ease-out infinite',
+                pointerEvents: 'none',
+              }} />
+              <div style={{
+                position: 'absolute',
+                inset: '-22px',
+                borderRadius: '50%',
+                background: isDark ? 'rgba(76,201,240,0.15)' : 'rgba(26,86,219,0.12)',
+                animation: 'jarvis-ring 2s 0.6s ease-out infinite',
+                pointerEvents: 'none',
+              }} />
+            </>
+          )}
 
-          <div style={{ position:'fixed', bottom:'100px', right:'28px', zIndex:9998 }}>
+          {/* Main button */}
+          <button
+            onClick={() => {
+              setOpenMode('manual')
+              setIsOpen(true)
+            }}
+            onMouseEnter={() => setHovered(true)}
+            onMouseLeave={() => setHovered(false)}
+            aria-label="Open Jarvis Voice Assistant"
+            title={listening ? 'Say "Hey Jarvis" or click' : 'Open Jarvis'}
+            style={{
+              width: '56px', height: '56px',
+              borderRadius: '50%',
+              border: isDark ? '2px solid rgba(255,255,255,0.15)' : '2px solid rgba(255,255,255,0.5)',
+              cursor: 'pointer',
+              position: 'relative',
+              overflow: 'hidden',
+              background: 'linear-gradient(135deg, #1a56db 0%, #0ea5e9 50%, #4CC9F0 100%)',
+              animation: 'jarvis-launcher-glow 3s ease-in-out infinite',
+              transform: hovered ? 'scale(1.06)' : 'scale(1)',
+              transition: 'transform 0.15s ease',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+            }}
+          >
+            {/* Specular highlight */}
+            <div style={{
+              position: 'absolute',
+              top: 0, left: 0,
+              width: '100%', height: '100%',
+              background: 'radial-gradient(circle at 30% 30%, rgba(255,255,255,0.3) 0%, transparent 60%)',
+              filter: 'blur(4px)',
+              pointerEvents: 'none',
+            }} />
 
-            {/* Pulsing rings — visible only while mic is open */}
-            {listening && (
-              <>
-                <div style={{ position:'absolute', inset:'-10px', borderRadius:'50%', background:'rgba(167,139,250,0.35)', animation:'otl-ring 2s ease-out infinite', pointerEvents:'none' }} />
-                <div style={{ position:'absolute', inset:'-22px', borderRadius:'50%', background:'rgba(96,165,250,0.2)',  animation:'otl-ring2 2s ease-out infinite 0.7s', pointerEvents:'none' }} />
-              </>
-            )}
+            {/* JARVIS wordmark */}
+            <span style={{
+              fontSize: '9px',
+              fontWeight: 800,
+              letterSpacing: '0.18em',
+              textTransform: 'uppercase',
+              color: 'rgba(255,255,255,0.95)',
+              fontFamily: "'Inter', system-ui, sans-serif",
+              position: 'relative',
+              zIndex: 1,
+            }}>
+              JARVIS
+            </span>
+          </button>
 
-            {/* Orb button */}
-            <button
-              className="otl-btn"
-              onClick={() => setIsOpen(true)}
-              aria-label="Open OTIS Voice Assistant"
-              title={listening ? 'Say "Hey Otis" or click' : 'Open OTIS'}
-              style={{
-                width:'56px', height:'56px', borderRadius:'50%',
-                border:'1.5px solid rgba(255,255,255,0.15)',
-                cursor:'pointer', position:'relative', overflow:'hidden',
-                background:'radial-gradient(circle at 32% 30%,rgba(96,165,250,0.95),transparent 52%),radial-gradient(circle at 68% 28%,rgba(167,139,250,0.9),transparent 52%),radial-gradient(circle at 50% 78%,rgba(244,114,182,0.85),transparent 48%),#0f0a2e',
-                boxShadow:'0 0 20px rgba(167,139,250,0.4),0 8px 24px rgba(0,0,0,0.4)',
-                animation:'otl-glow 3s ease-in-out infinite',
-                transition:'transform 0.2s ease,box-shadow 0.2s ease',
-              }}
-            >
-              <div style={{ position:'absolute', top:'14%', left:'18%', width:'30%', height:'30%', borderRadius:'50%', background:'rgba(255,255,255,0.4)', filter:'blur(4px)', pointerEvents:'none' }} />
-              <div style={{ position:'absolute', inset:0, display:'flex', alignItems:'center', justifyContent:'center', fontFamily:'-apple-system,BlinkMacSystemFont,"SF Pro Display",sans-serif', fontSize:'9px', fontWeight:'800', letterSpacing:'0.15em', color:'rgba(255,255,255,0.88)', textTransform:'uppercase' }}>
-                OTIS
-              </div>
-            </button>
-
-            {/* Hover label */}
-            <div className="otl-label" style={{ position:'absolute', right:'64px', top:'50%', transform:'translateY(-50%)', whiteSpace:'nowrap', padding:'5px 10px', borderRadius:'10px', background:'rgba(8,8,18,0.9)', backdropFilter:'blur(12px)', border:'1px solid rgba(255,255,255,0.1)', color:'rgba(255,255,255,0.7)', fontSize:'11px', fontWeight:'500', opacity:0, transition:'opacity 0.2s,transform 0.2s', pointerEvents:'none', fontFamily:'-apple-system,BlinkMacSystemFont,sans-serif' }}>
-              {listening ? 'Say "Hey Otis"' : 'Open OTIS'}
+          {/* Hover tooltip */}
+          {hovered && (
+            <div style={{
+              position: 'absolute',
+              right: '64px',
+              top: '50%',
+              transform: 'translateY(-50%)',
+              whiteSpace: 'nowrap',
+              pointerEvents: 'none',
+              padding: '6px 12px',
+              borderRadius: '10px',
+              fontSize: '12px',
+              fontWeight: 500,
+              fontFamily: "'Inter', system-ui, sans-serif",
+              background: isDark ? '#0d2244' : '#ffffff',
+              border: `1px solid ${isDark ? '#1e3a72' : '#e2e8f0'}`,
+              color: isDark ? '#f0f1ed' : '#0f172a',
+              boxShadow: '0 4px 12px rgba(0,0,0,0.08)',
+              animation: 'jarvis-fade-in 0.15s ease',
+            }}>
+              {listening ? 'Jarvis is listening…' : 'Say "Hey Jarvis"'}
             </div>
-          </div>
-        </>
+          )}
+        </div>
       )}
 
-      {isOpen && <OtisVoiceWidget onClose={() => setIsOpen(false)} />}
+      {/* ── Widget panel ─────────────────────────────────────────────────────── */}
+      {isOpen && (
+        <OtisVoiceWidget
+          autoStart
+          entryMode={openMode}
+          onClose={() => {
+            setIsOpen(false)
+            setOpenMode('manual')
+          }}
+        />
+      )}
     </>
   )
 }

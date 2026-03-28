@@ -36,6 +36,8 @@ from enum import Enum
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from database import get_db, table_columns
+from agents.query_engine import handle_query, format_query_result_for_voice, should_use_structured_query
+from auth import get_user_org
 from services.gemini_service import gemini
 from services.wake_word_service import WakeWordService
 from services.deepgram_service import SpeechToTextService
@@ -164,9 +166,21 @@ class OtisAgent:
                 raise ValueError(f"User {self.user_id} not found")
 
             self.user = dict(user_row)
+            membership = get_user_org(self.user_id)
+            if membership:
+                if not self.user.get("org_id"):
+                    self.user["org_id"] = membership.get("org_id")
+                if membership.get("org_role"):
+                    self.user["org_role"] = membership.get("org_role")
+                if membership.get("org_name"):
+                    self.user["org_name"] = membership.get("org_name")
+                if membership.get("org_slug"):
+                    self.user["org_slug"] = membership.get("org_slug")
+            if self.org_id and not self.user.get("org_id"):
+                self.user["org_id"] = self.org_id
 
             # Check if user is admin (OTIS admin-only mode)
-            if Config.OTIS_ADMIN_ONLY and self.user.get("role") not in ("admin", "manager"):
+            if Config.OTIS_ADMIN_ONLY and self.user.get("role") not in ("admin", "manager", "super_admin"):
                 logger.warning(
                     f"[OTIS Agent] User {self.user_id} ({self.user.get('role')}) "
                     f"attempted to use OTIS (admin-only mode)"
@@ -440,10 +454,22 @@ class OtisAgent:
             # Build conversation history for Gemini
             conversation_history = self._get_conversation_history()
 
-            # Decide if we should use function calling or simple chat
-            use_functions = self._function_registry is not None and self._should_use_functions(command_text)
-
             response_text = None
+            use_functions = False
+            structured_query = None
+            structured_response = None
+            if should_use_structured_query(command_text):
+                structured_query = handle_query(self.user, command_text, strict=True)
+                structured_response = format_query_result_for_voice(structured_query, command_text)
+
+            if structured_response:
+                function_called = f"structured_query:{structured_query.get('type')}"
+                function_result = structured_query.get("data")
+                response_text = structured_response
+
+            else:
+                # Decide if we should use function calling or simple chat
+                use_functions = self._function_registry is not None and self._should_use_functions(command_text)
 
             if use_functions:
                 # Function calling workflow
@@ -510,7 +536,7 @@ class OtisAgent:
                     # Gemini responded with text (no function needed)
                     response_text = result["text"]
 
-            else:
+            elif not response_text:
                 # Simple conversation (no functions)
                 logger.debug("[OTIS Agent] Using simple conversation mode")
 
@@ -586,7 +612,11 @@ class OtisAgent:
             "user_name": self.user.get("name", "there"),
             "user_role": self.user.get("role", "user"),
             "user_department": self.user.get("department"),
+            "org_id": self.user.get("org_id"),
+            "org_name": self.user.get("org_name"),
+            "org_role": self.user.get("org_role"),
             "pending_approvals_count": 0,
+            "org_member_count": 0,
             "upcoming_trips_count": 0,
             "recent_expense_count": 0,
             "pending_expenses_count": 0,
@@ -597,16 +627,33 @@ class OtisAgent:
             db = get_db()
 
             # Count pending approvals (for admins/managers)
-            if self.user.get("role") in ("manager", "admin"):
+            if self.user.get("role") in ("manager", "admin", "super_admin"):
                 try:
-                    result = db.execute(
-                        "SELECT COUNT(*) as cnt FROM approvals "
-                        "WHERE approver_id = ? AND status = 'pending'",
-                        (self.user_id,)
-                    ).fetchone()
+                    if self.user.get("role") == "super_admin" and self.user.get("org_id"):
+                        result = db.execute(
+                            "SELECT COUNT(*) as cnt FROM travel_requests "
+                            "WHERE org_id = ? AND status = 'submitted'",
+                            (self.user.get("org_id"),)
+                        ).fetchone()
+                    else:
+                        result = db.execute(
+                            "SELECT COUNT(*) as cnt FROM approvals "
+                            "WHERE approver_id = ? AND status = 'pending'",
+                            (self.user_id,)
+                        ).fetchone()
                     context["pending_approvals_count"] = dict(result).get("cnt", 0)
                 except Exception as e:
                     logger.debug(f"[OTIS Agent] Context approvals error: {e}")
+
+            if self.user.get("org_id") and self.user.get("role") in ("admin", "super_admin"):
+                try:
+                    result = db.execute(
+                        "SELECT COUNT(*) as cnt FROM org_members WHERE org_id = ?",
+                        (self.user.get("org_id"),)
+                    ).fetchone()
+                    context["org_member_count"] = dict(result).get("cnt", 0)
+                except Exception as e:
+                    logger.debug(f"[OTIS Agent] Context org member count error: {e}")
 
             # Count upcoming trips (next 30 days)
             try:
@@ -741,17 +788,6 @@ You are speaking to {self.user.get('name')}, who is a {self.user.get('role')}.
 - Analytics: get_travel_stats, get_spend_report
 - Policy: get_travel_policy
 - Quick: get_my_schedule_today
-
-**Examples:**
-User: "What pending approvals do I have?"
-→ Call get_pending_approvals()
-
-User: "Approve John's Mumbai trip"
-→ Call approve_trip(request_id=?, destination="Mumbai")
-  (If request_id not known, call get_pending_approvals first to find it)
-
-User: "Show me my trips"
-→ Call get_my_trips()
 """
 
     def _build_context(self) -> str:
@@ -769,6 +805,10 @@ User: "Show me my trips"
             f"(role: {self.user.get('role')}, "
             f"department: {self.user.get('department', 'N/A')})"
         )
+        if self.user.get("org_id"):
+            org_name = self.user.get("org_name") or f"Organization {self.user.get('org_id')}"
+            org_role = self.user.get("org_role", "member")
+            context_parts.append(f"Active organization: {org_name} (org role: {org_role})")
 
         try:
             db = get_db()
@@ -799,17 +839,34 @@ User: "Show me my trips"
                 logger.debug(f"[OTIS Agent] Context trips error: {e}")
 
             # Pending approvals (for admins/managers)
-            if self.user.get("role") in ("manager", "admin"):
+            if self.user.get("role") in ("manager", "admin", "super_admin"):
                 try:
-                    pending = db.execute(
-                        "SELECT COUNT(*) as cnt FROM approvals "
-                        "WHERE approver_id = ? AND status = 'pending'",
-                        (self.user_id,)
-                    ).fetchone()
+                    if self.user.get("role") == "super_admin" and self.user.get("org_id"):
+                        pending = db.execute(
+                            "SELECT COUNT(*) as cnt FROM travel_requests "
+                            "WHERE org_id = ? AND status = 'submitted'",
+                            (self.user.get("org_id"),)
+                        ).fetchone()
+                    else:
+                        pending = db.execute(
+                            "SELECT COUNT(*) as cnt FROM approvals "
+                            "WHERE approver_id = ? AND status = 'pending'",
+                            (self.user_id,)
+                        ).fetchone()
                     cnt = dict(pending).get("cnt", 0)
                     context_parts.append(f"Pending approvals: {cnt}")
                 except Exception as e:
                     logger.debug(f"[OTIS Agent] Context approvals error: {e}")
+
+            if self.user.get("org_id") and self.user.get("role") in ("admin", "super_admin"):
+                try:
+                    members = db.execute(
+                        "SELECT COUNT(*) as cnt FROM org_members WHERE org_id = ?",
+                        (self.user.get("org_id"),)
+                    ).fetchone()
+                    context_parts.append(f"Organization members: {dict(members).get('cnt', 0)}")
+                except Exception as e:
+                    logger.debug(f"[OTIS Agent] Context org members error: {e}")
 
             db.close()
 
@@ -837,13 +894,6 @@ User: "Show me my trips"
 - Numbers: say "three" not "3", "five thousand rupees" not "₹5000"
 - Always confirm actions: "I've approved the Mumbai trip for John"
 - If uncertain, ask ONE follow-up question
-
-## Examples
-❌ BAD: "Here are your pending approvals:\n- Mumbai trip for John\n- Delhi trip for Sarah"
-✅ GOOD: "You have two pending approvals. Mumbai trip for John and Delhi trip for Sarah."
-
-❌ BAD: "**Trip approved**. Request ID: TR-2024-001"
-✅ GOOD: "Done. I've approved John's Mumbai trip."
 
 ## Important
 - Keep responses SHORT - this is a voice conversation

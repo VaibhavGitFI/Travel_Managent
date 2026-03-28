@@ -97,7 +97,7 @@ def create_app() -> Flask:
 
     @app.after_request
     def set_csrf_cookie(response):
-        """Ensure CSRF cookie stays in sync with session on every response."""
+        """Ensure CSRF cookie and response header stay in sync with session on every response."""
         from flask import session as flask_session
         csrf_token = flask_session.get("_csrf_token")
         if csrf_token and "user_id" in flask_session:
@@ -106,6 +106,9 @@ def create_app() -> Flask:
                 httponly=False, samesite="Lax",
                 secure=not Config.DEBUG, max_age=86400,
             )
+            # Also expose token as a response header so the frontend can cache it
+            # in memory without relying on cookie availability
+            response.headers["X-CSRF-Token"] = csrf_token
         return response
 
     with app.app_context():

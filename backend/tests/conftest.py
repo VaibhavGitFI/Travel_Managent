@@ -57,6 +57,26 @@ def app():
     # Disable rate limiting during tests
     from extensions import limiter
     limiter.enabled = False
+
+    # config.py uses load_dotenv(override=True) which may have loaded the real DATABASE_URL
+    # from backend/.env, overriding the empty value set above.
+    # Force SQLite for all tests by clearing DATABASE_URL and closing any live Supabase pool.
+    import os
+    import database as _db_mod
+    os.environ["DATABASE_URL"] = ""
+    if _db_mod._pg_pool is not None:
+        try:
+            _db_mod._pg_pool.closeall()
+        except Exception:
+            pass
+        _db_mod._pg_pool = None
+
+    # Re-initialize tables on the local SQLite file now that DATABASE_URL is cleared.
+    # (create_app() may have run init_db() against Supabase; this ensures SQLite is ready.)
+    with application.app_context():
+        from database import init_db
+        init_db()
+
     yield application
 
 
