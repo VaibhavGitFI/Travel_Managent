@@ -12,18 +12,20 @@ import useStore from '../../store/useStore'
 const S = {
   IDLE: 'idle',
   CONNECTING: 'connecting',
-  READY: 'ready',
+  READY: 'ready',        // continuously listening for wake phrase
   LISTENING: 'listening',
   PROCESSING: 'processing',
   SPEAKING: 'speaking',
   ERROR: 'error',
 }
 
+const WAKE_PHRASES = ['hey otis', 'hey jarvis', 'otis']
+
 // Orb visual config per state
 const ORB = {
   [S.IDLE]:       { grad: 'radial-gradient(circle at 35% 30%, #60a5fa, #1d4ed8 55%, #0f172a)', glow: 'rgba(59,130,246,0.25)', dur: '3s', anim: 'ot-breathe' },
   [S.CONNECTING]: { grad: 'radial-gradient(circle at 35% 30%, #94a3b8, #475569 55%, #0f172a)', glow: 'rgba(148,163,184,0.2)', dur: '1s', anim: 'ot-breathe' },
-  [S.READY]:      { grad: 'radial-gradient(circle at 35% 30%, #34d399, #059669 55%, #064e3b)', glow: 'rgba(52,211,153,0.25)', dur: '3s', anim: 'ot-breathe' },
+  [S.READY]:      { grad: 'radial-gradient(circle at 35% 30%, #34d399, #059669 55%, #064e3b)', glow: 'rgba(52,211,153,0.18)', dur: '4s', anim: 'ot-breathe' },
   [S.LISTENING]:  { grad: 'radial-gradient(circle at 30% 30%, rgba(96,165,250,0.95), transparent 52%), radial-gradient(circle at 72% 28%, rgba(167,139,250,0.9), transparent 52%), radial-gradient(circle at 50% 78%, rgba(244,114,182,0.85), transparent 48%), #0f0a2e', glow: 'rgba(167,139,250,0.45)', dur: '0.55s', anim: 'ot-listen' },
   [S.PROCESSING]: { grad: 'radial-gradient(circle at 28% 28%, rgba(251,191,36,0.95), transparent 52%), radial-gradient(circle at 72% 28%, rgba(251,146,60,0.9), transparent 52%), radial-gradient(circle at 50% 78%, rgba(239,68,68,0.7), transparent 48%), #1a0800', glow: 'rgba(251,191,36,0.35)', dur: '0.9s', anim: 'ot-spin' },
   [S.SPEAKING]:   { grad: 'radial-gradient(circle at 30% 30%, rgba(52,211,153,0.95), transparent 52%), radial-gradient(circle at 70% 30%, rgba(96,165,250,0.85), transparent 52%), radial-gradient(circle at 50% 78%, rgba(167,139,250,0.75), transparent 48%), #021a14', glow: 'rgba(52,211,153,0.4)', dur: '0.7s', anim: 'ot-speak' },
@@ -33,7 +35,7 @@ const ORB = {
 const LABEL = {
   [S.IDLE]:       'Initializing…',
   [S.CONNECTING]: 'Connecting…',
-  [S.READY]:      'Tap orb to speak',
+  [S.READY]:      'Say "Hey Otis" or tap orb',
   [S.LISTENING]:  'Listening…',
   [S.PROCESSING]: 'Thinking…',
   [S.SPEAKING]:   'Speaking…',
@@ -49,8 +51,11 @@ export default function OtisVoiceWidget({ onClose }) {
   const [history, setHistory] = useState([])
   const [showHistory, setShowHistory] = useState(false)
   const [inputText, setInputText] = useState('')
+  const [wakeLog, setWakeLog] = useState('wake: idle')  // visible debug line
 
   const recognitionRef = useRef(null)
+  const wakeRecRef = useRef(null)
+  const wakeActiveRef = useRef(false)   // true = we WANT wake listening right now
   const stateRef = useRef(S.IDLE)
   const sessionIdRef = useRef(null)
   const historyEndRef = useRef(null)
@@ -69,12 +74,25 @@ export default function OtisVoiceWidget({ onClose }) {
     initSession()
     return () => {
       stopListening()
+      stopWakeListening()
       if (window.speechSynthesis) window.speechSynthesis.cancel()
       if (sessionIdRef.current) {
         stopOtisSession(sessionIdRef.current).catch(() => {})
       }
     }
   }, [])
+
+  // Start/stop background wake-word listening whenever state changes
+  useEffect(() => {
+    console.log('[OTIS Wake] state =>', state)
+    if (state === S.READY) {
+      wakeActiveRef.current = true          // mark as wanted
+      const t = setTimeout(startWakeListening, 400)
+      return () => clearTimeout(t)
+    } else {
+      stopWakeListening()                   // also sets wakeActiveRef = false
+    }
+  }, [state]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const initSession = async () => {
     setState(S.CONNECTING)
@@ -95,10 +113,95 @@ export default function OtisVoiceWidget({ onClose }) {
     }
   }
 
+  // ── Wake word (continuous background listener) ────────────────────────────
+
+  const stopWakeListening = () => {
+    wakeActiveRef.current = false          // tell onend NOT to restart
+    if (wakeRecRef.current) {
+      try { wakeRecRef.current.stop() } catch {}
+      wakeRecRef.current = null
+    }
+  }
+
+  const startWakeListening = () => {
+    const tag = `[OTIS Wake] startWakeListening — wakeActive:${wakeActiveRef.current} running:${!!wakeRecRef.current}`
+    console.log(tag)
+    setWakeLog(tag)
+
+    if (!wakeActiveRef.current) { setWakeLog('wake: skipped (not wanted)'); return }
+    if (wakeRecRef.current)     { setWakeLog('wake: skipped (already running)'); return }
+
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition
+    if (!SR) {
+      const msg = 'wake: SpeechRecognition NOT supported in this browser'
+      console.warn('[OTIS Wake]', msg)
+      setWakeLog(msg)
+      return
+    }
+
+    const rec = new SR()
+    rec.continuous = true
+    rec.interimResults = true
+    rec.lang = 'en-IN'
+
+    rec.onstart = () => {
+      console.log('[OTIS Wake] 👂 mic open — say "Hey Otis"')
+      setWakeLog('wake: 👂 listening — say "Hey Otis"')
+    }
+
+    rec.onresult = (e) => {
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        const isFinal = e.results[i].isFinal
+        const text = e.results[i][0].transcript.toLowerCase().trim()
+        console.log(`[OTIS Wake] heard (${isFinal ? 'final' : 'interim'}): "${text}"`)
+        setWakeLog(`wake: heard → "${text}"`)
+        if (WAKE_PHRASES.some(p => text.includes(p))) {
+          console.log('[OTIS Wake] ✅ WAKE PHRASE DETECTED — activating!')
+          setWakeLog('wake: ✅ wake phrase detected — activating!')
+          stopWakeListening()
+          setTimeout(() => {
+            if (stateRef.current === S.READY) startListening()
+          }, 250)
+          break
+        }
+      }
+    }
+
+    rec.onerror = (e) => {
+      console.warn('[OTIS Wake] error:', e.error)
+      setWakeLog(`wake: error — ${e.error}`)
+      wakeRecRef.current = null
+      if (e.error !== 'not-allowed' && wakeActiveRef.current) {
+        setTimeout(startWakeListening, 1000)
+      }
+    }
+
+    rec.onend = () => {
+      console.log('[OTIS Wake] ended — wakeActive:', wakeActiveRef.current)
+      setWakeLog(`wake: ended (wantRestart:${wakeActiveRef.current})`)
+      wakeRecRef.current = null
+      if (wakeActiveRef.current) {
+        setTimeout(startWakeListening, 300)
+      }
+    }
+
+    wakeRecRef.current = rec
+    try {
+      rec.start()
+      console.log('[OTIS Wake] rec.start() called')
+      setWakeLog('wake: starting…')
+    } catch (err) {
+      console.error('[OTIS Wake] failed to start:', err)
+      setWakeLog(`wake: failed to start — ${err}`)
+      wakeRecRef.current = null
+    }
+  }
+
   // ── Voice input ─────────────────────────────────────────────────────────────
 
   const startListening = useCallback(() => {
     if (stateRef.current === S.LISTENING || stateRef.current === S.PROCESSING || stateRef.current === S.CONNECTING) return
+    stopWakeListening()  // release mic before command capture (no-op if not running)
 
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition
     if (!SR) {
@@ -515,6 +618,23 @@ export default function OtisVoiceWidget({ onClose }) {
             <div ref={historyEndRef} />
           </div>
         )}
+
+        {/* ── Wake debug bar (remove once wake word is confirmed working) ────── */}
+        <div style={{
+          padding: '4px 16px 6px',
+          fontFamily: 'monospace',
+          fontSize: '10px',
+          color: wakeLog.includes('👂') ? '#34d399'
+               : wakeLog.includes('✅') ? '#fbbf24'
+               : wakeLog.includes('error') || wakeLog.includes('failed') ? '#f87171'
+               : 'rgba(255,255,255,0.3)',
+          borderTop: '1px solid rgba(255,255,255,0.04)',
+          whiteSpace: 'nowrap',
+          overflow: 'hidden',
+          textOverflow: 'ellipsis',
+        }}>
+          {wakeLog}
+        </div>
 
         {/* ── Text input ─────────────────────────────────────────────────────── */}
         <div style={{

@@ -188,12 +188,15 @@ class OtisAgent:
         """Initialize voice services (wake word, STT, TTS)."""
         try:
             # Initialize wake word service
-            if Config.PORCUPINE_ACCESS_KEY:
-                try:
-                    self._wake_word = WakeWordService()
-                    logger.info("[OTIS Agent] ✅ Wake word service initialized")
-                except Exception as e:
-                    logger.warning(f"[OTIS Agent] Wake word init failed: {e}")
+            # Auto-selects Porcupine (if PORCUPINE_ACCESS_KEY is set) or OpenWakeWord (free fallback)
+            try:
+                self._wake_word = WakeWordService()
+                logger.info(
+                    f"[OTIS Agent] ✅ Wake word service initialized "
+                    f"(backend: {self._wake_word.config.backend})"
+                )
+            except Exception as e:
+                logger.warning(f"[OTIS Agent] Wake word init failed: {e}")
 
             # Initialize STT service
             self._stt = SpeechToTextService()

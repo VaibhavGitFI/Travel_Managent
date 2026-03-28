@@ -1,21 +1,18 @@
 """
 OTIS Voice Agent - Wake Word Detection Service
-Powered by Porcupine from Picovoice
+Dual-backend: Porcupine (Picovoice) or OpenWakeWord, selected automatically.
 
-This service listens for the wake word "Hey Otis" to activate voice sessions.
-Uses Porcupine's highly accurate, offline wake word detection engine.
+Selection logic:
+    • PORCUPINE_ACCESS_KEY is set  → use Picovoice Porcupine (high accuracy, paid)
+    • No key                       → use OpenWakeWord (open-source, free, no key needed)
 
-Architecture:
-    Audio Stream → Audio Frames → Porcupine Engine → Wake Word Detected (True/False)
+Switching backends requires only adding / removing PORCUPINE_ACCESS_KEY from backend/.env.
+No code changes needed.
 
-Performance:
-    - Detection Latency: <100ms
-    - False Positive Rate: <0.01%
-    - CPU Usage: <1% (offline processing)
-    - Privacy: All processing happens locally (no cloud API calls)
-
-Author: TravelSync Pro Team
-Date: 2026-03-26
+Custom "Hey Otis" wake word:
+    Porcupine  → train at https://console.picovoice.ai/, set OTIS_WAKE_WORD_MODEL to .ppn path
+    OpenWakeWord → train at https://github.com/dscripka/openWakeWord, set OTIS_WAKE_WORD_MODEL to .onnx path
+    Default fallback for both backends: built-in "jarvis" / "hey_jarvis" keyword
 """
 
 import sys
@@ -27,92 +24,79 @@ from typing import Optional, Callable
 from dataclasses import dataclass
 from enum import Enum
 
-# Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import Config
 
-# Will import pvporcupine when service is initialized
-# This allows the service to fail gracefully if porcupine is not installed
-pvporcupine = None
-
 logger = logging.getLogger(__name__)
 
+# ── Constants ──────────────────────────────────────────────────────────────────
+
+# OpenWakeWord standard chunk = 80 ms at 16 kHz
+OWW_FRAME_LENGTH = 1280
+# Porcupine standard chunk = 512 samples at 16 kHz
+PORCUPINE_FRAME_LENGTH = 512
+SAMPLE_RATE = 16000
+
+
+# ── Status enum (shared) ───────────────────────────────────────────────────────
 
 class WakeWordStatus(Enum):
-    """Wake word detection status states."""
-    IDLE = "idle"                    # Not listening
-    LISTENING = "listening"          # Actively listening for wake word
-    DETECTED = "detected"            # Wake word just detected
-    ERROR = "error"                  # Error state
-    STOPPED = "stopped"              # Service stopped
+    IDLE = "idle"
+    LISTENING = "listening"
+    DETECTED = "detected"
+    ERROR = "error"
+    STOPPED = "stopped"
 
+
+# ── Config dataclass ───────────────────────────────────────────────────────────
 
 @dataclass
 class WakeWordConfig:
-    """Configuration for wake word detection."""
-    access_key: str                  # Porcupine access key
-    keyword: str = "Hey Otis"        # Wake word phrase
-    sensitivity: float = 0.5         # Detection sensitivity (0.0 to 1.0)
-    sample_rate: int = 16000         # Audio sample rate (Hz)
-    frame_length: int = 512          # Audio frame length (samples)
+    """Unified configuration for either backend."""
+    access_key: str = ""          # Porcupine access key (empty → use OpenWakeWord)
+    model_path: str = ""          # Custom .ppn (Porcupine) or .onnx (OpenWakeWord) file
+    keyword: str = "Hey Otis"     # Human-readable label
+    threshold: float = 0.5        # Sensitivity / detection threshold (0.0–1.0)
+    sample_rate: int = SAMPLE_RATE
+    frame_length: int = OWW_FRAME_LENGTH  # Updated after backend init
 
     def __post_init__(self):
-        """Validate configuration after initialization."""
-        if not self.access_key:
-            raise ValueError("Porcupine access key is required")
+        if not 0.0 <= self.threshold <= 1.0:
+            raise ValueError(f"threshold must be 0.0–1.0, got {self.threshold}")
 
-        if not 0.0 <= self.sensitivity <= 1.0:
-            raise ValueError(f"Sensitivity must be between 0.0 and 1.0, got {self.sensitivity}")
+    @property
+    def backend(self) -> str:
+        return "porcupine" if self.access_key else "openwakeword"
 
-        if self.sample_rate not in [16000, 8000]:
-            logger.warning(f"Non-standard sample rate {self.sample_rate}Hz. Porcupine works best at 16kHz.")
 
+# ── Main service ───────────────────────────────────────────────────────────────
 
 class WakeWordService:
     """
-    Wake word detection service using Porcupine.
+    Wake word detection service with automatic backend selection.
 
-    This service provides always-listening wake word detection with minimal CPU usage.
-    It processes audio in real-time and triggers callbacks when "Hey Otis" is detected.
+    With Porcupine (requires PORCUPINE_ACCESS_KEY):
+        - <100 ms latency, <0.01 % false-positive rate
+        - Needs free key from https://console.picovoice.ai/
 
-    Features:
-        - Offline processing (no cloud API calls)
-        - Thread-safe operation
-        - Automatic resource cleanup
-        - Comprehensive error handling
-        - Configurable sensitivity
-        - Multiple callback support
+    With OpenWakeWord (no key required):
+        - Fully offline, open-source
+        - Slightly lower accuracy; good enough for most use cases
 
     Usage:
-        >>> config = WakeWordConfig(access_key="your_key")
-        >>> service = WakeWordService(config)
-        >>> service.start_listening(on_wake_word_detected=lambda: print("Otis activated!"))
-        >>> # ... do other work ...
-        >>> service.stop_listening()
+        >>> service = WakeWordService()
+        >>> service.start_listening(on_wake_word_detected=lambda: print("Otis!"))
+        >>> # feed 1280-byte audio frames via process_audio_frame()
+        >>> service.cleanup()
     """
 
     def __init__(self, config: Optional[WakeWordConfig] = None):
-        """
-        Initialize the wake word detection service.
-
-        Args:
-            config: Wake word configuration. If None, loads from environment.
-
-        Raises:
-            ImportError: If pvporcupine package is not installed
-            ValueError: If configuration is invalid
-            RuntimeError: If Porcupine initialization fails
-        """
-        # Load Porcupine library
-        self._load_porcupine_library()
-
-        # Initialize configuration
         if config is None:
             config = self._load_config_from_env()
-
         self.config = config
-        self._porcupine = None
+
+        self._engine = None        # Porcupine engine OR OpenWakeWord Model
         self._status = WakeWordStatus.IDLE
         self._callbacks = []
         self._lock = threading.Lock()
@@ -120,522 +104,247 @@ class WakeWordService:
         self._false_positive_count = 0
         self._last_detection_time = None
 
-        # Initialize Porcupine engine
-        self._initialize_porcupine()
+        if self.config.backend == "porcupine":
+            self._init_porcupine()
+        else:
+            self._init_openwakeword()
 
         logger.info(
-            f"[OTIS Wake Word] Service initialized. "
-            f"Wake word: '{self.config.keyword}', "
-            f"Sensitivity: {self.config.sensitivity}, "
-            f"Sample rate: {self.config.sample_rate}Hz"
+            f"[OTIS Wake Word] Initialized with backend='{self.config.backend}', "
+            f"keyword='{self.config.keyword}', threshold={self.config.threshold}, "
+            f"frame_length={self.config.frame_length}"
         )
 
-    def _load_porcupine_library(self):
-        """
-        Load the Porcupine library dynamically.
+    # ── Config loading ─────────────────────────────────────────────────────────
 
-        Raises:
-            ImportError: If pvporcupine is not installed
-        """
-        global pvporcupine
+    @staticmethod
+    def _load_config_from_env() -> WakeWordConfig:
+        return WakeWordConfig(
+            access_key=Config.PORCUPINE_ACCESS_KEY or "",
+            model_path=os.getenv("OTIS_WAKE_WORD_MODEL", ""),
+            keyword=Config.OTIS_WAKE_WORD or "Hey Otis",
+            threshold=float(os.getenv("OTIS_WAKE_WORD_SENSITIVITY", "0.5")),
+        )
+
+    # ── Backend: Porcupine ─────────────────────────────────────────────────────
+
+    def _init_porcupine(self):
         try:
             import pvporcupine as pv
-            pvporcupine = pv
-            logger.debug("[OTIS Wake Word] Porcupine library loaded successfully")
-        except ImportError as e:
-            logger.error(
-                "[OTIS Wake Word] Failed to import pvporcupine. "
-                "Install with: pip install pvporcupine"
-            )
+        except ImportError:
             raise ImportError(
-                "pvporcupine is required for wake word detection. "
-                "Install it with: pip install pvporcupine"
-            ) from e
-
-    def _load_config_from_env(self) -> WakeWordConfig:
-        """
-        Load wake word configuration from environment variables.
-
-        Returns:
-            WakeWordConfig: Configuration loaded from environment
-
-        Raises:
-            ValueError: If PORCUPINE_ACCESS_KEY is not set
-        """
-        access_key = Config.PORCUPINE_ACCESS_KEY
-
-        if not access_key:
-            raise ValueError(
-                "PORCUPINE_ACCESS_KEY is not set. "
-                "Get your access key from https://console.picovoice.ai/ "
-                "and add it to backend/.env"
+                "pvporcupine is not installed. "
+                "Run: pip install pvporcupine  OR  remove PORCUPINE_ACCESS_KEY to use OpenWakeWord."
             )
 
-        # Load optional configuration
-        keyword = Config.OTIS_WAKE_WORD or "Hey Otis"
-
-        # Sensitivity: higher = more detections (more false positives)
-        #              lower = fewer detections (might miss real ones)
-        # 0.5 is a good balanced default
-        sensitivity = float(os.getenv("OTIS_WAKE_WORD_SENSITIVITY", "0.5"))
-
-        logger.debug(
-            f"[OTIS Wake Word] Loaded config from environment: "
-            f"keyword='{keyword}', sensitivity={sensitivity}"
-        )
-
-        return WakeWordConfig(
-            access_key=access_key,
-            keyword=keyword,
-            sensitivity=sensitivity
-        )
-
-    def _initialize_porcupine(self):
-        """
-        Initialize the Porcupine wake word detection engine.
-
-        This creates the Porcupine instance with the configured wake word.
-        Porcupine supports custom keywords and built-in keywords.
-
-        Raises:
-            RuntimeError: If Porcupine initialization fails
-        """
         try:
-            # For custom keywords like "Hey Otis", we need to use keyword_paths
-            # For now, we'll use Porcupine's built-in keywords
-            # In production, train a custom model at https://console.picovoice.ai/
+            custom = self.config.model_path and os.path.isfile(self.config.model_path)
+            if custom:
+                logger.info(f"[OTIS Wake Word] Porcupine: loading custom model {self.config.model_path}")
+                self._engine = pv.create(
+                    access_key=self.config.access_key,
+                    keyword_paths=[self.config.model_path],
+                    sensitivities=[self.config.threshold],
+                )
+            else:
+                # Fall back to built-in keyword until custom 'Hey Otis' model is trained
+                logger.info(
+                    "[OTIS Wake Word] Porcupine: no custom model — using built-in 'jarvis'. "
+                    "Train a custom model at https://console.picovoice.ai/ and set OTIS_WAKE_WORD_MODEL."
+                )
+                self._engine = pv.create(
+                    access_key=self.config.access_key,
+                    keywords=["jarvis"],
+                    sensitivities=[self.config.threshold],
+                )
 
-            # Built-in keywords that are similar (we'll use "jarvis" as placeholder)
-            # TODO: Train custom "Hey Otis" model and replace this
-            keyword_to_use = "jarvis"  # Built-in keyword closest to "Otis"
-
-            logger.info(
-                f"[OTIS Wake Word] Initializing Porcupine engine... "
-                f"Using built-in keyword: '{keyword_to_use}' "
-                f"(TODO: Replace with custom 'Hey Otis' model)"
-            )
-
-            self._porcupine = pvporcupine.create(
-                access_key=self.config.access_key,
-                keywords=[keyword_to_use],
-                sensitivities=[self.config.sensitivity]
-            )
-
-            # Update config with actual sample rate and frame length from Porcupine
-            self.config.sample_rate = self._porcupine.sample_rate
-            self.config.frame_length = self._porcupine.frame_length
-
-            logger.info(
-                f"[OTIS Wake Word] Porcupine initialized successfully. "
-                f"Sample rate: {self._porcupine.sample_rate}Hz, "
-                f"Frame length: {self._porcupine.frame_length} samples"
-            )
-
+            self.config.sample_rate = self._engine.sample_rate
+            self.config.frame_length = self._engine.frame_length
             self._status = WakeWordStatus.IDLE
 
         except Exception as e:
             self._status = WakeWordStatus.ERROR
-            logger.error(f"[OTIS Wake Word] Failed to initialize Porcupine: {e}")
-            raise RuntimeError(f"Porcupine initialization failed: {e}") from e
+            raise RuntimeError(f"Porcupine init failed: {e}") from e
+
+    # ── Backend: OpenWakeWord ──────────────────────────────────────────────────
+
+    def _init_openwakeword(self):
+        try:
+            from openwakeword.model import Model as OWWModel
+        except ImportError:
+            raise ImportError(
+                "openwakeword is not installed. "
+                "Run: pip install openwakeword"
+            )
+
+        try:
+            custom = self.config.model_path and os.path.isfile(self.config.model_path)
+            if custom:
+                models = [self.config.model_path]
+                logger.info(f"[OTIS Wake Word] OpenWakeWord: loading custom model {self.config.model_path}")
+            else:
+                models = ["hey_jarvis"]
+                logger.info(
+                    "[OTIS Wake Word] OpenWakeWord: no custom model — using built-in 'hey_jarvis'. "
+                    "Say 'Hey Jarvis' to activate OTIS for now. "
+                    "Train a custom model and set OTIS_WAKE_WORD_MODEL=/path/to/hey_otis.onnx."
+                )
+
+            self._engine = OWWModel(wakeword_models=models, inference_framework="onnx")
+            self.config.frame_length = OWW_FRAME_LENGTH
+            self._status = WakeWordStatus.IDLE
+
+        except Exception as e:
+            self._status = WakeWordStatus.ERROR
+            raise RuntimeError(f"OpenWakeWord init failed: {e}") from e
+
+    # ── Core detection ─────────────────────────────────────────────────────────
 
     def process_audio_frame(self, audio_frame: bytes) -> bool:
         """
-        Process a single audio frame and check for wake word.
-
-        This is the core detection method. Call this repeatedly with audio frames
-        from your audio input stream. Returns True when wake word is detected.
+        Feed one audio chunk; returns True if the wake word is detected.
 
         Args:
-            audio_frame: Raw audio data (16-bit PCM, mono, at configured sample rate)
-                        Must be exactly frame_length samples (512 samples = 1024 bytes)
-
-        Returns:
-            bool: True if wake word detected in this frame, False otherwise
-
-        Raises:
-            RuntimeError: If service is not initialized or in error state
-            ValueError: If audio frame is wrong size
-
-        Example:
-            >>> import pyaudio
-            >>> pa = pyaudio.PyAudio()
-            >>> stream = pa.open(rate=16000, channels=1, format=pyaudio.paInt16, input=True, frames_per_buffer=512)
-            >>> while True:
-            ...     frame = stream.read(512)
-            ...     if service.process_audio_frame(frame):
-            ...         print("Wake word detected!")
-            ...         break
+            audio_frame: Raw 16-bit PCM bytes.
+                         Must be exactly frame_length * 2 bytes.
         """
         with self._lock:
-            # Validate state
-            if self._status == WakeWordStatus.ERROR:
-                raise RuntimeError("Wake word service is in error state. Restart required.")
+            if self._status != WakeWordStatus.LISTENING:
+                return False
 
-            if self._status == WakeWordStatus.STOPPED:
-                raise RuntimeError("Wake word service is stopped. Call start_listening() first.")
-
-            if self._porcupine is None:
-                raise RuntimeError("Porcupine engine not initialized")
-
-            # Validate audio frame size
-            expected_bytes = self.config.frame_length * 2  # 2 bytes per 16-bit sample
-            if len(audio_frame) != expected_bytes:
+            expected = self.config.frame_length * 2
+            if len(audio_frame) != expected:
                 raise ValueError(
-                    f"Invalid audio frame size. Expected {expected_bytes} bytes "
-                    f"({self.config.frame_length} samples), got {len(audio_frame)} bytes"
+                    f"Wrong frame size: expected {expected} bytes "
+                    f"({self.config.frame_length} samples), got {len(audio_frame)}"
                 )
 
             try:
-                # Convert bytes to 16-bit integer array
-                # Porcupine expects array of int16 values
-                import struct
-                pcm = struct.unpack(
-                    f"{self.config.frame_length}h",  # 'h' = signed short (int16)
-                    audio_frame
+                detected = (
+                    self._process_porcupine(audio_frame)
+                    if self.config.backend == "porcupine"
+                    else self._process_oww(audio_frame)
                 )
-
-                # Process frame with Porcupine
-                keyword_index = self._porcupine.process(pcm)
-
-                # keyword_index == 0 means first keyword detected (we only have one)
-                # keyword_index == -1 means no detection
-                if keyword_index >= 0:
+                if detected:
                     self._on_wake_word_detected()
-                    return True
-
-                return False
+                return detected
 
             except Exception as e:
-                logger.error(f"[OTIS Wake Word] Error processing audio frame: {e}")
+                logger.error(f"[OTIS Wake Word] Frame processing error: {e}")
                 self._status = WakeWordStatus.ERROR
                 raise RuntimeError(f"Audio processing failed: {e}") from e
 
+    def _process_porcupine(self, audio_frame: bytes) -> bool:
+        import struct
+        pcm = struct.unpack(f"{self.config.frame_length}h", audio_frame)
+        return self._engine.process(pcm) >= 0
+
+    def _process_oww(self, audio_frame: bytes) -> bool:
+        import numpy as np
+        pcm = np.frombuffer(audio_frame, dtype=np.int16)
+        predictions = self._engine.predict(pcm)
+        return any(score >= self.config.threshold for score in predictions.values())
+
+    # ── Wake word callback ─────────────────────────────────────────────────────
+
     def _on_wake_word_detected(self):
-        """
-        Internal handler called when wake word is detected.
+        now = time.time()
+        if self._last_detection_time and (now - self._last_detection_time) < 1.0:
+            self._false_positive_count += 1
+            return
 
-        This method:
-        1. Updates detection statistics
-        2. Updates service status
-        3. Triggers all registered callbacks
-        4. Logs the detection event
-        """
-        current_time = time.time()
-
-        # Check for false positives (detections too close together)
-        if self._last_detection_time:
-            time_since_last = current_time - self._last_detection_time
-            if time_since_last < 1.0:  # Less than 1 second
-                self._false_positive_count += 1
-                logger.warning(
-                    f"[OTIS Wake Word] Possible false positive detected "
-                    f"(only {time_since_last:.2f}s since last detection)"
-                )
-                return  # Ignore this detection
-
-        # Update statistics
         self._detection_count += 1
-        self._last_detection_time = current_time
+        self._last_detection_time = now
         self._status = WakeWordStatus.DETECTED
 
-        logger.info(
-            f"[OTIS Wake Word] 🎙️ Wake word detected! "
-            f"(Detection #{self._detection_count})"
-        )
+        logger.info(f"[OTIS Wake Word] Wake word detected! (#{self._detection_count})")
 
-        # Trigger all registered callbacks
-        for callback in self._callbacks:
+        for cb in self._callbacks:
             try:
-                callback()
+                cb()
             except Exception as e:
-                logger.error(
-                    f"[OTIS Wake Word] Error in wake word callback: {e}",
-                    exc_info=True
-                )
+                logger.error(f"[OTIS Wake Word] Callback error: {e}", exc_info=True)
 
-        # Reset status back to listening
         self._status = WakeWordStatus.LISTENING
 
+    # ── Lifecycle ──────────────────────────────────────────────────────────────
+
     def register_callback(self, callback: Callable[[], None]):
-        """
-        Register a callback function to be called when wake word is detected.
-
-        Multiple callbacks can be registered. They will all be called in order
-        when the wake word is detected.
-
-        Args:
-            callback: Function to call (no arguments) when wake word detected
-
-        Example:
-            >>> def on_wake():
-            ...     print("Otis activated!")
-            ...     start_voice_session()
-            >>> service.register_callback(on_wake)
-        """
         with self._lock:
             if callback not in self._callbacks:
                 self._callbacks.append(callback)
-                logger.debug(f"[OTIS Wake Word] Callback registered: {callback.__name__}")
 
     def unregister_callback(self, callback: Callable[[], None]):
-        """
-        Remove a previously registered callback.
-
-        Args:
-            callback: The callback function to remove
-        """
         with self._lock:
             if callback in self._callbacks:
                 self._callbacks.remove(callback)
-                logger.debug(f"[OTIS Wake Word] Callback unregistered: {callback.__name__}")
 
     def start_listening(self, on_wake_word_detected: Optional[Callable[[], None]] = None):
-        """
-        Start listening for the wake word.
-
-        This changes the service status to LISTENING and optionally registers
-        a callback to be triggered when the wake word is detected.
-
-        Args:
-            on_wake_word_detected: Optional callback function to trigger on detection
-
-        Example:
-            >>> service.start_listening(on_wake_word_detected=lambda: print("Otis!"))
-        """
         with self._lock:
             if self._status == WakeWordStatus.ERROR:
-                raise RuntimeError("Service is in error state. Cannot start listening.")
-
+                raise RuntimeError("Service is in error state.")
             if on_wake_word_detected:
                 self.register_callback(on_wake_word_detected)
-
             self._status = WakeWordStatus.LISTENING
-            logger.info("[OTIS Wake Word] 👂 Started listening for wake word...")
+            logger.info(f"[OTIS Wake Word] Listening ({self.config.backend})...")
 
     def stop_listening(self):
-        """
-        Stop listening for the wake word.
-
-        This pauses wake word detection but keeps the Porcupine engine initialized.
-        Call start_listening() to resume.
-        """
         with self._lock:
             self._status = WakeWordStatus.IDLE
-            logger.info("[OTIS Wake Word] Stopped listening for wake word")
+            logger.info("[OTIS Wake Word] Stopped listening")
+
+    def cleanup(self):
+        with self._lock:
+            self._status = WakeWordStatus.STOPPED
+            self._callbacks.clear()
+            if self._engine is not None:
+                if self.config.backend == "porcupine":
+                    try:
+                        self._engine.delete()
+                    except Exception:
+                        pass
+                self._engine = None
+            logger.info("[OTIS Wake Word] Cleanup complete")
+
+    # ── Introspection ──────────────────────────────────────────────────────────
 
     def get_statistics(self) -> dict:
-        """
-        Get detection statistics.
-
-        Returns:
-            dict: Statistics including detection count, false positives, etc.
-        """
         with self._lock:
             return {
                 "status": self._status.value,
+                "backend": self.config.backend,
                 "total_detections": self._detection_count,
                 "false_positives": self._false_positive_count,
                 "last_detection_time": self._last_detection_time,
                 "configured_keyword": self.config.keyword,
-                "sensitivity": self.config.sensitivity,
+                "threshold": self.config.threshold,
                 "sample_rate": self.config.sample_rate,
-                "frame_length": self.config.frame_length
+                "frame_length": self.config.frame_length,
             }
 
     def reset_statistics(self):
-        """Reset all detection statistics to zero."""
         with self._lock:
             self._detection_count = 0
             self._false_positive_count = 0
             self._last_detection_time = None
-            logger.debug("[OTIS Wake Word] Statistics reset")
 
     def is_listening(self) -> bool:
-        """
-        Check if service is currently listening for wake word.
-
-        Returns:
-            bool: True if listening, False otherwise
-        """
         return self._status == WakeWordStatus.LISTENING
 
     def get_status(self) -> WakeWordStatus:
-        """
-        Get current service status.
-
-        Returns:
-            WakeWordStatus: Current status enum
-        """
         return self._status
 
-    def cleanup(self):
-        """
-        Clean up resources and stop the service.
-
-        This method should be called when the service is no longer needed.
-        It safely releases the Porcupine engine and clears callbacks.
-
-        After calling cleanup(), the service cannot be reused. Create a new
-        instance if you need wake word detection again.
-        """
-        with self._lock:
-            logger.info("[OTIS Wake Word] Cleaning up wake word service...")
-
-            # Stop listening
-            self._status = WakeWordStatus.STOPPED
-
-            # Clear callbacks
-            self._callbacks.clear()
-
-            # Delete Porcupine engine
-            if self._porcupine is not None:
-                try:
-                    self._porcupine.delete()
-                    logger.debug("[OTIS Wake Word] Porcupine engine deleted")
-                except Exception as e:
-                    logger.error(f"[OTIS Wake Word] Error deleting Porcupine: {e}")
-                finally:
-                    self._porcupine = None
-
-            logger.info("[OTIS Wake Word] Cleanup complete")
+    # ── Context manager ────────────────────────────────────────────────────────
 
     def __enter__(self):
-        """Context manager entry."""
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit - ensures cleanup."""
+    def __exit__(self, *_):
         self.cleanup()
 
     def __del__(self):
-        """Destructor - ensures cleanup even if cleanup() not called."""
         try:
-            if hasattr(self, '_porcupine') and self._porcupine is not None:
+            if getattr(self, "_engine", None) is not None:
                 self.cleanup()
         except Exception:
-            pass  # Ignore errors during destruction
-
-
-# ── Utility Functions ─────────────────────────────────────────────────────────
-
-def test_wake_word_service():
-    """
-    Test the wake word detection service with audio from microphone.
-
-    This is a standalone test function that demonstrates how to use the service.
-    Run this file directly to test: python wake_word_service.py
-    """
-    import pyaudio
-
-    print("=" * 70)
-    print("OTIS Wake Word Detection - Interactive Test")
-    print("=" * 70)
-
-    # Check if API key is configured
-    if not Config.PORCUPINE_ACCESS_KEY:
-        print("\n❌ ERROR: PORCUPINE_ACCESS_KEY not set!")
-        print("\n📝 To fix this:")
-        print("1. Go to https://console.picovoice.ai/")
-        print("2. Create a free account")
-        print("3. Copy your Access Key")
-        print("4. Add to backend/.env: PORCUPINE_ACCESS_KEY=your_key_here")
-        print("\nExiting...")
-        return
-
-    try:
-        # Initialize service
-        print("\n🔧 Initializing wake word service...")
-        service = WakeWordService()
-
-        print(f"✅ Service initialized!")
-        print(f"   Wake word: '{service.config.keyword}'")
-        print(f"   Sensitivity: {service.config.sensitivity}")
-        print(f"   Sample rate: {service.config.sample_rate}Hz")
-        print(f"   Frame length: {service.config.frame_length} samples")
-
-        # Register callback
-        def on_wake():
-            print("\n🎙️  WAKE WORD DETECTED! 🎙️")
-            print("   (In production, this would start a voice session)\n")
-
-        service.register_callback(on_wake)
-
-        # Initialize PyAudio
-        print("\n🎤 Initializing microphone...")
-        pa = pyaudio.PyAudio()
-
-        # Open audio stream
-        stream = pa.open(
-            rate=service.config.sample_rate,
-            channels=1,
-            format=pyaudio.paInt16,
-            input=True,
-            frames_per_buffer=service.config.frame_length
-        )
-
-        print("✅ Microphone ready!")
-        print("\n" + "=" * 70)
-        print(f"👂 LISTENING FOR: '{service.config.keyword}'")
-        print("=" * 70)
-        print("\nSpeak into your microphone now...")
-        print("Press Ctrl+C to stop\n")
-
-        # Start listening
-        service.start_listening()
-
-        # Main detection loop
-        try:
-            while True:
-                # Read audio frame
-                audio_frame = stream.read(
-                    service.config.frame_length,
-                    exception_on_overflow=False
-                )
-
-                # Process frame
-                service.process_audio_frame(audio_frame)
-
-        except KeyboardInterrupt:
-            print("\n\n⏹️  Stopped by user")
-
-    except Exception as e:
-        print(f"\n❌ Error: {e}")
-        logger.error("Test failed", exc_info=True)
-
-    finally:
-        # Cleanup
-        print("\n🧹 Cleaning up...")
-        try:
-            stream.stop_stream()
-            stream.close()
-            pa.terminate()
-            print("   Microphone closed")
-        except Exception:
             pass
-
-        try:
-            service.cleanup()
-            print("   Wake word service stopped")
-        except Exception:
-            pass
-
-        # Show statistics
-        stats = service.get_statistics()
-        print("\n📊 Final Statistics:")
-        print(f"   Total detections: {stats['total_detections']}")
-        print(f"   False positives: {stats['false_positives']}")
-
-        print("\n✅ Test complete!")
-        print("=" * 70)
-
-
-# ── Main ───────────────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    # Run interactive test when file is executed directly
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
-
-    test_wake_word_service()

@@ -39,6 +39,9 @@ cachetools==5.5.0
 Pillow==10.4.0
 
 # OTIS Voice Agent
+# Wake word: OpenWakeWord (free, no key) is always installed.
+# Porcupine (pvporcupine) is optional — install it and set PORCUPINE_ACCESS_KEY to switch backends.
+openwakeword
 pvporcupine==3.0.3
 deepgram-sdk==3.7.3
 elevenlabs==1.8.2

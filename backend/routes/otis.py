@@ -230,8 +230,9 @@ def stop_session(user):
         session = dict(row)
         session_id = session["session_id"]
 
-        # Calculate duration
-        started_at = datetime.fromisoformat(session["started_at"])
+        # Calculate duration (SQLite may return a string or a datetime object)
+        raw = session["started_at"]
+        started_at = raw if isinstance(raw, datetime) else datetime.fromisoformat(str(raw))
         ended_at = datetime.now()
         duration_seconds = int((ended_at - started_at).total_seconds())
 

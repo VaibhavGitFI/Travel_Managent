@@ -222,9 +222,10 @@ class Config:
             "email_smtp":        bool(cls.SMTP_HOST and cls.SMTP_USER),
             "zoho_cliq":         bool(cls.ZOHO_CLIQ_API_ENDPOINT and cls.ZOHO_CLIQ_REFRESH_TOKEN),
             "slack":             bool(cls.SLACK_WEBHOOK_URL or cls.SLACK_BOT_TOKEN),
-            "otis_voice":        bool(cls.OTIS_ENABLED and cls.PORCUPINE_ACCESS_KEY and
+            "otis_voice":        bool(cls.OTIS_ENABLED and
                                      cls.DEEPGRAM_API_KEY and cls.ELEVENLABS_API_KEY),
-            "otis_wake_word":    bool(cls.PORCUPINE_ACCESS_KEY),
+            # Wake word works with OpenWakeWord (no key) or Porcupine (with key)
+            "otis_wake_word":    True,
             "otis_stt":          bool(cls.DEEPGRAM_API_KEY),
             "otis_tts":          bool(cls.ELEVENLABS_API_KEY),
         }
