@@ -6,6 +6,7 @@ import os
 import logging
 from datetime import datetime
 from flask import Flask, send_from_directory, jsonify, request
+from utils.response import error_response
 from flask_socketio import emit, join_room
 from flask_cors import CORS
 
@@ -198,42 +199,42 @@ def create_app() -> Flask:
     # ── Standardized Error Handlers ───────────────────────────────────────────
     @app.errorhandler(400)
     def bad_request(e):
-        return jsonify({"success": False, "error": str(e.description) if hasattr(e, 'description') else "Bad request"}), 400
+        return error_response(str(e.description) if hasattr(e, "description") else "Bad request", 400)
 
     @app.errorhandler(401)
     def unauthorized(e):
-        return jsonify({"success": False, "error": "Authentication required"}), 401
+        return error_response("Authentication required", 401)
 
     @app.errorhandler(403)
     def forbidden(e):
-        return jsonify({"success": False, "error": "Access denied"}), 403
+        return error_response("Access denied", 403)
 
     @app.errorhandler(404)
     def not_found(e):
         if request.path.startswith("/api/"):
-            return jsonify({"success": False, "error": "Endpoint not found"}), 404
+            return error_response("Endpoint not found", 404)
         # Let SPA handle non-API 404s
         index_html = os.path.join(Config.REACT_BUILD, "index.html")
         if os.path.isfile(index_html):
             return send_from_directory(Config.REACT_BUILD, "index.html")
-        return jsonify({"success": False, "error": "Not found"}), 404
+        return error_response("Not found", 404)
 
     @app.errorhandler(405)
     def method_not_allowed(e):
-        return jsonify({"success": False, "error": "Method not allowed"}), 405
+        return error_response("Method not allowed", 405)
 
     @app.errorhandler(413)
     def payload_too_large(e):
-        return jsonify({"success": False, "error": "File too large. Maximum upload size is 20MB."}), 413
+        return error_response("File too large. Maximum upload size is 20MB.", 413)
 
     @app.errorhandler(429)
     def rate_limited(e):
-        return jsonify({"success": False, "error": "Too many requests. Please slow down."}), 429
+        return error_response("Too many requests. Please slow down.", 429)
 
     @app.errorhandler(500)
     def internal_error(e):
         logger.exception("Internal server error: %s", e)
-        return jsonify({"success": False, "error": "Internal server error"}), 500
+        return error_response("Internal server error", 500)
 
     # ── SocketIO Events ────────────────────────────────────────────────────────
     @socketio.on("connect")
