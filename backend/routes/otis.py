@@ -53,31 +53,17 @@ def _check_otis_permission(user: dict) -> tuple[bool, str]:
 
 def _get_service_status() -> dict:
     """Resolve the actual active OTIS providers without making network calls."""
+    from services.gemini_live_service import gemini_live
+
+    live_status = gemini_live.status()
+
     services = {
-        "wake_word": "available" if Config.PORCUPINE_ACCESS_KEY else "unavailable",
-        "stt": "fallback",
-        "tts": "fallback",
+        "wake_word": "available" if Config.PORCUPINE_ACCESS_KEY else "openwakeword",
+        "stt": "gemini_live" if live_status["live_available"] else "gemini_transcribe",
+        "tts": "gemini_live" if live_status["live_available"] else "google_tts",
         "llm": "gemini" if Config.GEMINI_API_KEY else "unavailable",
+        "live_api": live_status,
     }
-
-    try:
-        from services.deepgram_service import SpeechToTextService
-        stt = SpeechToTextService()
-        provider = stt.get_active_provider()
-        if provider:
-            services["stt"] = provider.value
-    except Exception as e:
-        logger.debug("[OTIS Routes] STT status probe failed: %s", e)
-
-    try:
-        from services.elevenlabs_voice_service import TextToSpeechService
-        tts = TextToSpeechService()
-        provider = tts.get_active_provider()
-        if provider:
-            services["tts"] = provider.value
-    except Exception as e:
-        logger.debug("[OTIS Routes] TTS status probe failed: %s", e)
-
     return services
 
 
@@ -100,8 +86,8 @@ def get_status():
             },
             "services": {
                 "wake_word": "available|unavailable",
-                "stt": "deepgram|google|vosk|mock",
-                "tts": "elevenlabs|google|pyttsx3|beep",
+                "stt": "gemini_live|gemini_transcribe",
+                "tts": "gemini_live|google_cloud_tts",
                 "llm": "gemini|unavailable"
             },
             "session": {
@@ -790,6 +776,55 @@ def validate_command(user):
     return jsonify({"success": True, **result}), 200
 
 
+def _detect_language(text: str) -> str:
+    """
+    Detect language from transcript text using simple character/word heuristics.
+    Returns ISO 639-1 code: 'en', 'hi', 'ta', 'te', 'kn', 'ml', 'mr', 'gu', 'bn', etc.
+    Falls back to 'en'.
+    """
+    if not text:
+        return "en"
+    # Unicode range detection for Indian scripts
+    ranges = {
+        "hi": (0x0900, 0x097F),   # Devanagari (Hindi, Marathi, Sanskrit)
+        "ta": (0x0B80, 0x0BFF),   # Tamil
+        "te": (0x0C00, 0x0C7F),   # Telugu
+        "kn": (0x0C80, 0x0CFF),   # Kannada
+        "ml": (0x0D00, 0x0D7F),   # Malayalam
+        "gu": (0x0A80, 0x0AFF),   # Gujarati
+        "bn": (0x0980, 0x09FF),   # Bengali
+        "pa": (0x0A00, 0x0A7F),   # Gurmukhi (Punjabi)
+    }
+    for char in text:
+        cp = ord(char)
+        for lang, (lo, hi) in ranges.items():
+            if lo <= cp <= hi:
+                return lang
+    # Arabic script
+    if any(0x0600 <= ord(c) <= 0x06FF for c in text):
+        return "ar"
+    # Default: English
+    return "en"
+
+
+def _lang_to_tts_code(lang: str) -> str:
+    """Map ISO 639-1 language code to Google Cloud TTS language code."""
+    mapping = {
+        "hi": "hi-IN",
+        "ta": "ta-IN",
+        "te": "te-IN",
+        "kn": "kn-IN",
+        "ml": "ml-IN",
+        "gu": "gu-IN",
+        "bn": "bn-IN",
+        "pa": "pa-IN",
+        "mr": "mr-IN",
+        "ar": "ar-XA",
+        "en": "en-IN",  # Default to Indian English for en
+    }
+    return mapping.get(lang, "en-IN")
+
+
 def _build_otis_context(user: dict, db) -> dict:
     """
     Build rich real-time context for OTIS from the database.
@@ -836,8 +871,9 @@ def _build_otis_context(user: dict, db) -> dict:
         _rollback_db_safely(db)
 
     try:
-        # Pending approvals (if manager/admin) — use actual schema columns
-        if user.get("role") in ("admin", "manager", "super_admin"):
+        # Pending approvals (if manager/admin) — scoped to caller's org.
+        # Guard: if org_id is None the user has no org so show nothing.
+        if user.get("role") in ("admin", "manager", "super_admin") and user.get("org_id"):
             rows = db.execute(
                 """SELECT tr.id, tr.destination, tr.purpose, u.name as requester_name,
                           tr.estimated_total, tr.status
@@ -845,7 +881,7 @@ def _build_otis_context(user: dict, db) -> dict:
                    JOIN users u ON u.id = tr.user_id
                    WHERE tr.org_id = ? AND tr.status = 'submitted'
                    ORDER BY tr.created_at DESC LIMIT 10""",
-                (user.get("org_id"),)
+                (user["org_id"],)
             ).fetchall()
             ctx["pending_approvals"] = [dict(r) for r in rows]
             ctx["pending_approval_count"] = len(ctx["pending_approvals"])
@@ -898,12 +934,14 @@ def _resolve_structured_otis_query(user: dict, command_text: str) -> dict | None
         return None
 
 
-def _resolve_otis_session_id(db, user_id: int, requested_session_id: str | None) -> str | None:
+def _resolve_otis_session_id(db, user: dict, requested_session_id: str | None) -> str:
     """
     Resolve the session OTIS should use for this command.
-    Reuses the requested session when valid, otherwise falls back to the
-    user's current active session so follow-up turns keep their memory.
+    Reuses the requested session when valid, falls back to active session,
+    or auto-creates one so voice commands always have conversation context.
     """
+    user_id = user["id"]
+
     if requested_session_id:
         row = db.execute(
             "SELECT session_id FROM otis_sessions WHERE session_id = ? AND user_id = ?",
@@ -917,7 +955,22 @@ def _resolve_otis_session_id(db, user_id: int, requested_session_id: str | None)
         "ORDER BY started_at DESC LIMIT 1",
         (user_id,)
     ).fetchone()
-    return active["session_id"] if active else None
+    if active:
+        return active["session_id"]
+
+    # Auto-create session so commands always have context
+    import uuid
+    session_id = f"otis-{uuid.uuid4().hex[:12]}"
+    now = datetime.now()
+    db.execute(
+        """INSERT INTO otis_sessions
+           (org_id, user_id, session_id, status, started_at)
+           VALUES (?, ?, ?, 'active', ?)""",
+        (user.get("org_id"), user_id, session_id, now)
+    )
+    db.commit()
+    logger.info("[OTIS] Auto-created session %s for user %s", session_id, user_id)
+    return session_id
 
 
 def _load_otis_conversation_history(db, session_id: str, max_turns: int = 5) -> list[dict]:
@@ -1009,13 +1062,13 @@ def process_command_rest(user):
     try:
         db = get_db()
         try:
-            session_id = _resolve_otis_session_id(db, user["id"], requested_session_id)
+            session_id = _resolve_otis_session_id(db, user, requested_session_id)
             structured_result = _resolve_structured_otis_query(user, command_text)
             context = None
             conversation_history = []
             if not structured_result:
                 context = _build_otis_context(user, db)
-                conversation_history = _load_otis_conversation_history(db, session_id) if session_id else []
+                conversation_history = _load_otis_conversation_history(db, session_id)
         finally:
             db.close()
 
@@ -1092,140 +1145,262 @@ def process_command_rest(user):
         return jsonify({"success": False, "error": "Failed to process command"}), 500
 
 
-# ── Audio Transcription ────────────────────────────────────────────────────────
+# ── Audio Transcription (Gemini) ───────────────────────────────────────────────
 
 @otis_bp.route("/transcribe", methods=["POST"])
 @require_otis
 def transcribe_audio(user):
     """
     POST /api/otis/transcribe
-    Multipart form: audio=<file>
+    Multipart form: audio=<file>  (webm, wav, ogg, m4a, mp4)
 
-    Transcribes voice audio using the configured OTIS STT stack.
-    Prefers Deepgram and falls back through the service chain when needed.
+    Transcribes voice audio using Gemini 2.0 Flash (file-upload API).
+    No Deepgram required. Falls back to gemini_service.transcribe_audio if needed.
 
     Returns:
-        {"success": true, "text": "transcribed text", "provider": "deepgram|google|vosk|mock|gemini"}
+        {"success": true, "text": "...", "provider": "gemini_live|gemini", "confidence": 0.95}
     """
+    from services.gemini_live_service import gemini_live as _gl
+
     if "audio" not in request.files:
         return jsonify({"success": False, "error": "audio file required"}), 400
 
-    audio_file   = request.files["audio"]
-    mime_type    = audio_file.content_type or audio_file.mimetype or "audio/webm"
-    audio_bytes  = audio_file.read()
+    audio_file  = request.files["audio"]
+    mime_type   = audio_file.content_type or audio_file.mimetype or "audio/webm"
+    audio_bytes = audio_file.read()
 
     if len(audio_bytes) < 400:
         return jsonify({"success": False, "error": "Audio too short — try again"}), 400
 
-    # ── Try the OTIS STT stack first ─────────────────────────────────────────
+    # Primary: Gemini Live transcription (uses gemini-2.0-flash file upload)
+    result = _gl.transcribe_audio(audio_bytes, mime_type)
+    if result.get("success") and result.get("transcript"):
+        logger.info("[OTIS Transcribe] Gemini OK: '%s'", result["transcript"][:60])
+        return jsonify({
+            "success":    True,
+            "text":       result["transcript"],
+            "provider":   result.get("model", "gemini_live"),
+            "confidence": 0.95,
+        }), 200
+
+    # Fallback: gemini_service.transcribe_audio (same underlying model, different path)
     try:
-        import asyncio
-        import concurrent.futures
-        from services.deepgram_service import SpeechToTextService
-        stt = SpeechToTextService()
-
-        # asyncio.run() fails inside Flask-SocketIO (gevent patches the loop).
-        # Run in a fresh thread with its own event loop instead.
-        def _run_stt():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                return loop.run_until_complete(stt.transcribe(audio_bytes))
-            finally:
-                loop.close()
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            result = ex.submit(_run_stt).result(timeout=15)
-
-        if result and result.text:
-            provider = getattr(getattr(result, "provider", None), "value", "unknown")
-            logger.info(
-                f"[OTIS Transcribe] {provider} OK: '{result.text[:60]}' "
-                f"(conf={getattr(result, 'confidence', 0):.2f})"
-            )
-            return jsonify({
-                "success":    True,
-                "text":       result.text,
-                "confidence": getattr(result, "confidence", 0.9),
-                "provider":   provider,
-            }), 200
-    except Exception as e:
-        logger.warning(f"[OTIS Transcribe] STT service failed, trying Gemini: {e}")
-
-    # ── Fallback: Gemini multimodal transcription ─────────────────────────────
-    try:
-        from services.gemini_service import gemini
-        text = gemini.transcribe_audio(audio_bytes, mime_type)
+        from services.gemini_service import gemini as _g
+        text = _g.transcribe_audio(audio_bytes, mime_type)
         if text:
-            logger.info(f"[OTIS Transcribe] Gemini fallback OK: '{text[:60]}'")
-            return jsonify({"success": True, "text": text, "provider": "gemini"}), 200
-    except Exception as e:
-        logger.warning(f"[OTIS Transcribe] Gemini transcription failed: {e}")
+            logger.info("[OTIS Transcribe] gemini_service fallback OK: '%s'", text[:60])
+            return jsonify({"success": True, "text": text, "provider": "gemini", "confidence": 0.9}), 200
+    except Exception as exc:
+        logger.warning("[OTIS Transcribe] Fallback also failed: %s", exc)
 
-    return jsonify({"success": False, "error": "Could not transcribe audio"}), 422
+    return jsonify({"success": False, "error": "Could not transcribe audio — check GEMINI_API_KEY"}), 422
 
 
-# ── Text-to-Speech ────────────────────────────────────────────────────────────
+# ── Text-to-Speech (Google Cloud TTS, Indian English) ─────────────────────────
 
 @otis_bp.route("/speak", methods=["POST"])
 @require_otis
 def speak_text(user):
     """
     POST /api/otis/speak
-    Body: {"text": "Hello, I am Jarvis."}
+    Body: {"text": "Hello, I am OTIS."}
 
-    Synthesises speech using the OTIS TTS stack and returns playable audio.
+    Synthesises speech via Google Cloud TTS (en-IN-Neural2-B — Indian English male).
+    No ElevenLabs required. Returns MP3 binary.
 
     Returns:
-        audio/* binary  — on success
-        {"success": false, "error": "..."}  — on failure
+        audio/mpeg binary on success
+        {"success": false, "error": "..."} on failure
     """
     from flask import Response
+    from services.gemini_live_service import gemini_live as _gl
+
     data = request.get_json(silent=True) or {}
-    text = data.get("text", "").strip()[:2000]
+    text = (data.get("text") or "").strip()[:2000]
 
     if not text:
         return jsonify({"success": False, "error": "text is required"}), 400
 
+    audio_bytes = _gl.synthesize_speech(text, language_code="en-IN")
+    if audio_bytes:
+        # Detect mime type: Gemini TTS returns WAV/PCM, Google Cloud returns MP3
+        mime = "audio/mpeg"
+        if audio_bytes[:4] == b"RIFF":
+            mime = "audio/wav"
+        elif audio_bytes[:4] != b"\xff\xfb" and audio_bytes[:3] != b"ID3":
+            mime = "audio/wav"  # Raw PCM from Gemini
+
+        logger.info("[OTIS Speak] TTS OK — %d bytes (%s)", len(audio_bytes), mime)
+        return Response(
+            audio_bytes,
+            mimetype=mime,
+            headers={
+                "Content-Length": str(len(audio_bytes)),
+                "Cache-Control":  "no-store",
+            },
+        )
+
+    # Graceful failure — frontend can display text instead
+    return jsonify({
+        "success":  False,
+        "error":    "TTS unavailable — check GEMINI_API_KEY.",
+        "text":     text,
+    }), 422
+
+
+# ── All-in-one voice command (transcribe + LLM + TTS in one call) ─────────────
+
+@otis_bp.route("/voice-command", methods=["POST"])
+@require_otis
+def voice_command_endpoint(user):
+    """
+    POST /api/otis/voice-command
+    Multipart form: audio=<blob>, session_id=<str>, include_audio=<true|false>
+
+    All-in-one: transcribe (inline, fast) + LLM response + TTS audio.
+    Returns single JSON so frontend makes ONE HTTP call instead of three.
+
+    Response:
+      {
+        "success": true,
+        "transcript": "what are my pending expenses",
+        "language": "en",
+        "response": "You have 3 pending expenses totalling Rs 12,450.",
+        "session_id": "otis-abc",
+        "audio_b64": "<base64 mp3>",     # null if TTS unavailable
+        "audio_mime": "audio/mpeg",
+        "provider": "gemini+google_tts"
+      }
+    """
+    import base64 as _b64
+    import time
+    from services.gemini_live_service import gemini_live as _gl
+
+    # ── 1. Parse request ─────────────────────────────────────────
+    if "audio" not in request.files:
+        return jsonify({"success": False, "error": "audio file required"}), 400
+
+    audio_file   = request.files["audio"]
+    mime_type    = audio_file.content_type or audio_file.mimetype or "audio/webm;codecs=opus"
+    audio_bytes  = audio_file.read()
+    session_id   = request.form.get("session_id")
+    want_audio   = request.form.get("include_audio", "true").lower() != "false"
+
+    if len(audio_bytes) < 200:
+        return jsonify({"success": False, "error": "audio too short"}), 400
+
+    t0 = time.time()
+
+    # ── 2. Fast inline transcription ─────────────────────────────
+    tr = _gl.transcribe_audio_inline(audio_bytes, mime_type)
+    transcript = tr.get("transcript", "")
+
+    if not transcript:
+        return jsonify({
+            "success": False,
+            "error": "Could not understand audio. Please speak clearly and try again.",
+        }), 422
+
+    t_transcribe = time.time() - t0
+
+    # ── 3. Detect language (simple heuristic from transcript) ────
+    detected_lang = _detect_language(transcript)
+
+    # ── 4. LLM command processing ─────────────────────────────────
+    db = get_db()
     try:
-        import asyncio
-        import concurrent.futures
-        from services.elevenlabs_voice_service import TextToSpeechService
-        tts = TextToSpeechService()
+        session_id = _resolve_otis_session_id(db, user, session_id)
+        structured_result = _resolve_structured_otis_query(user, transcript)
+        context = None
+        conversation_history = []
+        if not structured_result:
+            context = _build_otis_context(user, db)
+            conversation_history = _load_otis_conversation_history(db, session_id)
+    finally:
+        db.close()
 
-        # asyncio.run() fails inside Flask-SocketIO (gevent patches the loop).
-        # Run in a fresh thread with its own event loop instead.
-        def _run_tts():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                return loop.run_until_complete(tts.speak(text))
-            finally:
-                loop.close()
+    if structured_result:
+        response_text = structured_result["response_text"]
+        data_source = "structured_query"
+    else:
+        from services.gemini_service import gemini as _g
+        response_text = _g.generate_voice_optimized(
+            prompt=transcript,
+            context=context,
+            conversation_history=conversation_history,
+            model_type="flash"
+        )
+        data_source = "gemini"
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            result = ex.submit(_run_tts).result(timeout=10)
+    if not response_text:
+        response_text = "I understand. Could you please rephrase?"
 
-        if result and result.audio_data:
-            provider = getattr(getattr(result, "provider", None), "value", "unknown")
-            audio_format = (getattr(result, "audio_format", "") or "").lower()
-            mimetype = {
-                "mp3": "audio/mpeg",
-                "wav": "audio/wav",
-            }.get(audio_format, "application/octet-stream")
+    t_llm = time.time() - t0
 
-            logger.info(f"[OTIS Speak] {provider} OK — {len(result.audio_data)} bytes")
-            return Response(
-                result.audio_data,
-                mimetype=mimetype,
-                headers={
-                    "Content-Length": str(len(result.audio_data)),
-                    "X-Provider":     provider,
-                    "Cache-Control":  "no-store",
-                },
+    # ── 5. Save conversation ───────────────────────────────────────
+    if session_id:
+        try:
+            db2 = get_db()
+            row = db2.execute(
+                "SELECT COALESCE(MAX(turn_number), 0) FROM otis_conversations WHERE session_id = ?",
+                (session_id,)
+            ).fetchone()
+            next_turn = (row[0] if row else 0) + 1
+            db2.execute(
+                "INSERT INTO otis_conversations (session_id, turn_number, role, content) VALUES (?, ?, ?, ?)",
+                (session_id, next_turn, "user", transcript)
             )
-    except Exception as e:
-        logger.exception(f"[OTIS Speak] TTS failed: {e}")
-        return jsonify({"success": False, "error": "TTS synthesis failed"}), 500
+            db2.execute(
+                "INSERT INTO otis_conversations (session_id, turn_number, role, content) VALUES (?, ?, ?, ?)",
+                (session_id, next_turn + 1, "assistant", response_text)
+            )
+            db2.execute(
+                """INSERT INTO otis_commands
+                   (org_id, user_id, session_id, command_text, transcript, response_text, success, latency_ms)
+                   VALUES (?, ?, ?, ?, ?, ?, 1, ?)""",
+                (user.get("org_id"), user["id"], session_id, transcript, transcript, response_text,
+                 int((time.time() - t0) * 1000))
+            )
+            db2.execute(
+                "UPDATE otis_sessions SET total_turns = COALESCE(total_turns, 0) + 1 WHERE session_id = ?",
+                (session_id,)
+            )
+            db2.commit()
+            db2.close()
+        except Exception:
+            pass
 
-    return jsonify({"success": False, "error": "TTS returned no audio"}), 500
+    # ── 6. TTS audio (same call, no extra round-trip) ─────────────
+    audio_b64  = None
+    audio_mime = None
+    if want_audio:
+        tts_lang = _lang_to_tts_code(detected_lang)
+        audio_bytes_out = _gl.synthesize_speech(response_text, language_code=tts_lang)
+        if audio_bytes_out:
+            audio_b64  = _b64.b64encode(audio_bytes_out).decode()
+            # Detect format: MP3 from Google Cloud TTS, WAV/PCM from Gemini TTS
+            if audio_bytes_out[:4] == b"RIFF":
+                audio_mime = "audio/wav"
+            elif audio_bytes_out[:4] == b"\xff\xfb" or audio_bytes_out[:3] == b"ID3":
+                audio_mime = "audio/mpeg"
+            else:
+                audio_mime = "audio/wav"  # Gemini raw PCM
+
+    total_ms = int((time.time() - t0) * 1000)
+    logger.info(
+        "[OTIS Voice] user=%s lang=%s transcript='%s' -> '%s' [transcribe=%.1fs llm=%.1fs total=%dms]",
+        user["id"], detected_lang, transcript[:40], response_text[:40],
+        t_transcribe, t_llm - t_transcribe, total_ms
+    )
+
+    return jsonify({
+        "success":      True,
+        "transcript":   transcript,
+        "language":     detected_lang,
+        "response":     response_text,
+        "session_id":   session_id,
+        "audio_b64":    audio_b64,
+        "audio_mime":   audio_mime,
+        "latency_ms":   total_ms,
+        "data_source":  data_source,
+    }), 200
