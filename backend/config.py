@@ -281,3 +281,34 @@ class Config:
     def allowed_file(cls, filename: str) -> bool:
         return ("." in filename and
                 filename.rsplit(".", 1)[1].lower() in cls.ALLOWED_EXTENSIONS)
+
+    @classmethod
+    def validate(cls) -> None:
+        """Fail fast if critical production config is missing.
+        Called at the end of create_app() in app.py."""
+        errors = []
+
+        if _is_gcp():
+            # These MUST be set in production
+            required = {
+                "SECRET_KEY": cls.SECRET_KEY,
+                "JWT_SECRET_KEY": cls.JWT_SECRET_KEY,
+                "DATABASE_URL": cls.DATABASE_URL,
+            }
+            for name, value in required.items():
+                if not value or value in ("change-this-in-production", "dev-only-insecure-placeholder-do-not-use"):
+                    errors.append(f"{name} is not configured")
+
+        # Optional — warn but don't fail
+        optional = {
+            "GEMINI_API_KEY": cls.GEMINI_API_KEY,
+            "SMTP_HOST": cls.SMTP_HOST,
+        }
+        for name, value in optional.items():
+            if not value:
+                logger.warning("[Config] Optional config missing: %s — related features disabled", name)
+
+        if errors:
+            msg = "FATAL: Missing required configuration:\n" + "\n".join(f"  - {e}" for e in errors)
+            logger.critical(msg)
+            raise RuntimeError(msg)

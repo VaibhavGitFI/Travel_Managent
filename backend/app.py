@@ -702,6 +702,9 @@ You have access to all TravelSync data for this user including trips, expenses, 
             "api_docs": "/api/health",
         }), 200
 
+    # Fail fast if critical production config is missing
+    Config.validate()
+
     return app
 
 
