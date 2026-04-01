@@ -165,6 +165,10 @@ def chat():
     if not user:
         return jsonify({"success": False, "error": "Authentication required"}), 401
 
+    # Chat attachments have a tighter size limit than general uploads
+    if request.content_length and request.content_length > 5 * 1024 * 1024:
+        return jsonify({"success": False, "error": "File too large for chat. Max 5 MB."}), 413
+
     message, context, upload, session_id = _request_payload()
     if not message and not upload:
         return jsonify({"success": False, "error": "message or attachment is required"}), 400

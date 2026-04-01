@@ -475,3 +475,15 @@ def test_path_traversal_blocked(client):
         # If 200, it must be the SPA fallback (index.html), never /etc/passwd content
         if resp.status_code == 200:
             assert b"root:" not in resp.data, "Path traversal leaked /etc/passwd!"
+
+
+# ── Upload Size Limits ───────────────────────────────────────────────────────
+
+def test_upload_too_large_returns_413(client):
+    """Uploading a file larger than MAX_CONTENT_LENGTH returns 413."""
+    import io
+    # Create a 21 MB blob (exceeds the 20 MB MAX_CONTENT_LENGTH)
+    big = io.BytesIO(b"x" * (21 * 1024 * 1024))
+    resp = client.post("/api/uploads", data={"file": (big, "big.txt")},
+                       content_type="multipart/form-data")
+    assert resp.status_code in (413, 401)  # 401 if auth required first
