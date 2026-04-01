@@ -165,6 +165,15 @@ class Config:
     except (ValueError, TypeError):
         JWT_REFRESH_TTL = 30
 
+    # CORS — comma-separated list of allowed origins.
+    # Default: localhost dev servers. Override in production:
+    #   CORS_ORIGINS=https://app.travelsync.pro
+    CORS_ORIGINS = [
+        o.strip() for o in
+        os.getenv("CORS_ORIGINS", "http://localhost:5173,http://localhost:3399,http://127.0.0.1:5173,http://127.0.0.1:3399").split(",")
+        if o.strip()
+    ]
+
     # GCP
     GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID") or os.getenv("GOOGLE_CLOUD_PROJECT")
     GCS_BUCKET     = os.getenv("GCS_BUCKET")

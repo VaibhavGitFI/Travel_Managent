@@ -26,13 +26,12 @@ def create_app() -> Flask:
 
     os.makedirs(Config.UPLOAD_FOLDER, exist_ok=True)
 
-    # Allow React dev server (port 5173) and same-origin production
-    allowed_origins = [
-        "http://localhost:5173",
-        "http://localhost:3399",
-        "http://127.0.0.1:5173",
-        "http://127.0.0.1:3399",
-    ]
+    # CORS origins configurable via CORS_ORIGINS env var (comma-separated).
+    # Never allow "*" with credentials — that's a security vulnerability.
+    allowed_origins = Config.CORS_ORIGINS
+    if "*" in allowed_origins:
+        logger.warning("[CORS] Wildcard '*' is not allowed with credentials — removing it")
+        allowed_origins = [o for o in allowed_origins if o != "*"]
     CORS(app, supports_credentials=True, origins=allowed_origins)
 
     # async_mode must match the Gunicorn worker class (--worker-class eventlet in
