@@ -107,7 +107,8 @@ class AgentInfo:
         self.timeout_s = timeout_s
         self.registered_at = datetime.now(timezone.utc).isoformat()
 
-        # Health metrics
+        # Health metrics (guarded by _metrics_lock)
+        self._metrics_lock = threading.Lock()
         self.invocations = 0
         self.successes = 0
         self.failures = 0
@@ -195,10 +196,11 @@ class AgentRegistry:
         agent = self._agents.get(name)
         if not agent:
             return
-        agent.invocations += 1
-        agent.successes += 1
-        agent.total_latency_ms += latency_ms
-        agent.last_invoked = datetime.now(timezone.utc).isoformat()
+        with agent._metrics_lock:
+            agent.invocations += 1
+            agent.successes += 1
+            agent.total_latency_ms += latency_ms
+            agent.last_invoked = datetime.now(timezone.utc).isoformat()
         if agent.circuit_breaker:
             agent.circuit_breaker.record_success()
 
@@ -206,11 +208,12 @@ class AgentRegistry:
         agent = self._agents.get(name)
         if not agent:
             return
-        agent.invocations += 1
-        agent.failures += 1
-        agent.last_invoked = datetime.now(timezone.utc).isoformat()
-        agent.last_error = error[:200] if error else None
-        agent.last_error_time = datetime.now(timezone.utc).isoformat()
+        with agent._metrics_lock:
+            agent.invocations += 1
+            agent.failures += 1
+            agent.last_invoked = datetime.now(timezone.utc).isoformat()
+            agent.last_error = error[:200] if error else None
+            agent.last_error_time = datetime.now(timezone.utc).isoformat()
         if agent.circuit_breaker:
             agent.circuit_breaker.record_failure()
 
