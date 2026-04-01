@@ -40,10 +40,10 @@ def validate_request(request_data):
     checks = []
     issues = []
 
-    # Flight class check
-    flight_class = request_data.get("flight_class", "economy")
+    # Flight class check — normalize to lowercase for case-insensitive comparison
+    flight_class = str(request_data.get("flight_class", "economy")).strip().lower()
     allowed_classes = {"economy": 1, "premium_economy": 2, "business": 3, "first": 4}
-    max_class = policy.get("max_flight_class", "economy")
+    max_class = str(policy.get("max_flight_class", "economy")).strip().lower()
     if allowed_classes.get(flight_class, 1) > allowed_classes.get(max_class, 1):
         checks.append({"category": "Flight Class", "status": "red", "message": f"{flight_class} exceeds policy max ({max_class})"})
         issues.append(f"Flight class '{flight_class}' exceeds max allowed '{max_class}'")
@@ -51,7 +51,10 @@ def validate_request(request_data):
         checks.append({"category": "Flight Class", "status": "green", "message": f"{flight_class} within policy"})
 
     # Hotel budget check
-    hotel_budget = float(request_data.get("hotel_budget_per_night", 5000))
+    try:
+        hotel_budget = float(request_data.get("hotel_budget_per_night", 5000))
+    except (ValueError, TypeError):
+        hotel_budget = 5000.0
     max_hotel = policy.get("max_hotel_per_night", 10000)
     if hotel_budget > max_hotel:
         checks.append({"category": "Hotel Budget", "status": "red", "message": f"Rs.{hotel_budget:,.0f}/night exceeds cap Rs.{max_hotel:,.0f}"})
@@ -62,7 +65,10 @@ def validate_request(request_data):
         checks.append({"category": "Hotel Budget", "status": "green", "message": f"Rs.{hotel_budget:,.0f}/night within policy"})
 
     # Duration check
-    duration = int(request_data.get("duration_days", 1))
+    try:
+        duration = int(request_data.get("duration_days", 1))
+    except (ValueError, TypeError):
+        duration = 1
     max_dur = policy.get("max_trip_duration_days", 14)
     if duration > max_dur:
         checks.append({"category": "Duration", "status": "red", "message": f"{duration} days exceeds max {max_dur}"})
@@ -73,7 +79,10 @@ def validate_request(request_data):
         checks.append({"category": "Duration", "status": "green", "message": f"{duration} days within policy"})
 
     # Total budget check
-    estimated_total = float(request_data.get("estimated_total", 0))
+    try:
+        estimated_total = float(request_data.get("estimated_total", 0))
+    except (ValueError, TypeError):
+        estimated_total = 0.0
     max_budget = policy.get("max_total_budget", 100000)
     if estimated_total > max_budget:
         checks.append({"category": "Total Budget", "status": "red", "message": f"Rs.{estimated_total:,.0f} exceeds max Rs.{max_budget:,.0f}"})
@@ -96,8 +105,9 @@ def validate_request(request_data):
                 issues.append(f"Less than {min_advance} days advance booking")
             else:
                 checks.append({"category": "Advance Booking", "status": "green", "message": f"{days_ahead} days advance notice"})
-        except ValueError:
-            checks.append({"category": "Advance Booking", "status": "green", "message": "Date not validated"})
+        except (ValueError, TypeError):
+            checks.append({"category": "Advance Booking", "status": "amber", "message": "Could not parse date — manual review required"})
+            issues.append("Start date could not be parsed for advance booking check")
     else:
         checks.append({"category": "Advance Booking", "status": "green", "message": "No date specified"})
 
