@@ -15,6 +15,7 @@ import json
 import logging
 import sqlite3
 import datetime as dt
+from contextlib import contextmanager
 from dotenv import load_dotenv
 
 # Ensure .env is loaded before checking DATABASE_URL
@@ -63,6 +64,8 @@ class _PGCursor:
             lambda m: f"TO_CHAR({m.group(2)}, '{_sqlite_fmt_to_pg(m.group(1))}')",
             sql,
         )
+        # Convert SQLite last_insert_rowid() to PostgreSQL lastval()
+        pg_sql = re.sub(r"last_insert_rowid\(\s*\)", "lastval()", pg_sql, flags=re.IGNORECASE)
         pg_sql = re.sub(r"\?", "%s", pg_sql)
         self._cur.execute(pg_sql, params or ())
         return self
@@ -166,13 +169,17 @@ _pg_pool = None
 _pg_pool_lock = __import__('threading').Lock()
 _pg_pool_last_failure = 0.0
 
-# Pool tuning: conservative defaults so Supabase session-mode poolers do not
-# reject the app during normal UI concurrency. Can be overridden by env vars.
-_PG_MINCONN = max(1, int(os.getenv("DB_POOL_MINCONN", "1")))
-_PG_MAXCONN = max(_PG_MINCONN, int(os.getenv("DB_POOL_MAXCONN", "4")))
+# Pool tuning — defaults raised from 1-4 to 2-10 to handle moderate production
+# concurrency under eventlet (single Gunicorn worker, many green threads).
+# Supabase session-mode poolers typically allow 20-60 connections per project.
+_PG_MINCONN = max(1, int(os.getenv("DB_POOL_MINCONN", "2")))
+_PG_MAXCONN = max(_PG_MINCONN, int(os.getenv("DB_POOL_MAXCONN", "10")))
 _PG_ACQUIRE_RETRIES = 3   # retries before giving up on pool
 _PG_ACQUIRE_BACKOFF = 0.1  # initial back-off seconds (doubles each retry)
 _PG_POOL_FAILURE_COOLDOWN = float(os.getenv("DB_POOL_FAILURE_COOLDOWN", "15"))
+# Per-connection timeouts added to the DSN to prevent runaway queries / stale conns
+_PG_CONNECT_TIMEOUT = int(os.getenv("DB_CONNECT_TIMEOUT", "5"))       # seconds
+_PG_STATEMENT_TIMEOUT = int(os.getenv("DB_STATEMENT_TIMEOUT", "15000"))  # milliseconds
 
 
 def _get_pg_pool():
@@ -195,10 +202,12 @@ def _get_pg_pool():
                 minconn=_PG_MINCONN,
                 maxconn=_PG_MAXCONN,
                 dsn=database_url,
+                connect_timeout=_PG_CONNECT_TIMEOUT,
+                options=f"-c statement_timeout={_PG_STATEMENT_TIMEOUT}",
             )
             logger.info(
-                "[DB] PostgreSQL connection pool created (%d-%d connections)",
-                _PG_MINCONN, _PG_MAXCONN,
+                "[DB] PostgreSQL pool created (%d-%d conns, connect_timeout=%ds, statement_timeout=%dms)",
+                _PG_MINCONN, _PG_MAXCONN, _PG_CONNECT_TIMEOUT, _PG_STATEMENT_TIMEOUT,
             )
             _pg_pool_last_failure = 0.0
             return _pg_pool
@@ -295,6 +304,8 @@ def _pool_getconn_with_retry(pool):
                                 minconn=_PG_MINCONN,
                                 maxconn=_PG_MAXCONN,
                                 dsn=database_url,
+                                connect_timeout=_PG_CONNECT_TIMEOUT,
+                                options=f"-c statement_timeout={_PG_STATEMENT_TIMEOUT}",
                             )
                             pool = _pg_pool
                             logger.info("[DB] PostgreSQL pool recreated after failure")
@@ -358,6 +369,32 @@ def get_db():
     db.execute("PRAGMA foreign_keys = ON")
     db.execute("PRAGMA journal_mode = WAL")
     return db
+
+
+@contextmanager
+def transaction():
+    """Context manager for atomic multi-step database operations.
+
+    Usage:
+        with transaction() as db:
+            db.execute("INSERT ...")
+            db.execute("UPDATE ...")
+        # Auto-commits on success, auto-rolls back on exception.
+
+    Non-DB side effects (email, webhook) should happen AFTER the with block.
+    """
+    conn = get_db()
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
 
 
 def _is_pg():
@@ -733,6 +770,30 @@ def _create_tables(c, pg=None):
         created_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )""")
 
+    # ── Auth Security Tables ──────────────────────────────────────────────────
+    # token_blacklist: persists revoked JWT hashes across processes/instances.
+    # Rows are expired by the keepalive thread every 4 minutes.
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS token_blacklist (
+        token_hash   TEXT PRIMARY KEY,
+        expires_at   TIMESTAMP NOT NULL,
+        created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+
+    # auth_codes: stores one-time codes for password reset and email verification.
+    # Replaces the previous in-memory _reset_tokens / _verify_tokens dicts so that
+    # codes work correctly across multiple Cloud Run instances.
+    c.execute(f"""
+    CREATE TABLE IF NOT EXISTS auth_codes (
+        id           {pk},
+        code         TEXT UNIQUE NOT NULL,
+        type         TEXT NOT NULL,
+        user_id      INTEGER NOT NULL REFERENCES users(id),
+        email        TEXT,
+        expires_at   TIMESTAMP NOT NULL,
+        created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+
     # ── Indexes for query performance ─────────────────────────────────────────
     _create_indexes(c, use_pg)
 
@@ -801,12 +862,23 @@ def _create_indexes(c, pg=False):
         ("idx_otis_commands_function",        "otis_commands", "function_called"),
         ("idx_otis_conversations_session",    "otis_conversations", "session_id"),
         ("idx_otis_analytics_org_date",       "otis_analytics", "org_id"),
+        # auth security tables
+        ("idx_token_blacklist_expires",       "token_blacklist", "expires_at"),
+        ("idx_auth_codes_user_type",          "auth_codes", "user_id"),
+        ("idx_auth_codes_expires",            "auth_codes", "expires_at"),
     ]
     for idx_name, table, column in indexes:
         try:
             c.execute(f"CREATE INDEX IF NOT EXISTS {idx_name} ON {table} ({column})")
         except Exception as e:
             logger.debug("[DB] Index %s skipped: %s", idx_name, e)
+
+    # ── Unique constraints (safe to run on every startup) ────────────────────
+    # Prevents a user from being added to the same org multiple times.
+    try:
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_org_members_org_user ON org_members (org_id, user_id)")
+    except Exception as e:
+        logger.debug("[DB] Unique index uq_org_members_org_user skipped: %s", e)
 
 
 # ── Migrations: safely add columns to existing databases ───────────────────────
