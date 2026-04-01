@@ -11,6 +11,7 @@ from agents.recommendation_agent import get_recommendations
 from database import get_db
 from extensions import limiter
 from services.task_queue import task_queue
+from validators import require_json
 
 
 logger = logging.getLogger(__name__)
@@ -121,6 +122,7 @@ def _serialize_trip(row: dict) -> dict:
 @trips_bp.route("/plan-trip", methods=["POST"])
 @trips_bp.route("/trips/plan", methods=["POST"])
 @limiter.limit("10 per minute")
+@require_json("destination")
 def plan_trip_route():
     """POST /api/plan-trip and /api/trips/plan — run the A2A orchestrator."""
     user = get_current_user()

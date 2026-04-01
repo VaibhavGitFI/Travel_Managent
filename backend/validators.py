@@ -3,8 +3,10 @@ TravelSync Pro — Input Validation Helpers
 Lightweight validation without external dependencies (no marshmallow/pydantic required).
 """
 import re
+from functools import wraps
 from datetime import datetime as _dt
 from typing import Any
+from flask import request as flask_request, jsonify
 
 # Reusable regex patterns
 _EMAIL_RE = re.compile(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$")
@@ -159,3 +161,47 @@ def validate_currency(data: dict, field: str = "currency_code", required: bool =
     if not _CURRENCY_RE.match(val):
         raise ValidationError(field, "Currency code must be a 3-letter ISO 4217 code")
     return val
+
+
+# ── Decorator-style validators for route handlers ────────────────────────────
+
+def require_json(*required_fields):
+    """Decorator: validates required fields exist in JSON body."""
+    def decorator(f):
+        @wraps(f)
+        def wrapper(*args, **kwargs):
+            data = flask_request.get_json(silent=True)
+            if data is None:
+                return jsonify({"success": False, "error": "Request body must be JSON"}), 400
+            missing = [fld for fld in required_fields if fld not in data or data[fld] is None]
+            if missing:
+                return jsonify({"success": False, "error": f"Missing required fields: {', '.join(missing)}"}), 400
+            return f(*args, **kwargs)
+        return wrapper
+    return decorator
+
+
+def require_id(param_name):
+    """Decorator: validates a URL parameter is a positive integer."""
+    def decorator(f):
+        @wraps(f)
+        def wrapper(*args, **kwargs):
+            val = kwargs.get(param_name)
+            if val is not None:
+                try:
+                    val = int(val)
+                    if val <= 0:
+                        raise ValueError
+                    kwargs[param_name] = val
+                except (ValueError, TypeError):
+                    return jsonify({"success": False, "error": f"Invalid {param_name}"}), 400
+            return f(*args, **kwargs)
+        return wrapper
+    return decorator
+
+
+def sanitize_string(value, max_length=500):
+    """Strip, truncate, and remove null bytes from string input."""
+    if not isinstance(value, str):
+        return value
+    return value.strip().replace("\x00", "")[:max_length]
