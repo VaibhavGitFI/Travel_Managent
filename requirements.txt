@@ -1,3 +1,6 @@
+# All versions pinned exactly. To upgrade, edit the version and test.
+# Generated: 2026-04-02
+
 # Core Flask
 flask==3.1.0
 flask-cors==4.0.0
@@ -46,18 +49,13 @@ Pillow==10.4.0
 # OTIS Voice Agent — Gemini Live API
 # STT + LLM + TTS handled by Google Gemini Live (replaces Deepgram + ElevenLabs).
 # google-genai is the newer SDK required for Live API (separate from google-generativeai).
-google-genai>=1.0.0
+google-genai==1.69.0
 
 # Wake word detection (optional — works without a key via OpenWakeWord)
-openwakeword
+openwakeword==0.6.0
 pvporcupine==3.0.3
 websockets==13.1
 pyaudio==0.2.14
-
-# ElevenLabs + Deepgram kept for reference but no longer used by OTIS.
-# Remove these lines if you want a clean install.
-# deepgram-sdk==3.7.3
-# elevenlabs==1.8.2
 
 # Twilio — WhatsApp webhook signature verification + sending
 twilio==9.0.5
