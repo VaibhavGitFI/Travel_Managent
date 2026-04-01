@@ -442,3 +442,16 @@ def test_whatsapp_webhook_rejects_invalid_signature(client):
                        data={"From": "whatsapp:+919999999999", "Body": "hello", "NumMedia": "0"},
                        headers={"X-Twilio-Signature": "bogus-sig-value"})
     assert resp.status_code == 403
+
+
+def test_cliq_webhook_rejects_unauthorized_request(client):
+    """POST to Cliq bot without Authorization header must be rejected."""
+    resp = client.post("/api/cliq/bot", json={"text": "hello"})
+    assert resp.status_code == 403
+
+
+def test_cliq_webhook_rejects_wrong_token(client):
+    """POST to Cliq bot with wrong token must be rejected."""
+    resp = client.post("/api/cliq/bot", json={"text": "hello"},
+                       headers={"Authorization": "Bearer wrong-token"})
+    assert resp.status_code == 403

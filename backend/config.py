@@ -54,19 +54,31 @@ def _get_env_or_secret(env_key: str, secret_name: str | None = None, default: st
 
 class Config:
     # Core
-    SECRET_KEY = _get_env_or_secret("FLASK_SECRET_KEY", default="change-this-in-production")
-    DEBUG = os.getenv("DEBUG", "True").lower() == "true"
+    # DEBUG defaults to False — must be explicitly set to "true" to enable.
+    # Flask debug mode activates the Werkzeug interactive debugger (RCE risk).
+    DEBUG = os.getenv("DEBUG", "False").lower() == "true"
+
     try:
         PORT = int(os.getenv("PORT", 3399))
     except (ValueError, TypeError):
         PORT = 3399
 
-    # Warn loudly if using the default secret in production
-    if _is_gcp() and SECRET_KEY == "change-this-in-production":
-        logger.critical(
-            "FLASK_SECRET_KEY is using default value in production! "
-            "Set it via Secret Manager or environment variable immediately."
+    # Flask session signing key — required; no insecure fallback.
+    _raw_secret = _get_env_or_secret("FLASK_SECRET_KEY")
+    if not _raw_secret:
+        if _is_gcp():
+            raise RuntimeError(
+                "FLASK_SECRET_KEY must be configured in GCP Secret Manager "
+                "for production deployments. Add it via: "
+                "gcloud secrets create FLASK_SECRET_KEY --data-file=<keyfile>"
+            )
+        # Local dev only — never used in production.
+        logger.warning(
+            "[Config] FLASK_SECRET_KEY not set — using insecure dev placeholder. "
+            "Set FLASK_SECRET_KEY in backend/.env before running against real data."
         )
+        _raw_secret = "dev-only-insecure-placeholder-do-not-use"
+    SECRET_KEY = _raw_secret
 
     # Paths — BASE_DIR is the backend/ directory; PROJECT_ROOT is one level up
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -111,6 +123,7 @@ class Config:
     ZOHO_CLIQ_CLIENT_SECRET = _get_env_or_secret("ZOHO_CLIQ_CLIENT_SECRET")
     ZOHO_CLIQ_REFRESH_TOKEN = _get_env_or_secret("ZOHO_CLIQ_REFRESH_TOKEN")
     ZOHO_CLIQ_ACCESS_TOKEN  = _get_env_or_secret("ZOHO_CLIQ_ACCESS_TOKEN")
+    CLIQ_WEBHOOK_TOKEN      = _get_env_or_secret("CLIQ_WEBHOOK_TOKEN")
 
     # Notifications — Slack
     SLACK_WEBHOOK_URL = _get_env_or_secret("SLACK_WEBHOOK_URL")
@@ -120,12 +133,33 @@ class Config:
     # Database — Cloud SQL PostgreSQL in prod (via DATABASE_URL), SQLite in dev
     DATABASE_URL = _get_env_or_secret("DATABASE_URL")
 
-    # JWT
-    JWT_SECRET_KEY  = _get_env_or_secret("JWT_SECRET_KEY", default=SECRET_KEY)
+    # Redis — optional. Enables global rate limiting, cross-instance SocketIO,
+    # and shared caching. Without Redis everything falls back to in-process memory.
+    # Example: redis://localhost:6379/0 or redis://:<password>@redis-host:6379/0
+    REDIS_URL = _get_env_or_secret("REDIS_URL")
+
+    # JWT — intentionally independent from SECRET_KEY so rotating one does not
+    # invalidate the other. Falls back to SECRET_KEY only in non-GCP (dev) mode.
+    _raw_jwt_secret = _get_env_or_secret("JWT_SECRET_KEY")
+    if not _raw_jwt_secret:
+        if _is_gcp():
+            raise RuntimeError(
+                "JWT_SECRET_KEY must be configured in GCP Secret Manager. "
+                "Add it via: gcloud secrets create JWT_SECRET_KEY --data-file=<keyfile>"
+            )
+        logger.warning(
+            "[Config] JWT_SECRET_KEY not set — falling back to SECRET_KEY (dev only)."
+        )
+        _raw_jwt_secret = SECRET_KEY
+    JWT_SECRET_KEY = _raw_jwt_secret
+
+    # Access token lifetime — reduced from 24h to 60 min. Short-lived tokens
+    # limit the blast radius of token theft. The frontend uses silent refresh
+    # via the /api/auth/refresh endpoint + long-lived refresh token.
     try:
-        JWT_ACCESS_TTL = int(os.getenv("JWT_ACCESS_TTL_MINUTES", "1440"))
+        JWT_ACCESS_TTL = int(os.getenv("JWT_ACCESS_TTL_MINUTES", "60"))
     except (ValueError, TypeError):
-        JWT_ACCESS_TTL = 1440
+        JWT_ACCESS_TTL = 60
     try:
         JWT_REFRESH_TTL = int(os.getenv("JWT_REFRESH_TTL_DAYS", "30"))
     except (ValueError, TypeError):
@@ -142,13 +176,18 @@ class Config:
 
     # OTIS API Keys
     PORCUPINE_ACCESS_KEY = _get_env_or_secret("PORCUPINE_ACCESS_KEY")
-    DEEPGRAM_API_KEY     = _get_env_or_secret("DEEPGRAM_API_KEY")
-    ELEVENLABS_API_KEY   = _get_env_or_secret("ELEVENLABS_API_KEY")
+    # Deepgram + ElevenLabs no longer used — OTIS now uses Gemini Live API
+    # (kept as None so existing code that checks them doesn't crash)
+    DEEPGRAM_API_KEY   = None
+    ELEVENLABS_API_KEY = None
 
-    # OTIS Voice Settings
-    OTIS_VOICE_ID = os.getenv("OTIS_VOICE_ID", "pNInz6obpgDQGcFmaJgB")
-    OTIS_VOICE_GENDER = os.getenv("OTIS_VOICE_GENDER", "male")
+    # OTIS Voice Settings — Gemini Live voices
+    # Available: Puck, Charon, Kore, Fenrir, Aoede, Orus, Perseus
+    # Best for Indian English: Puck (energetic), Orus (calm), Charon (deep)
+    OTIS_LIVE_VOICE    = os.getenv("OTIS_LIVE_VOICE", "Puck")
     OTIS_VOICE_LANGUAGE = os.getenv("OTIS_VOICE_LANGUAGE", "en-IN")
+    # Google Cloud TTS voice for REST /speak endpoint (Indian English Neural)
+    OTIS_GCP_TTS_VOICE = os.getenv("OTIS_GCP_TTS_VOICE", "en-IN-Neural2-B")
 
     try:
         OTIS_VOICE_SPEED = float(os.getenv("OTIS_VOICE_SPEED", "1.0"))
@@ -222,12 +261,11 @@ class Config:
             "email_smtp":        bool(cls.SMTP_HOST and cls.SMTP_USER),
             "zoho_cliq":         bool(cls.ZOHO_CLIQ_API_ENDPOINT and cls.ZOHO_CLIQ_REFRESH_TOKEN),
             "slack":             bool(cls.SLACK_WEBHOOK_URL or cls.SLACK_BOT_TOKEN),
-            "otis_voice":        bool(cls.OTIS_ENABLED and
-                                     cls.DEEPGRAM_API_KEY and cls.ELEVENLABS_API_KEY),
+            "otis_voice":        bool(cls.OTIS_ENABLED and cls.GEMINI_API_KEY),
             # Wake word works with OpenWakeWord (no key) or Porcupine (with key)
             "otis_wake_word":    True,
-            "otis_stt":          bool(cls.DEEPGRAM_API_KEY),
-            "otis_tts":          bool(cls.ELEVENLABS_API_KEY),
+            "otis_stt":          bool(cls.GEMINI_API_KEY),   # Gemini Live STT
+            "otis_tts":          bool(cls.GEMINI_API_KEY),   # Google Cloud TTS / Gemini Live TTS
         }
 
     @classmethod
