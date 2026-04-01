@@ -152,11 +152,13 @@ def forecast_budget(
     forecast_mid = int(flight_mid + hotel_total + per_diem_total + misc)
     forecast_max = int(flight_max + hotel_total * 1.2 + per_diem_total * 1.1 + misc * 1.5)
 
-    # If historical average exists, blend it in (weight 40% history, 60% formula)
+    # If historical average exists, blend it in: 60% formula + 40% historical.
+    # Max uses 1.3x historical as a conservative safety margin for budgeting.
     if historical_avg:
-        forecast_min = int(forecast_min * 0.6 + historical_avg * 0.6 * 0.4)
+        forecast_min = int(forecast_min * 0.6 + historical_avg * 0.4)
         forecast_mid = int(forecast_mid * 0.6 + historical_avg * 0.4)
-        forecast_max = int(forecast_max * 0.6 + historical_avg * 1.3 * 0.4)
+        # Pad max by 30% above historical average for budget safety margin
+        forecast_max = int(forecast_max * 0.6 + (historical_avg * 1.3) * 0.4)
 
     # 4. Confidence level
     if len(history) >= 3:
