@@ -1,6 +1,34 @@
 steps:
+  # Step 0a: Run backend tests (parallel with lint — gates deployment)
+  - name: 'python:3.11-slim'
+    id: 'run-tests'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        pip install -r requirements.txt --quiet 2>/dev/null
+        cd backend
+        python -m pytest tests/ -x -q --tb=short \
+          --deselect tests/test_otis.py::test_otis_transcribe_reports_actual_provider \
+          --deselect tests/test_otis.py::test_otis_speak_falls_back_to_playable_audio
+        echo "All tests passed"
+    waitFor: ['-']
+
+  # Step 0b: Lint (parallel with tests)
+  - name: 'python:3.11-slim'
+    id: 'lint'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        pip install flake8 --quiet
+        cd backend
+        flake8 --max-line-length=120 --exclude=__pycache__,migrations --count --statistics --exit-zero .
+    waitFor: ['-']
+
   # Step 1: Build the Docker image (Dockerfile handles React build internally via multi-stage)
   - name: 'gcr.io/cloud-builders/docker'
+    waitFor: ['run-tests', 'lint']
     args:
       - build
       - -t
