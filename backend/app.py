@@ -35,13 +35,21 @@ def create_app() -> Flask:
     ]
     CORS(app, supports_credentials=True, origins=allowed_origins)
 
-    # socketio.init_app(app, cors_allowed_origins=allowed_origins, async_mode="eventlet",
-    #                   logger=False, engineio_logger=False)
-
-
+    # async_mode must match the Gunicorn worker class (--worker-class eventlet in
+    # the Dockerfile). Setting it explicitly avoids non-deterministic auto-detection
+    # when multiple async libraries are installed.
+    #
+    # When REDIS_URL is set, SocketIO uses it as a message queue so events
+    # emitted on one Cloud Run instance are broadcast to users connected to other
+    # instances (e.g. real-time notifications, OTIS events). Without Redis,
+    # cross-instance delivery silently fails (acceptable for single-instance dev).
+    import os as _os
+    _redis_url = _os.getenv("REDIS_URL", "").strip() or None
     socketio.init_app(
         app,
         cors_allowed_origins=allowed_origins,
+        async_mode="eventlet",
+        message_queue=_redis_url,
         logger=False,
         engineio_logger=False,
     )
@@ -58,6 +66,38 @@ def create_app() -> Flask:
     app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
     app.config["SESSION_COOKIE_SECURE"] = not Config.DEBUG  # Secure in prod
     app.config["SESSION_COOKIE_NAME"] = "ts_session"
+
+    # ── Global auth enforcement (before_request) ───────────────────────────
+    # Every /api/ route is protected by default. Public routes are listed in
+    # _AUTH_EXEMPT_PREFIXES. This is a single enforcement point — a developer
+    # adding a new route cannot accidentally forget authentication.
+    _AUTH_EXEMPT_PREFIXES = (
+        "/api/auth/login",
+        "/api/auth/register",
+        "/api/auth/verify-email",
+        "/api/auth/forgot-password",
+        "/api/auth/reset-password",
+        "/api/auth/refresh",
+        "/api/health",
+        "/api/cliq/bot",
+        "/api/whatsapp/webhook",
+        "/api/docs",
+    )
+
+    @app.before_request
+    def require_auth():
+        """Enforce authentication on all /api/ routes except explicitly public ones."""
+        if not request.path.startswith("/api/"):
+            return None
+        if request.method == "OPTIONS":
+            return None  # CORS preflight
+        if any(request.path.startswith(p) for p in _AUTH_EXEMPT_PREFIXES):
+            return None
+        from auth import get_current_user
+        user = get_current_user()
+        if not user:
+            return jsonify({"success": False, "error": "Authentication required"}), 401
+        return None
 
     # ── CSRF protection (global before_request) ──────────────────────────────
     @app.before_request
@@ -113,6 +153,11 @@ def create_app() -> Flask:
 
     with app.app_context():
         init_db(app)
+
+    # Start the Supabase keep-alive thread here so it runs under every process
+    # entry point (Gunicorn, run.py, tests). The old placement inside
+    # `if __name__ == "__main__"` meant it never started under Gunicorn.
+    _start_supabase_keepalive()
 
     # ── Register Blueprints ────────────────────────────────────────────────────
     from routes.auth      import auth_bp
@@ -213,11 +258,84 @@ def create_app() -> Flask:
             join_room(room)
             emit("room_joined", {"room": room})
 
-    # ── OTIS Voice Assistant WebSocket Events ─────────────────────────────────
+    # ── OTIS shared resources ────────────────────────────────────────────────
+    # Shared thread pool for OTIS async tasks (transcription, command execution).
+    # Replaces per-call ThreadPoolExecutor(max_workers=1) which created and
+    # destroyed a thread pool on every voice command.
+    import concurrent.futures as _cf
+    _otis_executor = _cf.ThreadPoolExecutor(max_workers=4, thread_name_prefix="otis")
+
+    # Audio buffers for sessions using the fallback (non-Gemini-Live) path.
+    # Keyed by session_id. Cleaned up on session stop and by a TTL sweep.
+    _audio_buffers: dict[str, bytes] = {}
+
+    # ── OTIS Voice Assistant WebSocket Events (Gemini Live API) ──────────────
+    #
+    #  Audio pipeline (frontend unchanged):
+    #    otis:audio_chunk → Gemini Live (real-time STT+LLM+TTS)
+    #    otis:process_command → OtisAgentPool (text commands, no audio needed)
+    #    otis:request_audio → Google Cloud TTS (on-demand TTS)
+    #
+    #  Live events emitted back to frontend (same names as before):
+    #    otis:session_started, otis:audio_received, otis:transcript,
+    #    otis:response, otis:audio_ready, otis:turn_complete, otis:barge_in,
+    #    otis:error, otis:session_stopped
+
+    def _build_otis_system_prompt(user: dict) -> str:
+        """Build Gemini Live system instruction incorporating live user context."""
+        from database import get_db
+        now = datetime.now().strftime("%A, %B %d, %Y at %I:%M %p")
+        name  = user.get("full_name") or user.get("name", "there")
+        role  = user.get("role", "employee")
+        dept  = user.get("department") or ""
+        org   = user.get("org_name") or ""
+
+        context_lines = [f"Date/time: {now}"]
+        try:
+            db = get_db()
+            # Pending expense approvals for managers/admins
+            if role in ("admin", "manager", "super_admin"):
+                row = db.execute(
+                    "SELECT COUNT(*) as c FROM approvals WHERE approver_id = ? AND status='pending'",
+                    (user["id"],)
+                ).fetchone()
+                if row:
+                    context_lines.append(f"Pending travel approvals: {row['c']}")
+            # User's own pending expenses
+            row2 = db.execute(
+                "SELECT COUNT(*) as c FROM expenses_db WHERE user_id=? AND COALESCE(approval_status,'draft') IN ('draft','submitted')",
+                (user["id"],)
+            ).fetchone()
+            if row2 and row2["c"]:
+                context_lines.append(f"User pending expenses: {row2['c']}")
+            db.close()
+        except Exception:
+            pass
+
+        ctx = "\n".join(context_lines)
+        return f"""You are OTIS (Omniscient Travel Intelligence System), the voice AI assistant for TravelSync Pro.
+
+You are speaking with {name}, {role}{f' in {dept}' if dept else ''}{f' at {org}' if org else ''}.
+
+{ctx}
+
+VOICE RESPONSE RULES — CRITICAL:
+- Speak in clear, natural Indian English accent
+- Be concise: 1-3 sentences maximum per response
+- NO markdown, NO bullet points, NO tables in speech
+- Use conversational numbers: "three trips" not "3 trips"
+- Use Indian currency: "rupees fifty thousand" not "₹50,000"
+- Always confirm actions: "I've approved John's Mumbai trip"
+- If uncertain, ask ONE follow-up question
+- End responses with what happens next or offer help
+
+You have access to all TravelSync data for this user including trips, expenses, approvals, meetings, and analytics."""
+
     @socketio.on("otis:start_session")
     def handle_otis_start(data):
-        """Start OTIS voice session."""
+        """Start OTIS voice session and initialise Gemini Live API connection."""
         from auth import get_current_user
+        from services.gemini_live_service import gemini_live
         user = get_current_user()
         if not user:
             emit("otis:error", {"error": "Authentication required"})
@@ -225,19 +343,85 @@ def create_app() -> Flask:
 
         try:
             session_id = data.get("session_id")
-            logger.info(f"[OTIS WebSocket] Session {session_id} started for user {user['id']}")
-            emit("otis:session_started", {"session_id": session_id, "status": "ready"})
-        except Exception as e:
-            logger.exception("[OTIS WebSocket] Start session failed")
+            if not session_id:
+                import uuid
+                session_id = f"otis-{uuid.uuid4().hex[:12]}"
+
+            user_room = f"user_{user['id']}"
+            live_mode = False
+
+            if gemini_live.live_available:
+                system_prompt = _build_otis_system_prompt(user)
+                voice = (data.get("voice") or "Puck").capitalize()
+
+                def _on_live_event(event_type: str, ev_data: dict):
+                    """Route Gemini Live events to the user's SocketIO room."""
+                    try:
+                        if event_type == "transcript":
+                            socketio.emit("otis:transcript", {
+                                "session_id": session_id,
+                                "text": ev_data.get("text", ""),
+                            }, room=user_room)
+
+                        elif event_type in ("response", "text_token") and ev_data.get("text"):
+                            socketio.emit("otis:response", {
+                                "session_id": session_id,
+                                "response":   ev_data.get("text", ""),
+                                "streaming":  event_type == "text_token",
+                            }, room=user_room)
+
+                        elif event_type == "audio_chunk":
+                            socketio.emit("otis:audio_ready", {
+                                "session_id": session_id,
+                                "audio_b64":  ev_data.get("audio_b64", ""),
+                                "mime_type":  ev_data.get("mime_type", "audio/pcm;rate=24000"),
+                                "streaming":  True,
+                            }, room=user_room)
+
+                        elif event_type == "turn_complete":
+                            socketio.emit("otis:turn_complete", {"session_id": session_id}, room=user_room)
+
+                        elif event_type == "barge_in":
+                            socketio.emit("otis:barge_in", {"session_id": session_id}, room=user_room)
+
+                        elif event_type == "error":
+                            socketio.emit("otis:error", {
+                                "session_id": session_id,
+                                "error": ev_data.get("message", "Gemini Live error"),
+                            }, room=user_room)
+                    except Exception as cb_err:
+                        logger.debug("[OTIS WS] Live event callback error: %s", cb_err)
+
+                sess = gemini_live.create_session(
+                    session_id=session_id,
+                    system_prompt=system_prompt,
+                    on_event=_on_live_event,
+                    voice_name=voice,
+                )
+                if sess:
+                    live_mode = True
+                    logger.info("[OTIS WS] Gemini Live session created: %s", session_id)
+
+            emit("otis:session_started", {
+                "session_id": session_id,
+                "status":     "ready",
+                "mode":       "gemini_live" if live_mode else "text",
+            })
+        except Exception:
+            logger.exception("[OTIS WS] Start session failed")
             emit("otis:error", {"error": "Failed to start session"})
 
     @socketio.on("otis:audio_chunk")
     def handle_otis_audio(data):
         """
-        Receive audio chunk for STT processing.
-        Client sends raw audio data, we transcribe and process.
+        Stream audio chunk to Gemini Live API.
+        Gemini handles STT + LLM + TTS in real time — no separate transcription step.
+        Falls back to Gemini transcribe+command when Live not available.
         """
+        import base64 as _b64
         from auth import get_current_user
+        from services.gemini_live_service import gemini_live
+
         user = get_current_user()
         if not user:
             emit("otis:error", {"error": "Authentication required"})
@@ -245,138 +429,177 @@ def create_app() -> Flask:
 
         try:
             session_id = data.get("session_id")
-            audio_data = data.get("audio")  # Base64 encoded audio
-            is_final = data.get("is_final", False)
+            audio_b64  = data.get("audio", "")
+            is_final   = data.get("is_final", False)
+            mime_type  = data.get("mime_type", "audio/pcm;rate=16000")
 
-            if not audio_data:
-                emit("otis:error", {"error": "Audio data required"})
+            if not audio_b64:
                 return
 
-            # TODO: In production, accumulate chunks and transcribe when is_final=True
-            # For now, emit acknowledgment
+            audio_bytes = _b64.b64decode(audio_b64)
+
+            # ── Gemini Live path (real-time) ───────────────────────────────
+            if gemini_live.session_alive(session_id):
+                gemini_live.send_audio(session_id, audio_bytes)
+                emit("otis:audio_received", {
+                    "session_id": session_id,
+                    "chunk_size": len(audio_bytes),
+                    "is_final":   is_final,
+                    "mode":       "gemini_live",
+                })
+                return
+
+            # ── Fallback: accumulate then transcribe+process ───────────────
+            buf = _audio_buffers.get(session_id, b"")
+            _audio_buffers[session_id] = buf + audio_bytes
+
             emit("otis:audio_received", {
                 "session_id": session_id,
-                "chunk_size": len(audio_data),
-                "is_final": is_final
+                "chunk_size": len(audio_bytes),
+                "is_final":   is_final,
+                "mode":       "buffered",
             })
 
-            # If final chunk, trigger STT processing
             if is_final:
+                full_audio = _audio_buffers.pop(session_id, b"")
+                if not full_audio:
+                    return
                 emit("otis:transcribing", {"session_id": session_id})
-                # Actual STT processing would happen here
-                # For now, emit placeholder
-                # emit("otis:transcript", {"text": "...", "session_id": session_id})
 
-        except Exception as e:
-            logger.exception("[OTIS WebSocket] Audio processing failed")
-            emit("otis:error", {"error": "Failed to process audio"})
+                def _transcribe_and_respond():
+                    result = gemini_live.transcribe_audio(full_audio, mime_type)
+                    return result.get("transcript", "")
+
+                transcript = _otis_executor.submit(_transcribe_and_respond).result(timeout=15)
+
+                if transcript:
+                    emit("otis:transcript", {"session_id": session_id, "text": transcript})
+                    # Trigger text command processing
+                    socketio.emit("otis:process_command", {
+                        "session_id": session_id,
+                        "command":    transcript,
+                    })
+
+        except Exception:
+            logger.exception("[OTIS WS] Audio chunk processing failed")
+            emit("otis:error", {"error": "Audio processing failed"})
 
     @socketio.on("otis:process_command")
     def handle_otis_command(data):
         """
-        Process a voice command (text already transcribed).
-        This is the main OTIS processing pipeline.
+        Process a text command via OtisAgentPool (Gemini LLM + function calling).
+        Used for text-mode and as fallback when Live API not available.
         """
         import asyncio
-        import concurrent.futures
-
         from auth import get_current_user
+        from services.gemini_live_service import gemini_live
+
         user = get_current_user()
         if not user:
             emit("otis:error", {"error": "Authentication required"})
             return
 
         try:
-            session_id = data.get("session_id")
-            command_text = data.get("command", "").strip()
+            session_id   = data.get("session_id")
+            command_text = (data.get("command") or "").strip()
 
             if not command_text:
                 emit("otis:error", {"error": "Command text required"})
                 return
 
-            logger.info(f"[OTIS WebSocket] Processing command: '{command_text}' (session: {session_id})")
-
-            # Security: validate command before processing
+            # Security validation
             try:
                 from otis_security import OtisCommandSecurity
-                validation = OtisCommandSecurity.validate(command_text)
-                if not validation["valid"]:
-                    emit("otis:error", {"error": validation["error"], "session_id": session_id})
+                v = OtisCommandSecurity.validate(command_text)
+                if not v["valid"]:
+                    emit("otis:error", {"error": v["error"], "session_id": session_id})
                     return
-                command_text = validation["command"]  # Use sanitized command
-                # If high-risk and needs confirmation, notify client
-                if validation.get("needs_confirmation"):
+                command_text = v["command"]
+                if v.get("needs_confirmation"):
                     emit("otis:confirm_required", {
-                        "session_id": session_id,
-                        "command": command_text,
-                        "risk_reason": validation["risk_reason"]
+                        "session_id":  session_id,
+                        "command":     command_text,
+                        "risk_reason": v["risk_reason"],
                     })
                     return
-                # Quota check
                 if session_id:
-                    allowed, quota_reason = OtisCommandSecurity.check_command_quota(user["id"], session_id)
-                    if not allowed:
-                        emit("otis:error", {"error": quota_reason, "session_id": session_id})
+                    ok, quota_msg = OtisCommandSecurity.check_command_quota(user["id"], session_id)
+                    if not ok:
+                        emit("otis:error", {"error": quota_msg, "session_id": session_id})
                         return
             except ImportError:
-                pass  # Security module optional — don't block if not yet installed
+                pass
 
             emit("otis:processing", {"session_id": session_id, "command": command_text})
 
-            # Import OTIS agent (use pool to avoid re-initializing services each call)
             try:
                 from agents.otis_agent import OtisAgentPool
-
-                pool = OtisAgentPool.instance()
+                pool  = OtisAgentPool.instance()
                 agent = pool.get_or_create(
                     user_id=user["id"],
                     org_id=user.get("org_id"),
-                    session_id=session_id or f"ws-{user['id']}"
+                    session_id=session_id or f"ws-{user['id']}",
                 )
 
-                # Run async process_command in a thread with its own event loop
-                def _run_command():
-                    return asyncio.run(agent.process_command(command_text))
+                def _run():
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    try:
+                        return loop.run_until_complete(agent.process_command(command_text))
+                    finally:
+                        loop.close()
 
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                    response_text = executor.submit(_run_command).result(timeout=30)
+                response_text = _otis_executor.submit(_run).result(timeout=30)
 
-                # Send response back to client
                 emit("otis:response", {
                     "session_id": session_id,
-                    "command": command_text,
-                    "response": response_text,
-                    "timestamp": datetime.now().isoformat()
+                    "command":    command_text,
+                    "response":   response_text,
+                    "timestamp":  datetime.now().isoformat(),
                 })
 
-                logger.info(f"[OTIS WebSocket] Response sent: '{response_text[:50]}...'")
+                # Auto-generate TTS audio for the response (Google Cloud TTS)
+                try:
+                    audio_bytes = gemini_live.synthesize_speech(response_text)
+                    if audio_bytes:
+                        import base64 as _b64
+                        emit("otis:audio_ready", {
+                            "session_id": session_id,
+                            "audio_b64":  _b64.b64encode(audio_bytes).decode(),
+                            "mime_type":  "audio/mpeg",
+                            "duration_ms": 0,
+                        })
+                except Exception:
+                    pass  # TTS failure is non-fatal
 
-            except ImportError as ie:
-                logger.error(f"[OTIS WebSocket] OTIS agent not found: {ie}")
+            except ImportError:
                 emit("otis:response", {
                     "session_id": session_id,
-                    "response": "OTIS is not fully configured. Please contact your administrator.",
-                    "error": True
+                    "response":   "OTIS is not fully configured.",
+                    "error":      True,
                 })
-            except Exception as agent_err:
-                logger.exception("[OTIS WebSocket] Agent processing failed")
+            except Exception:
+                logger.exception("[OTIS WS] Agent command failed")
                 emit("otis:response", {
                     "session_id": session_id,
-                    "response": "I encountered an error processing your command. Please try again.",
-                    "error": True
+                    "response":   "I encountered an error. Please try again.",
+                    "error":      True,
                 })
 
-        except Exception as e:
-            logger.exception("[OTIS WebSocket] Command processing failed")
+        except Exception:
+            logger.exception("[OTIS WS] Command processing failed")
             emit("otis:error", {"error": "Failed to process command"})
 
     @socketio.on("otis:request_audio")
     def handle_otis_request_audio(data):
         """
-        Request TTS audio for a text response.
-        Client can request audio generation for a specific text.
+        Generate TTS audio for a given text via Google Cloud TTS (Indian English).
+        Returns base64-encoded MP3 in otis:audio_ready event.
         """
+        import base64 as _b64
         from auth import get_current_user
+        from services.gemini_live_service import gemini_live
+
         user = get_current_user()
         if not user:
             emit("otis:error", {"error": "Authentication required"})
@@ -384,31 +607,41 @@ def create_app() -> Flask:
 
         try:
             session_id = data.get("session_id")
-            text = data.get("text", "").strip()
+            text       = (data.get("text") or "").strip()[:2000]
 
             if not text:
                 emit("otis:error", {"error": "Text required for audio generation"})
                 return
 
-            logger.info(f"[OTIS WebSocket] Generating audio for: '{text[:50]}...'")
-
-            # TODO: Generate TTS audio
-            # For now, emit placeholder
-            emit("otis:audio_ready", {
-                "session_id": session_id,
-                "text": text,
-                "audio_url": None,  # Would be base64 audio or URL
-                "duration_ms": 0
-            })
-
-        except Exception as e:
-            logger.exception("[OTIS WebSocket] Audio generation failed")
+            audio_bytes = gemini_live.synthesize_speech(text, language_code="en-IN")
+            if audio_bytes:
+                emit("otis:audio_ready", {
+                    "session_id":  session_id,
+                    "text":        text,
+                    "audio_b64":   _b64.b64encode(audio_bytes).decode(),
+                    "mime_type":   "audio/mpeg",
+                    "duration_ms": 0,
+                    "provider":    "google_cloud_tts",
+                })
+            else:
+                emit("otis:audio_ready", {
+                    "session_id":  session_id,
+                    "text":        text,
+                    "audio_b64":   None,
+                    "mime_type":   None,
+                    "duration_ms": 0,
+                    "provider":    "unavailable",
+                })
+        except Exception:
+            logger.exception("[OTIS WS] Audio generation failed")
             emit("otis:error", {"error": "Failed to generate audio"})
 
     @socketio.on("otis:stop_session")
     def handle_otis_stop(data):
-        """Stop OTIS voice session."""
+        """Stop OTIS voice session — tears down Gemini Live connection and agent pool entry."""
         from auth import get_current_user
+        from services.gemini_live_service import gemini_live
+
         user = get_current_user()
         if not user:
             emit("otis:error", {"error": "Authentication required"})
@@ -416,36 +649,53 @@ def create_app() -> Flask:
 
         try:
             session_id = data.get("session_id")
-            logger.info(f"[OTIS WebSocket] Session {session_id} stopped")
-            # Release agent from pool to free resources
+
+            # Stop Gemini Live session
+            if session_id:
+                gemini_live.stop_session(session_id)
+
+            # Clean up audio buffer (prevents memory leak on dropped sessions)
+            _audio_buffers.pop(session_id, None)
+
+            # Release agent pool entry
             try:
                 from agents.otis_agent import OtisAgentPool
                 OtisAgentPool.instance().release(session_id or f"ws-{user['id']}")
             except Exception:
                 pass
+
+            logger.info("[OTIS WS] Session %s stopped", session_id)
             emit("otis:session_stopped", {"session_id": session_id})
-        except Exception as e:
-            logger.exception("[OTIS WebSocket] Stop session failed")
+        except Exception:
+            logger.exception("[OTIS WS] Stop session failed")
             emit("otis:error", {"error": "Failed to stop session"})
 
     # ── Serve React SPA (production) ───────────────────────────────────────────
+    _SPA_DIR = os.path.abspath(Config.REACT_BUILD)
+
     @app.route("/", defaults={"path": ""})
     @app.route("/<path:path>")
     def serve_react(path):
         # Don't intercept /api or /socket.io routes
         if path.startswith("api/") or path.startswith("socket.io"):
             return jsonify({"success": False, "error": "Not found"}), 404
-        # Serve static asset from React build if it exists
+
+        # Serve static asset from React build if it exists.
+        # Path traversal protection: resolve absolute path THEN verify it
+        # is still inside _SPA_DIR. Also reject null bytes.
         if path:
-            build_file = os.path.normpath(os.path.join(Config.REACT_BUILD, path))
-            if not build_file.startswith(os.path.normpath(Config.REACT_BUILD)):
-                return jsonify({"success": False, "error": "Forbidden"}), 403
-            if os.path.isfile(build_file):
-                return send_from_directory(Config.REACT_BUILD, path)
+            if "\x00" in path:
+                return jsonify({"success": False, "error": "Not found"}), 404
+            safe_path = os.path.abspath(os.path.join(_SPA_DIR, path))
+            if not (safe_path.startswith(_SPA_DIR + os.sep) or safe_path == _SPA_DIR):
+                return jsonify({"success": False, "error": "Not found"}), 404
+            if os.path.isfile(safe_path):
+                return send_from_directory(_SPA_DIR, path)
+
         # SPA fallback — always serve index.html for client-side routing
-        index_html = os.path.join(Config.REACT_BUILD, "index.html")
+        index_html = os.path.join(_SPA_DIR, "index.html")
         if os.path.isfile(index_html):
-            return send_from_directory(Config.REACT_BUILD, "index.html")
+            return send_from_directory(_SPA_DIR, "index.html")
         # Dev mode — React runs on port 5173
         return jsonify({
             "message": "TravelSync Pro API v3.0",
@@ -480,12 +730,15 @@ def log_startup_banner() -> None:
 
 # ── Supabase Keep-Alive ───────────────────────────────────────────────────────
 def _start_supabase_keepalive():
-    """Background thread that pings Supabase every 4 minutes to prevent free-tier pausing."""
+    """Background thread that pings Supabase every 4 minutes to prevent free-tier
+    pausing. Also purges expired rows from token_blacklist and auth_codes tables so
+    they do not grow unboundedly."""
     import threading
     import time as _time
+    from datetime import datetime as _dt
 
     if not Config.DATABASE_URL:
-        return  # No Supabase configured
+        return  # SQLite in dev — no keep-alive needed
 
     def _ping_loop():
         while True:
@@ -493,21 +746,35 @@ def _start_supabase_keepalive():
             try:
                 from database import get_db
                 db = get_db()
+                # Keep connection alive
                 db.execute("SELECT 1")
+                # Purge expired auth tokens — prevents table bloat
+                now_iso = _dt.utcnow().isoformat()
+                db.execute(
+                    "DELETE FROM token_blacklist WHERE expires_at < ?", (now_iso,)
+                )
+                db.execute(
+                    "DELETE FROM auth_codes WHERE expires_at < ?", (now_iso,)
+                )
+                db.commit()
                 db.close()
             except Exception as e:
-                logger.warning("[KeepAlive] Supabase ping failed: %s", e)
+                logger.warning("[KeepAlive] Supabase ping/cleanup failed: %s", e)
 
     t = threading.Thread(target=_ping_loop, daemon=True, name="supabase-keepalive")
     t.start()
-    logger.info("[KeepAlive] Supabase keep-alive thread started (ping every 4 min)")
+    logger.info("[KeepAlive] Supabase keep-alive thread started (ping + cleanup every 4 min)")
 
 
-# ── Entry Point ────────────────────────────────────────────────────────────────
+# ── Module-level app for Gunicorn ─────────────────────────────────────────────
+# Gunicorn imports this module and looks up the `app` variable directly:
+#   gunicorn --worker-class eventlet -w 1 app:app
+# `create_app()` is called exactly ONCE here. run.py imports this `app` variable
+# directly rather than calling create_app() again, which previously caused double
+# blueprint registration, double init_db(), and duplicate SocketIO event handlers.
 app = create_app()
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     log_startup_banner()
-    _start_supabase_keepalive()
     socketio.run(app, host="0.0.0.0", port=Config.PORT, debug=Config.DEBUG)

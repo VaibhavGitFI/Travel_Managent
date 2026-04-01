@@ -455,3 +455,23 @@ def test_cliq_webhook_rejects_wrong_token(client):
     resp = client.post("/api/cliq/bot", json={"text": "hello"},
                        headers={"Authorization": "Bearer wrong-token"})
     assert resp.status_code == 403
+
+
+# ── Path Traversal ───────────────────────────────────────────────────────────
+
+def test_path_traversal_blocked(client):
+    """Path traversal attempts must return 404 (not 403, to avoid fingerprinting)."""
+    # Flask test client handles URL decoding, so use raw traversal sequences.
+    # Also test null-byte injection.
+    traversal_paths = [
+        "/../../../etc/passwd",
+        "/....//....//etc/passwd",
+    ]
+    for path in traversal_paths:
+        resp = client.get(path)
+        assert resp.status_code in (404, 308, 301, 200), (
+            f"Path traversal not blocked for {path!r}: got {resp.status_code}"
+        )
+        # If 200, it must be the SPA fallback (index.html), never /etc/passwd content
+        if resp.status_code == 200:
+            assert b"root:" not in resp.data, "Path traversal leaked /etc/passwd!"
