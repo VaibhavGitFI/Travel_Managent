@@ -25,33 +25,36 @@ logger = logging.getLogger(__name__)
 _MAX_HISTORY = 20          # max messages to keep per user
 _SESSION_TIMEOUT = 1800    # 30 minutes
 
-_conversations: dict[str, dict] = defaultdict(lambda: {"messages": [], "last_active": 0})
+from services.state_store import StateNamespace
 
-# Pending expenses waiting for category confirmation
-_pending_expenses: dict[str, dict] = {}  # phone -> {amount, vendor, date, description, gst, payment_method, user_id}
+_conversations = StateNamespace("wa:conversations", ttl_seconds=7200)   # 2 hours
+_pending_expenses = StateNamespace("wa:pending_expenses", ttl_seconds=1800)  # 30 min
 
 
 def _get_history(phone: str) -> list[dict]:
     """Get conversation history for a phone number. Clears if expired."""
-    session = _conversations[phone]
-    if time.time() - session["last_active"] > _SESSION_TIMEOUT:
-        session["messages"] = []
-    return session["messages"]
+    session = _conversations.get(phone)
+    if not session:
+        return []
+    if time.time() - session.get("last_active", 0) > _SESSION_TIMEOUT:
+        _conversations.delete(phone)
+        return []
+    return session.get("messages", [])
 
 
 def _add_to_history(phone: str, role: str, content: str):
     """Add a message to conversation history."""
-    session = _conversations[phone]
+    session = _conversations.get(phone) or {"messages": [], "last_active": 0}
     session["messages"].append({"role": role, "content": content})
     session["last_active"] = time.time()
-    # Trim old messages
     if len(session["messages"]) > _MAX_HISTORY:
         session["messages"] = session["messages"][-_MAX_HISTORY:]
+    _conversations.set(phone, session)
 
 
 def _clear_history(phone: str):
     """Clear conversation history for a user."""
-    _conversations[phone] = {"messages": [], "last_active": 0}
+    _conversations.set(phone, {"messages": [], "last_active": 0})
 
 whatsapp_bp = Blueprint("whatsapp", __name__, url_prefix="/api/whatsapp")
 

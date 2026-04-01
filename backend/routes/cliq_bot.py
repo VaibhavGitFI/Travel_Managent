@@ -32,8 +32,9 @@ def _verify_cliq_webhook() -> bool:
     return hmac.compare_digest(incoming, expected_token)
 
 
-# Guided expense flow state per user: {phone_key: {"step": "amount|category|description|confirm", ...}}
-_expense_flow: dict[str, dict] = {}
+# Guided expense flow state per user
+from services.state_store import StateNamespace
+_expense_flow = StateNamespace("cliq:expense_flow", ttl_seconds=1800)
 
 CATEGORY_BUTTONS = [
     {"text": "Flight"}, {"text": "Hotel"}, {"text": "Food & Meals"},
@@ -428,7 +429,7 @@ def _get_context_buttons(message: str, user: dict | None) -> list:
     # Expense flow — show category buttons or confirm buttons
     phone_key = f"cliq_{user.get('email', '') if user else ''}"
     if phone_key in _expense_flow:
-        step = _expense_flow[phone_key].get("step")
+        step = _expense_flow.get(phone_key, {}).get("step")
         if step == "category":
             return CATEGORY_BUTTONS
         if step == "confirm":
@@ -733,7 +734,7 @@ def _handle_expense_flow(phone_key: str, text: str, raw: str, user: dict) -> str
         "communication": "Communication", "other": "Other",
     }
 
-    flow = _expense_flow[phone_key]
+    flow = _expense_flow.get(phone_key, {})
     step = flow.get("step")
 
     if text == "cancel":
@@ -749,6 +750,7 @@ def _handle_expense_flow(phone_key: str, text: str, raw: str, user: dict) -> str
                 return "Please enter a valid amount between 1 and 10,00,000.\n\nExample: 500"
             flow["amount"] = amount
             flow["step"] = "description"
+            _expense_flow.set(phone_key, flow)
             return f"*Amount Set*\n\nRs. {amount:,.2f}\n\nNow describe the expense:\n\nExample: Uber cab to airport"
         except (ValueError, TypeError):
             return "Invalid amount. Please enter a number.\n\nExample: 500"
@@ -762,6 +764,7 @@ def _handle_expense_flow(phone_key: str, text: str, raw: str, user: dict) -> str
         if auto_cat and auto_cat != "other":
             flow["category"] = auto_cat
             flow["step"] = "confirm"
+            _expense_flow.set(phone_key, flow)
             return (
                 f"*Expense Summary*\n\n"
                 f"Amount: Rs. {flow['amount']:,.2f}\n"
@@ -772,6 +775,7 @@ def _handle_expense_flow(phone_key: str, text: str, raw: str, user: dict) -> str
             )
         else:
             flow["step"] = "category"
+            _expense_flow.set(phone_key, flow)
             return (
                 f"Amount: Rs. {flow['amount']:,.2f}\n"
                 f"Description: {flow['description']}\n\n"
@@ -785,6 +789,7 @@ def _handle_expense_flow(phone_key: str, text: str, raw: str, user: dict) -> str
             return "Please select a valid category:\n\nFlight | Hotel | Food & Meals | Local Transport | Visa / Docs | Communication | Other"
         flow["category"] = cat
         flow["step"] = "confirm"
+        _expense_flow.set(phone_key, flow)
         return (
             f"*Expense Summary*\n\n"
             f"Amount: Rs. {flow['amount']:,.2f}\n"
