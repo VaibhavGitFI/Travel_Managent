@@ -7,6 +7,7 @@ import hmac
 import logging
 from flask import Blueprint, request, jsonify
 from database import get_db
+from extensions import limiter
 
 logger = logging.getLogger(__name__)
 
@@ -267,6 +268,7 @@ def _find_user_by_name(name: str) -> dict | None:
 
 
 @cliq_bot_bp.route("/bot", methods=["POST"])
+@limiter.limit("60 per minute")
 def bot_handler():
     """POST /api/cliq/bot — handle messages from Zoho Cliq bot."""
     if not _verify_cliq_webhook():

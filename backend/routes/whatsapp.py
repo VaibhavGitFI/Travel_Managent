@@ -16,6 +16,7 @@ from twilio.request_validator import RequestValidator
 from services.http_client import http as http_requests
 from database import get_db
 from services.whatsapp_service import whatsapp_service
+from extensions import limiter
 
 logger = logging.getLogger(__name__)
 
@@ -1168,6 +1169,7 @@ def _process_message(from_number: str, body: str) -> str:
 # ── Webhook ──────────────────────────────────────────────────────────────────
 
 @whatsapp_bp.route("/webhook", methods=["POST"])
+@limiter.limit("60 per minute")
 def webhook():
     if not _verify_twilio_signature():
         return Response("Forbidden", status=403, content_type="text/plain")
