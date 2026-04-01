@@ -386,8 +386,18 @@ def test_admin_full_approval_flow(super_admin_client, app, db):
 
 # ── Error Resilience ──────────────────────────────────────────────────────────
 
-def test_404_api_endpoint(client):
+def test_404_api_unauthenticated_returns_401(client):
+    """Unauthenticated requests to unknown endpoints return 401, not 404.
+    This prevents endpoint enumeration — attackers cannot probe which paths exist."""
     resp = client.get("/api/nonexistent")
+    assert resp.status_code == 401
+    data = resp.get_json()
+    assert data["success"] is False
+
+
+def test_404_api_authenticated(auth_client):
+    """Authenticated requests to unknown endpoints return 404."""
+    resp = auth_client.get("/api/nonexistent")
     assert resp.status_code == 404
     data = resp.get_json()
     assert data["success"] is False
@@ -412,3 +422,23 @@ def test_empty_json_body(auth_client):
     resp = auth_client.post("/api/requests", json={})
     data = resp.get_json()
     assert data["success"] is False
+
+
+# ── Webhook Auth ─────────────────────────────────────────────────────────────
+
+def test_whatsapp_webhook_rejects_unsigned_request(client):
+    """POST to WhatsApp webhook without X-Twilio-Signature must be rejected."""
+    resp = client.post("/api/whatsapp/webhook", data={
+        "From": "whatsapp:+919999999999",
+        "Body": "hello",
+        "NumMedia": "0",
+    })
+    assert resp.status_code == 403
+
+
+def test_whatsapp_webhook_rejects_invalid_signature(client):
+    """POST with a bogus X-Twilio-Signature must be rejected."""
+    resp = client.post("/api/whatsapp/webhook",
+                       data={"From": "whatsapp:+919999999999", "Body": "hello", "NumMedia": "0"},
+                       headers={"X-Twilio-Signature": "bogus-sig-value"})
+    assert resp.status_code == 403

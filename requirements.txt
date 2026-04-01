@@ -34,19 +34,33 @@ psycopg2-binary==2.9.10
 # Auth
 PyJWT==2.10.1
 
+# Redis — used by Flask-Limiter (global rate limits), Flask-SocketIO (cross-
+# instance message queue), and cache_service.py. Falls back gracefully when
+# REDIS_URL is not set — all features degrade to in-process memory.
+redis==5.2.1
+
 # Utilities
 cachetools==5.5.0
 Pillow==10.4.0
 
-# OTIS Voice Agent
-# Wake word: OpenWakeWord (free, no key) is always installed.
-# Porcupine (pvporcupine) is optional — install it and set PORCUPINE_ACCESS_KEY to switch backends.
+# OTIS Voice Agent — Gemini Live API
+# STT + LLM + TTS handled by Google Gemini Live (replaces Deepgram + ElevenLabs).
+# google-genai is the newer SDK required for Live API (separate from google-generativeai).
+google-genai>=1.0.0
+
+# Wake word detection (optional — works without a key via OpenWakeWord)
 openwakeword
 pvporcupine==3.0.3
-deepgram-sdk==3.7.3
-elevenlabs==1.8.2
 websockets==13.1
 pyaudio==0.2.14
+
+# ElevenLabs + Deepgram kept for reference but no longer used by OTIS.
+# Remove these lines if you want a clean install.
+# deepgram-sdk==3.7.3
+# elevenlabs==1.8.2
+
+# Twilio — WhatsApp webhook signature verification + sending
+twilio==9.0.5
 
 # Production server
 gunicorn==23.0.0

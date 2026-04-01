@@ -4,6 +4,7 @@ Interactive AI-powered WhatsApp bot via Twilio webhook.
 Maintains per-user conversation history for contextual responses.
 Supports receipt image scanning via OCR.
 """
+import hmac
 import logging
 import time
 import os
@@ -11,7 +12,8 @@ import tempfile
 from collections import defaultdict
 from base64 import b64encode
 from flask import Blueprint, request, Response
-import requests as http_requests
+from twilio.request_validator import RequestValidator
+from services.http_client import http as http_requests
 from database import get_db
 from services.whatsapp_service import whatsapp_service
 
@@ -52,6 +54,30 @@ def _clear_history(phone: str):
     _conversations[phone] = {"messages": [], "last_active": 0}
 
 whatsapp_bp = Blueprint("whatsapp", __name__, url_prefix="/api/whatsapp")
+
+# ── Twilio Signature Verification ───────────────────────────────────────────
+
+def _verify_twilio_signature() -> bool:
+    """Verify the X-Twilio-Signature header using the Twilio Auth Token.
+    Returns True if the request is authentic, False otherwise.
+    Fail-closed: returns False if TWILIO_AUTH_TOKEN is not configured."""
+    from config import Config
+    auth_token = Config.TWILIO_AUTH_TOKEN
+    if not auth_token:
+        logger.warning("[WA Bot] TWILIO_AUTH_TOKEN not configured — rejecting webhook")
+        return False
+
+    signature = request.headers.get("X-Twilio-Signature", "")
+    if not signature:
+        return False
+
+    validator = RequestValidator(auth_token)
+    # Reconstruct the URL Twilio used to sign the request.
+    # Use X-Forwarded-Proto if behind a reverse proxy (Cloud Run).
+    proto = request.headers.get("X-Forwarded-Proto", request.scheme)
+    url = request.url.replace(request.scheme + "://", proto + "://", 1)
+
+    return validator.validate(url, request.form.to_dict(), signature)
 
 # ── Menus ────────────────────────────────────────────────────────────────────
 
@@ -135,11 +161,11 @@ def _get_user_trips(user_id: int, limit: int = 5) -> str:
 
 def _get_pending_approvals(user_id: int, role: str) -> str:
     try:
-        if role not in ("admin", "manager"):
+        if role not in ("admin", "manager", "super_admin"):
             return "Only managers and admins can view approvals."
 
         db = get_db()
-        if role == "admin":
+        if role in ("admin", "super_admin"):
             rows = db.execute(
                 "SELECT a.request_id, t.destination, t.origin, t.start_date, "
                 "t.estimated_total, u.full_name "
@@ -288,7 +314,7 @@ def _get_upcoming_meetings(user_id: int) -> str:
 
 def _handle_approve_reject(user: dict, command: str, request_id: str) -> str:
     try:
-        if user.get("role") not in ("admin", "manager"):
+        if user.get("role") not in ("admin", "manager", "super_admin"):
             return "Only managers and admins can approve or reject requests."
 
         from agents.request_agent import process_approval
@@ -785,6 +811,18 @@ def _save_expense(user_id: int, category: str, description: str, amount, vendor:
         if vendor and vendor not in desc:
             desc = f"{vendor} - {desc}"
 
+        # Look up user's org so the expense is visible on the Expense page
+        org_id = None
+        try:
+            from database import get_db as _get_db
+            _db = _get_db()
+            _om = _db.execute("SELECT org_id FROM org_members WHERE user_id = ? LIMIT 1", (user_id,)).fetchone()
+            if _om:
+                org_id = dict(_om)["org_id"]
+            _db.close()
+        except Exception:
+            pass
+
         expense_data = {
             "user_id": user_id,
             "category": category,
@@ -797,12 +835,20 @@ def _save_expense(user_id: int, category: str, description: str, amount, vendor:
             "stage": 1,
             "currency_code": "INR",
         }
+        if org_id:
+            expense_data["org_id"] = org_id
         logger.info("[%s Bot] Calling add_expense with data: %s", source.upper() if source else "WA", expense_data)
         result = add_expense(expense_data)
         logger.info("[%s Bot] add_expense returned: %s", source.upper() if source else "WA", result)
         success = result.get("success", False)
         if success:
             logger.info("[%s Bot] Expense saved successfully with ID: %s", source.upper() if source else "WA", result.get("expense_id"))
+            try:
+                from extensions import socketio
+                socketio.emit("data_changed", {"entity": "expenses"}, room=f"user_{user_id}", namespace="/")
+                socketio.emit("data_changed", {"entity": "analytics"}, room=f"user_{user_id}", namespace="/")
+            except Exception:
+                pass
         else:
             logger.warning("[%s Bot] Expense save failed: %s", source.upper() if source else "WA", result.get("error", "Unknown error"))
         return success
@@ -1115,6 +1161,9 @@ def _process_message(from_number: str, body: str) -> str:
 
 @whatsapp_bp.route("/webhook", methods=["POST"])
 def webhook():
+    if not _verify_twilio_signature():
+        return Response("Forbidden", status=403, content_type="text/plain")
+
     from_number = request.form.get("From", "")
     body = request.form.get("Body", "").strip()
     num_media = int(request.form.get("NumMedia", "0"))
