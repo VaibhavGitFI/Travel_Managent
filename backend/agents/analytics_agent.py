@@ -38,10 +38,13 @@ def _format_amount(amount: float, currency_code: str = "INR") -> str:
     return f"{currency_code} {amount:,.2f}"
 
 
-def _compliance_counts(db, request_cols: set[str], user_id: int = None) -> dict:
+def _compliance_counts(db, request_cols: set[str], user_id: int = None, org_id: int = None) -> dict:
     counts = {"compliant": 0, "partial": 0, "non_compliant": 0, "unknown": 0}
     where = []
     params = []
+    if org_id and "org_id" in request_cols:
+        where.append("org_id = ?")
+        params.append(org_id)
     if user_id and "user_id" in request_cols:
         where.append("user_id = ?")
         params.append(user_id)
@@ -177,24 +180,62 @@ def get_dashboard_stats(user_id: int = None) -> dict:
         db.close()
 
 
-def get_spend_analysis() -> dict:
-    """Spend trend + category + destination breakdown."""
+def get_spend_analysis(user_id: int = None, org_id: int = None, role: str = "employee") -> dict:
+    """Spend trend + category + destination breakdown.
+
+    Data scoping:
+      - admins/managers with an org_id: see all expenses within their org
+      - employees: see only their own expenses
+      - no org_id: fall back to user_id scoping
+    """
     db = get_db()
     try:
         expense_cols = _table_columns(db, "expenses_db")
+        request_cols = _table_columns(db, "travel_requests")
         amount_expr = _expense_amount_expr(expense_cols)
         date_col = "created_at" if "created_at" in expense_cols else "expense_date" if "expense_date" in expense_cols else "date"
 
+        # Build WHERE clause for expense queries
+        exp_where_parts = []
+        exp_params = []
+        if role in ("admin", "manager", "super_admin") and org_id and "org_id" in expense_cols:
+            exp_where_parts.append("org_id = ?")
+            exp_params.append(org_id)
+        elif user_id and "user_id" in expense_cols:
+            exp_where_parts.append("user_id = ?")
+            exp_params.append(user_id)
+        exp_where = (" AND " + " AND ".join(exp_where_parts)) if exp_where_parts else ""
+
+        # Build WHERE clause for travel_requests queries
+        req_where_parts = []
+        req_params = []
+        if role in ("admin", "manager", "super_admin") and org_id and "org_id" in request_cols:
+            req_where_parts.append("org_id = ?")
+            req_params.append(org_id)
+        elif user_id and "user_id" in request_cols:
+            req_where_parts.append("user_id = ?")
+            req_params.append(user_id)
+        req_where = (" WHERE " + " AND ".join(req_where_parts)) if req_where_parts else ""
+
         monthly_trend = []
         for i in range(5, -1, -1):
-            month_dt = datetime.now().replace(day=1) - timedelta(days=i * 30)
+            # Correct calendar month subtraction: go to the 1st of the current
+            # month, then step back i months. The old approach used
+            # timedelta(days=i*30) which drifted across month boundaries.
+            today = datetime.now()
+            month = today.month - i
+            year = today.year
+            while month <= 0:
+                month += 12
+                year -= 1
+            month_dt = datetime(year, month, 1)
             month_key = month_dt.strftime("%Y-%m")
             month_label = month_dt.strftime("%b %Y")
             amount = float(db.execute(
                 f"""SELECT COALESCE(SUM({amount_expr}), 0)
                     FROM expenses_db
-                    WHERE strftime('%Y-%m', {date_col}) = ?""",
-                (month_key,),
+                    WHERE strftime('%Y-%m', {date_col}) = ?{exp_where}""",
+                (month_key, *exp_params),
             ).fetchone()[0] or 0)
             monthly_trend.append({
                 "month": month_key,
@@ -207,8 +248,10 @@ def get_spend_analysis() -> dict:
         cat_col = "category" if "category" in expense_cols else None
         category_breakdown = []
         if cat_col:
+            cat_where = ("WHERE " + " AND ".join(exp_where_parts)) if exp_where_parts else ""
             rows = db.execute(
-                f"SELECT {cat_col}, COALESCE(SUM({amount_expr}), 0) FROM expenses_db GROUP BY {cat_col} ORDER BY 2 DESC"
+                f"SELECT {cat_col}, COALESCE(SUM({amount_expr}), 0) FROM expenses_db {cat_where} GROUP BY {cat_col} ORDER BY 2 DESC",
+                tuple(exp_params),
             ).fetchall()
             for row in rows:
                 name = row[0] or "miscellaneous"
@@ -221,11 +264,11 @@ def get_spend_analysis() -> dict:
                     "formatted": _format_amount(amount),
                 })
 
-        request_cols = _table_columns(db, "travel_requests")
         top_cities = []
         if "destination" in request_cols:
             rows = db.execute(
-                "SELECT destination, COUNT(*) FROM travel_requests GROUP BY destination ORDER BY 2 DESC LIMIT 8"
+                f"SELECT destination, COUNT(*) FROM travel_requests{req_where} GROUP BY destination ORDER BY 2 DESC LIMIT 8",
+                tuple(req_params),
             ).fetchall()
             top_cities = [
                 {"city": r[0], "name": r[0], "trips": int(r[1]), "count": int(r[1])}
@@ -319,26 +362,54 @@ def get_budget_tracking(request_id: str = None) -> dict:
         db.close()
 
 
-def get_policy_compliance_scorecard() -> dict:
-    """Policy + expense verification scorecard."""
+def get_policy_compliance_scorecard(user_id: int = None, org_id: int = None, role: str = "employee") -> dict:
+    """Policy + expense verification scorecard.
+
+    Data scoping (same rules as get_spend_analysis):
+      - admins/managers with org_id: org-wide compliance
+      - employees: own compliance only
+    """
     db = get_db()
     try:
         request_cols = _table_columns(db, "travel_requests")
         expense_cols = _table_columns(db, "expenses_db")
 
-        compliance = _compliance_counts(db, request_cols)
+        # Scope compliance_counts by user or org
+        scope_user_id = None
+        scope_org_id = org_id if role in ("admin", "manager", "super_admin") else None
+        if role not in ("admin", "manager", "super_admin"):
+            scope_user_id = user_id
+
+        compliance = _compliance_counts(db, request_cols, user_id=scope_user_id, org_id=scope_org_id)
         total_requests = sum(compliance.values())
         compliance_rate = round((compliance["compliant"] / total_requests * 100) if total_requests else 0)
 
+        # Build expense WHERE clause
+        exp_where_parts = []
+        exp_params: list = []
+        if role in ("admin", "manager", "super_admin") and org_id and "org_id" in expense_cols:
+            exp_where_parts.append("org_id = ?")
+            exp_params.append(org_id)
+        elif user_id and "user_id" in expense_cols:
+            exp_where_parts.append("user_id = ?")
+            exp_params.append(user_id)
+        exp_where = (" WHERE " + " AND ".join(exp_where_parts)) if exp_where_parts else ""
+
         if "verification_status" in expense_cols:
-            total_exp = db.execute("SELECT COUNT(*) FROM expenses_db").fetchone()[0]
+            total_exp = db.execute(
+                f"SELECT COUNT(*) FROM expenses_db{exp_where}", tuple(exp_params)
+            ).fetchone()[0]
+            verified_where = f"{exp_where}{' AND ' if exp_where else ' WHERE '}verification_status = 'verified'"
             verified_exp = db.execute(
-                "SELECT COUNT(*) FROM expenses_db WHERE verification_status = 'verified'"
+                f"SELECT COUNT(*) FROM expenses_db{verified_where}", tuple(exp_params)
             ).fetchone()[0]
         elif "status" in expense_cols:
-            total_exp = db.execute("SELECT COUNT(*) FROM expenses_db").fetchone()[0]
+            total_exp = db.execute(
+                f"SELECT COUNT(*) FROM expenses_db{exp_where}", tuple(exp_params)
+            ).fetchone()[0]
+            verified_where = f"{exp_where}{' AND ' if exp_where else ' WHERE '}status IN ('approved', 'verified', 'reimbursed')"
             verified_exp = db.execute(
-                "SELECT COUNT(*) FROM expenses_db WHERE status IN ('approved', 'verified', 'reimbursed')"
+                f"SELECT COUNT(*) FROM expenses_db{verified_where}", tuple(exp_params)
             ).fetchone()[0]
         else:
             total_exp = 0
@@ -434,8 +505,8 @@ def get_carbon_analytics(user_id: int = None, role: str = "employee") -> dict:
         if origin and dest:
             try:
                 dist_km = maps.get_distance_km(origin, dest) or 0.0
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("[Analytics] Distance lookup failed %s→%s: %s", origin, dest, exc)
         if not dist_km:
             # Rough fallback: domestic ~700 km avg, international ~5000 km avg
             dist_km = 5000.0 if trip_type == "international" else 700.0

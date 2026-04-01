@@ -492,7 +492,8 @@ class OtisFunctionRegistry:
                     voice_response = f"Done. I've approved the {destination} trip for {name}."
                 else:
                     voice_response = f"Done. I've approved request {request_id}."
-            except:
+            except Exception as exc:
+                logger.warning("[OTIS Functions] approve trip detail lookup failed: %s", exc)
                 voice_response = "Trip approved successfully."
 
             return {
@@ -706,8 +707,8 @@ class OtisFunctionRegistry:
                         meeting_date = datetime.strptime(meeting_date_str, "%Y-%m-%d").date()
                         if today <= meeting_date <= future_date:
                             upcoming.append(meeting)
-                    except:
-                        pass
+                    except (ValueError, TypeError):
+                        pass  # justified: skip meetings with unparseable dates
 
             count = len(upcoming)
 
@@ -777,7 +778,11 @@ class OtisFunctionRegistry:
     async def _get_spend_report_wrapper(self, context: Dict, params: Dict) -> Dict:
         """Get spending analysis."""
         try:
-            spend_data = get_spend_analysis()
+            spend_data = get_spend_analysis(
+                user_id=context.get("user_id"),
+                org_id=context.get("org_id"),
+                role=context.get("role", "employee"),
+            )
 
             monthly_spend = spend_data.get("monthly_spend", 0)
             budget = spend_data.get("monthly_budget", 0)
