@@ -1,8 +1,10 @@
 """
 TravelSync Pro — Health Check Route
-Returns service status for all configured APIs.
-Includes a Supabase keep-alive ping to prevent free-tier database pausing.
+Deep health check: verifies database, Redis, and external API connectivity.
+Returns 503 when critical dependencies are down so Cloud Run stops routing
+traffic to broken instances.
 """
+import os
 import logging
 from datetime import datetime
 from flask import Blueprint, jsonify
@@ -14,34 +16,50 @@ logger = logging.getLogger(__name__)
 
 @health_bp.route("/health", methods=["GET"])
 def health():
-    """GET /api/health — service status for all configured APIs + Supabase ping."""
+    """GET /api/health — deep health check with component-level status."""
+    checks = {}
+
+    # 1. Database
     try:
-        status = Config.services_status()
-
-        # Include cache status
-        try:
-            from services.cache_service import get_cache_status
-            status["cache"] = get_cache_status()
-        except Exception:
-            pass
-
-        # Supabase database ping — keeps the free-tier DB awake
-        db_ok = False
-        try:
-            from database import get_db
-            db = get_db()
-            row = db.execute("SELECT 1 AS alive").fetchone()
-            db_ok = bool(row)
-            db.close()
-        except Exception as e:
-            logger.warning("[Health] Supabase ping failed: %s", e)
-        status["database"] = db_ok
-
-        status.update({
-            "status": "ok" if db_ok else "degraded",
-            "version": "3.0.0",
-            "timestamp": datetime.utcnow().isoformat(),
-        })
-        return jsonify(status), 200
+        from database import get_db
+        db = get_db()
+        row = db.execute("SELECT 1 AS alive").fetchone()
+        db.close()
+        checks["database"] = "ok" if row else "error: no result"
     except Exception as e:
-        return jsonify({"status": "error", "error": str(e)}), 500
+        checks["database"] = f"error: {type(e).__name__}"
+        logger.warning("[Health] Database check failed: %s", e)
+
+    # 2. Redis (if configured)
+    redis_url = os.getenv("REDIS_URL")
+    if redis_url:
+        try:
+            import redis as redis_lib
+            r = redis_lib.Redis.from_url(redis_url, socket_timeout=2)
+            r.ping()
+            checks["redis"] = "ok"
+        except Exception as e:
+            checks["redis"] = f"error: {type(e).__name__}"
+            logger.warning("[Health] Redis check failed: %s", e)
+
+    # 3. Cache status
+    try:
+        from services.cache_service import get_cache_status
+        checks["cache"] = get_cache_status()
+    except Exception:
+        pass
+
+    # 4. Services configuration status
+    services = Config.services_status()
+
+    # Overall: healthy only if all checks pass
+    all_ok = all(v == "ok" for v in checks.values() if isinstance(v, str))
+    status_code = 200 if all_ok else 503
+
+    return jsonify({
+        "status": "healthy" if all_ok else "degraded",
+        "checks": checks,
+        "services": services,
+        "version": os.getenv("BUILD_SHA", "3.0.0"),
+        "timestamp": datetime.utcnow().isoformat(),
+    }), status_code

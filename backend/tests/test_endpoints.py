@@ -9,9 +9,10 @@ import json
 
 def test_health_endpoint(client):
     resp = client.get("/api/health")
-    assert resp.status_code == 200
+    assert resp.status_code in (200, 503)
     data = resp.get_json()
-    assert data["status"] in ("ok", "degraded")
+    assert data["status"] in ("ok", "healthy", "degraded")
+    assert "checks" in data
 
 
 def test_docs_json(client):
