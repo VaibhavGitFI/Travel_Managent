@@ -83,3 +83,9 @@ desktop.ini
 .coverage
 htmlcov/
 .tox/
+
+# ── Docs / internal notes (dev-only markdown, not for git) ────
+docs/
+
+# ── Backup files ──────────────────────────────────────────────
+*.bak

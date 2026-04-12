@@ -11,8 +11,8 @@ Setup:
 """
 import os
 import logging
-import requests
 from cachetools import TTLCache
+from services.http_client import http as requests
 
 logger = logging.getLogger(__name__)
 

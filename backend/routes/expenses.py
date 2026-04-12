@@ -31,39 +31,48 @@ def list_expenses():
         return jsonify({"success": False, "error": "Authentication required"}), 401
 
     trip_id = request.args.get("trip_id", "").strip()
+    search = (request.args.get("search") or "").strip()
+
+    try:
+        page = max(1, int(request.args.get("page", 1)))
+        per_page = min(100, max(1, int(request.args.get("per_page", 20))))
+    except (ValueError, TypeError):
+        page, per_page = 1, 20
 
     try:
         org = get_current_org()
         oid = org["org_id"] if org else None
-        result = get_expenses(trip_id or None, user_id=user["id"], org_id=oid)
+
+        # Search and pagination are now pushed to the SQL layer inside
+        # get_expenses() — no more fetching all rows then slicing in Python.
+        result = get_expenses(
+            trip_id or None,
+            user_id=user["id"],
+            org_id=oid,
+            search=search or None,
+            page=page,
+            per_page=per_page,
+        )
         expenses = result.get("expenses", []) if isinstance(result, dict) else result
 
-        # Search filter
-        search = (request.args.get("search") or "").strip().lower()
-        if search:
-            expenses = [
-                e for e in expenses
-                if search in (e.get("description") or "").lower()
-                or search in (e.get("vendor") or "").lower()
-                or search in (e.get("category") or "").lower()
-            ]
-
-        total = len(expenses)
-
-        # Pagination
-        try:
-            page = max(1, int(request.args.get("page", 1)))
-            per_page = min(100, max(1, int(request.args.get("per_page", 20))))
-        except (ValueError, TypeError):
-            page, per_page = 1, 20
+        # For total count we also need an un-paginated count. When SQL-level
+        # pagination is used the result set is already sliced so len(expenses)
+        # is the page size, not the total. We do a second lightweight count
+        # query when search or pagination is active.
+        if search or page > 1 or len(expenses) == per_page:
+            count_result = get_expenses(
+                trip_id or None, user_id=user["id"], org_id=oid,
+                search=search or None,
+            )
+            total = len(count_result.get("expenses", []))
+        else:
+            total = len(expenses)
 
         total_pages = max(1, -(-total // per_page))
-        start = (page - 1) * per_page
-        items = expenses[start:start + per_page]
 
         out = result if isinstance(result, dict) else {"success": True}
         out.update({
-            "expenses": items,
+            "expenses": expenses,
             "total": total,
             "page": page,
             "per_page": per_page,

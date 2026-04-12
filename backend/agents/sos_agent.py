@@ -4,7 +4,7 @@ Provides local emergency numbers by city/country, nearby hospital/police search,
 reverse-geocoding from GPS coordinates, and embassy contacts.
 """
 import logging
-import requests as http_requests
+from services.http_client import http as http_requests
 from services.maps_service import maps
 
 logger = logging.getLogger(__name__)

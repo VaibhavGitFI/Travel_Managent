@@ -246,3 +246,24 @@ export const otisSpeak = async (text) => {
     return null
   }
 }
+
+/**
+ * All-in-one voice command: transcribe + LLM response + TTS audio in one HTTP call.
+ * Replaces the 3-call chain (transcribe → command → speak).
+ *
+ * @param {Blob} audioBlob - Recorded audio blob
+ * @param {string|null} sessionId - Active OTIS session ID
+ * @param {boolean} includeAudio - Whether to include base64 TTS audio in response
+ * @returns {Promise<{success, transcript, language, response, session_id, audio_b64, audio_mime, latency_ms}>}
+ */
+export const voiceCommand = async (audioBlob, sessionId = null, includeAudio = true) => {
+  const formData = new FormData()
+  formData.append('audio', audioBlob, 'voice.webm')
+  if (sessionId) formData.append('session_id', sessionId)
+  formData.append('include_audio', includeAudio ? 'true' : 'false')
+  const { data } = await client.post('/otis/voice-command', formData, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+    timeout: 15000,   // 15s max — covers worst case slow audio
+  })
+  return data
+}

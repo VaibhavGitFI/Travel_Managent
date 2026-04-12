@@ -8,8 +8,8 @@ Optional env: AVIATIONSTACK_API_KEY
 import os
 import random
 import logging
-import requests
 from datetime import datetime, timedelta
+from services.http_client import http as requests
 from cachetools import TTLCache
 
 logger = logging.getLogger(__name__)

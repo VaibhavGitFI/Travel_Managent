@@ -4,7 +4,7 @@ Dashboard stats, spend analysis, and policy compliance scorecard from real DB da
 """
 import logging
 from flask import Blueprint, jsonify
-from auth import get_current_user
+from auth import get_current_user, get_current_org
 from flask import request as flask_request
 from extensions import limiter
 from agents.analytics_agent import (
@@ -12,6 +12,7 @@ from agents.analytics_agent import (
     get_spend_analysis,
     get_policy_compliance_scorecard,
     get_carbon_analytics,
+    get_budget_tracking,
 )
 from agents.travel_mode_agent import calculate_carbon
 from services.maps_service import maps
@@ -45,7 +46,12 @@ def spend():
         return jsonify({"success": False, "error": "Authentication required"}), 401
 
     try:
-        result = get_spend_analysis()
+        org = get_current_org()
+        result = get_spend_analysis(
+            user_id=user["id"],
+            org_id=org["org_id"] if org else None,
+            role=user.get("role", "employee"),
+        )
         return jsonify(result), 200
     except Exception as e:
         logger.exception("Failed to load spend analysis")
@@ -60,7 +66,12 @@ def compliance():
         return jsonify({"success": False, "error": "Authentication required"}), 401
 
     try:
-        result = get_policy_compliance_scorecard()
+        org = get_current_org()
+        result = get_policy_compliance_scorecard(
+            user_id=user["id"],
+            org_id=org["org_id"] if org else None,
+            role=user.get("role", "employee"),
+        )
         return jsonify(result), 200
     except Exception as e:
         logger.exception("Failed to load compliance scorecard")
@@ -80,6 +91,22 @@ def carbon():
     except Exception as e:
         logger.exception("Failed to load carbon analytics")
         return jsonify({"success": False, "error": "Failed to load carbon analytics"}), 500
+
+
+@analytics_bp.route("/budget", methods=["GET"])
+def budget():
+    """GET /api/analytics/budget?request_id=X — monthly or per-request budget vs actual."""
+    user = get_current_user()
+    if not user:
+        return jsonify({"success": False, "error": "Authentication required"}), 401
+
+    try:
+        request_id = flask_request.args.get("request_id")
+        result = get_budget_tracking(request_id=request_id)
+        return jsonify(result), 200
+    except Exception as e:
+        logger.exception("Failed to load budget tracking")
+        return jsonify({"success": False, "error": "Failed to load budget data"}), 500
 
 
 @analytics_bp.route("/carbon/estimate", methods=["GET"])

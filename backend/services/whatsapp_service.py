@@ -5,7 +5,7 @@ Falls back silently when not configured.
 """
 import os
 import logging
-import requests as http_requests
+from services.http_client import http as http_requests
 from base64 import b64encode
 
 logger = logging.getLogger(__name__)

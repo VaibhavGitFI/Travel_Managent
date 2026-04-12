@@ -6,8 +6,8 @@ Configure GOOGLE_MAPS_API_KEY to enable real data.
 import os
 import math
 import logging
-import requests
 from cachetools import TTLCache
+from services.http_client import http as requests
 
 logger = logging.getLogger(__name__)
 

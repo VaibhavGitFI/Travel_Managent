@@ -8,8 +8,8 @@ import os
 import re
 import base64
 import logging
-import requests
 from pathlib import Path
+from services.http_client import http as requests
 from datetime import datetime
 
 logger = logging.getLogger(__name__)

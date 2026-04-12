@@ -7,8 +7,8 @@ Get free API keys at: https://developers.amadeus.com/register
 import os
 import random
 import logging
-import requests
 from datetime import datetime, timedelta
+from services.http_client import http as requests
 from cachetools import TTLCache
 
 logger = logging.getLogger(__name__)

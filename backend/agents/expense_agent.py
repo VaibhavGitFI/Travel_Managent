@@ -281,8 +281,14 @@ def add_expense(data: dict) -> dict:
         db.close()
 
 
-def get_expenses(trip_id: str = None, user_id: int = None, org_id: int = None) -> dict:
-    """Fetch expenses, optionally filtered by trip/request id and org."""
+def get_expenses(trip_id: str = None, user_id: int = None, org_id: int = None,
+                  search: str = None, page: int = None, per_page: int = None) -> dict:
+    """Fetch expenses, optionally filtered by trip/request id, org, and search term.
+
+    When `search` is provided the filter is pushed to SQL (LIKE on description,
+    vendor, and category) instead of fetching all rows and filtering in Python.
+    When `page`/`per_page` are provided SQL LIMIT/OFFSET is used.
+    """
     db = get_db()
     try:
         cols = _table_columns(db, "expenses_db")
@@ -315,9 +321,32 @@ def get_expenses(trip_id: str = None, user_id: int = None, org_id: int = None) -
             if trip_filters:
                 query += " AND (" + " OR ".join(trip_filters) + ")"
 
+        # SQL-level search — avoids loading all rows into Python
+        if search:
+            search_term = f"%{search}%"
+            search_clauses = []
+            if "description" in cols:
+                search_clauses.append(f"LOWER({p}description) LIKE LOWER(?)")
+                params.append(search_term)
+            if "vendor" in cols:
+                search_clauses.append(f"LOWER({p}vendor) LIKE LOWER(?)")
+                params.append(search_term)
+            if "category" in cols:
+                search_clauses.append(f"LOWER({p}category) LIKE LOWER(?)")
+                params.append(search_term)
+            if search_clauses:
+                query += " AND (" + " OR ".join(search_clauses) + ")"
+
         order_col = "expense_date" if "expense_date" in cols else "date" if "date" in cols else "created_at"
         prefix = "e." if has_approval else ""
         query += f" ORDER BY {prefix}{order_col} DESC"
+
+        # SQL-level pagination when requested
+        if page is not None and per_page is not None:
+            offset = (page - 1) * per_page
+            query += " LIMIT ? OFFSET ?"
+            params.extend([per_page, offset])
+
         rows = db.execute(query, tuple(params)).fetchall()
 
         expenses = []

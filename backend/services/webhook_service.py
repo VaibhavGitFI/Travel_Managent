@@ -9,7 +9,7 @@ import logging
 import time
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
-import requests as http_requests
+from services.http_client import http as http_requests
 
 logger = logging.getLogger(__name__)
 _executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="webhook")

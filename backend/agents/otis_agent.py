@@ -40,8 +40,7 @@ from agents.query_engine import handle_query, format_query_result_for_voice, sho
 from auth import get_user_org
 from services.gemini_service import gemini
 from services.wake_word_service import WakeWordService
-from services.deepgram_service import SpeechToTextService
-from services.elevenlabs_voice_service import TextToSpeechService
+from services.gemini_live_service import gemini_live
 from config import Config
 
 # Import OTIS function registry
@@ -124,10 +123,8 @@ class OtisAgent:
         self._state = OtisState.IDLE
         self._current_session: Optional[OtisSession] = None
 
-        # Initialize voice services
+        # Initialize voice services (wake word only; STT+TTS handled by Gemini Live)
         self._wake_word: Optional[WakeWordService] = None
-        self._stt: Optional[SpeechToTextService] = None
-        self._tts: Optional[TextToSpeechService] = None
         self._initialize_services()
 
         # Initialize function registry for TravelSync actions
@@ -199,36 +196,22 @@ class OtisAgent:
             raise
 
     def _initialize_services(self):
-        """Initialize voice services (wake word, STT, TTS)."""
+        """Initialize voice services. STT+TTS now handled by Gemini Live API."""
+        # Wake word service (optional — uses Porcupine or OpenWakeWord)
         try:
-            # Initialize wake word service
-            # Auto-selects Porcupine (if PORCUPINE_ACCESS_KEY is set) or OpenWakeWord (free fallback)
-            try:
-                self._wake_word = WakeWordService()
-                logger.info(
-                    f"[OTIS Agent] ✅ Wake word service initialized "
-                    f"(backend: {self._wake_word.config.backend})"
-                )
-            except Exception as e:
-                logger.warning(f"[OTIS Agent] Wake word init failed: {e}")
-
-            # Initialize STT service
-            self._stt = SpeechToTextService()
+            self._wake_word = WakeWordService()
             logger.info(
-                f"[OTIS Agent] ✅ STT service initialized "
-                f"(provider: {self._stt.get_active_provider().value})"
+                f"[OTIS Agent] ✅ Wake word service initialized "
+                f"(backend: {self._wake_word.config.backend})"
             )
-
-            # Initialize TTS service
-            self._tts = TextToSpeechService()
-            logger.info(
-                f"[OTIS Agent] ✅ TTS service initialized "
-                f"(provider: {self._tts.get_active_provider().value})"
-            )
-
         except Exception as e:
-            logger.error(f"[OTIS Agent] Service initialization failed: {e}")
-            raise
+            logger.warning(f"[OTIS Agent] Wake word init failed (non-critical): {e}")
+
+        # Gemini Live API handles STT + LLM + TTS
+        if gemini_live.live_available:
+            logger.info("[OTIS Agent] ✅ Gemini Live API ready (real-time STT+TTS)")
+        else:
+            logger.info("[OTIS Agent] Gemini Live: %s", gemini_live.status())
 
     async def start(self):
         """
@@ -394,17 +377,18 @@ class OtisAgent:
             return None
 
         elif self._state == OtisState.LISTENING_FOR_COMMAND:
-            # Transcribe speech
-            # Note: This simplified version processes frame-by-frame
-            # In production, you'd buffer audio until silence detected
+            # Transcribe speech via Gemini (replaces Deepgram)
             try:
-                result = await self._stt.transcribe(audio_frame)
+                result = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: gemini_live.transcribe_audio(audio_frame, "audio/pcm")
+                )
+                text = result.get("transcript", "") if isinstance(result, dict) else str(result)
 
-                if result.text:
-                    logger.info(f"[OTIS Agent] 📝 Transcribed: '{result.text}'")
+                if text:
+                    logger.info(f"[OTIS Agent] Transcribed: '{text}'")
 
                     # Process command
-                    response = await self.process_command(result.text)
+                    response = await self.process_command(text)
 
                     # Return to wake word listening
                     self._state = OtisState.LISTENING_FOR_WAKE
@@ -412,7 +396,7 @@ class OtisAgent:
                     return response
 
             except Exception as e:
-                logger.error(f"[OTIS Agent] STT processing error: {e}")
+                logger.error(f"[OTIS Agent] Transcription error: {e}")
                 self._state = OtisState.LISTENING_FOR_WAKE
 
             return None
@@ -1075,23 +1059,24 @@ You are speaking to {self.user.get('name')}, who is a {self.user.get('role')}.
         except Exception as e:
             logger.error(f"[OTIS Agent] Failed to save command: {e}")
 
-    async def _speak(self, text: str):
-        """Speak text using TTS service."""
+    async def _speak(self, text: str) -> Optional[bytes]:
+        """
+        Generate TTS audio via Gemini Live Service (Google Cloud TTS, Indian English).
+        Returns MP3 bytes or None. The WebSocket handler emits audio to the client.
+        """
         self._state = OtisState.SPEAKING
-
         try:
-            result = await self._tts.speak(text)
-            logger.info(
-                f"[OTIS Agent] 🗣️  Speaking: '{text[:50]}...' "
-                f"({result.provider.value}, {len(result.audio_data)} bytes)"
-            )
-
-            # In production, you'd send audio_data to the client for playback
-            # For now, just log that we generated it
-            return result.audio_data
-
-        except Exception as e:
-            logger.error(f"[OTIS Agent] TTS error: {e}")
+            audio_bytes = gemini_live.synthesize_speech(text)
+            if audio_bytes:
+                logger.info(
+                    "[OTIS Agent] TTS generated %d bytes for: '%s'",
+                    len(audio_bytes), text[:60],
+                )
+            else:
+                logger.info("[OTIS Agent] TTS unavailable (no Google TTS key); text-only response")
+            return audio_bytes
+        except Exception as exc:
+            logger.error("[OTIS Agent] TTS error: %s", exc)
             return None
 
     # ── Callback Registration ─────────────────────────────────────────────────
@@ -1129,8 +1114,9 @@ You are speaking to {self.user.get('name')}, who is a {self.user.get('role')}.
             },
             "services": {
                 "wake_word": self._wake_word.get_statistics() if self._wake_word else None,
-                "stt": self._stt.get_statistics() if self._stt else None,
-                "tts": self._tts.get_statistics() if self._tts else None
+                "stt": "gemini_live",
+                "tts": "gemini_live",
+                "live_available": gemini_live.live_available,
             }
         }
 

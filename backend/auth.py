@@ -6,6 +6,7 @@ Both auth methods are accepted by all protected endpoints.
 import time
 import secrets
 import logging
+from datetime import datetime, timezone
 from functools import wraps
 from flask import session, jsonify, request, make_response
 from werkzeug.security import check_password_hash
@@ -18,8 +19,13 @@ logger = logging.getLogger(__name__)
 _user_cache = TTLCache(maxsize=100, ttl=60)
 
 # ── JWT Token Blacklist ───────────────────────────────────────────────────────
-# Revoked tokens stored with their expiry time; cleaned up periodically.
-_token_blacklist: dict[str, float] = {}   # {jti_or_token_hash: expiry_timestamp}
+# Two-layer store:
+#   L1 — in-process dict: fast path, avoids a DB call on every non-revoked request.
+#         Entries expire automatically (keyed by expiry Unix timestamp).
+#   L2 — database (token_blacklist table): persists revocations across all Cloud Run
+#         instances and process restarts. L1 is populated on first DB hit so the
+#         same token does not cause a DB round-trip more than once per 5 minutes.
+_blacklist_l1: dict[str, float] = {}   # {token_hash: expiry_unix_float}
 _blacklist_last_cleanup = 0.0
 
 
@@ -51,16 +57,50 @@ def generate_tokens(user_id: int, org_id: int | None = None, org_role: str | Non
         return {}
 
 
+def _is_token_blacklisted(token_hash: str) -> bool:
+    """Two-layer revocation check: L1 in-process cache, then L2 database.
+
+    L1 hit: O(1), no DB call — serves the common case (non-revoked tokens).
+    L2 hit: one SELECT on token_blacklist; populates L1 for 5 minutes so the
+            same revoked token does not hammer the DB on every request.
+    """
+    now = time.time()
+    # L1 fast path
+    if token_hash in _blacklist_l1:
+        if _blacklist_l1[token_hash] > now:
+            return True
+        # Expired entry — remove it
+        _blacklist_l1.pop(token_hash, None)
+
+    # L2 database (cross-instance)
+    try:
+        db = get_db()
+        row = db.execute(
+            "SELECT expires_at FROM token_blacklist WHERE token_hash = ?",
+            (token_hash,),
+        ).fetchone()
+        db.close()
+        if row:
+            # Warm L1 so this path is taken at most once per ~5 min per token
+            _blacklist_l1[token_hash] = now + 300
+            return True
+    except Exception:
+        # DB unavailable — fall through (fail-open on revocation check is
+        # acceptable given the short JWT TTL)
+        pass
+    return False
+
+
 def verify_token(token: str, token_type: str = "access") -> int | None:
     """Verify a JWT token; return user_id (int) or None. Rejects blacklisted tokens."""
     try:
-        import jwt, hashlib
+        import jwt
+        import hashlib
         payload = jwt.decode(token, _jwt_secret(), algorithms=["HS256"])
         if payload.get("type") != token_type:
             return None
-        # Check blacklist
         token_hash = hashlib.sha256(token.encode()).hexdigest()
-        if token_hash in _token_blacklist:
+        if _is_token_blacklisted(token_hash):
             return None
         return int(payload["sub"])
     except Exception:
@@ -68,22 +108,38 @@ def verify_token(token: str, token_type: str = "access") -> int | None:
 
 
 def revoke_token(token: str) -> None:
-    """Add a token to the blacklist. Auto-cleans expired entries."""
+    """Revoke a JWT — writes to the DB (cross-instance) and warms the L1 cache."""
     import hashlib
     global _blacklist_last_cleanup
     try:
         import jwt
         payload = jwt.decode(token, _jwt_secret(), algorithms=["HS256"], options={"verify_exp": False})
-        expiry = payload.get("exp", time.time() + 86400)
+        expiry_unix = payload.get("exp", int(time.time()) + 86400)
         token_hash = hashlib.sha256(token.encode()).hexdigest()
-        _token_blacklist[token_hash] = expiry
-        # Periodic cleanup (every 10 min)
+        expires_iso = datetime.utcfromtimestamp(expiry_unix).isoformat()
+
+        # Write to DB so other instances see the revocation
+        try:
+            db = get_db()
+            db.execute(
+                "INSERT OR REPLACE INTO token_blacklist (token_hash, expires_at) VALUES (?, ?)",
+                (token_hash, expires_iso),
+            )
+            db.commit()
+            db.close()
+        except Exception as db_err:
+            logger.warning("[Auth] Failed to persist token revocation to DB: %s", db_err)
+
+        # Warm L1 cache
+        _blacklist_l1[token_hash] = float(expiry_unix)
+
+        # Periodic L1 cleanup (every 10 min) to prevent unbounded growth
         now = time.time()
         if now - _blacklist_last_cleanup > 600:
             _blacklist_last_cleanup = now
-            expired = [k for k, exp in _token_blacklist.items() if exp < now]
-            for k in expired:
-                _token_blacklist.pop(k, None)
+            expired_keys = [k for k, exp in list(_blacklist_l1.items()) if exp < now]
+            for k in expired_keys:
+                _blacklist_l1.pop(k, None)
     except Exception:
         pass
 
@@ -274,6 +330,14 @@ def invalidate_org_cache(user_id: int) -> None:
     _org_cache.pop(user_id, None)
 
 
+# Columns returned by _get_user_by_id — excludes password_hash so it never
+# circulates through request handlers, caches, or downstream functions.
+_USER_SAFE_COLS = (
+    "id, username, name, full_name, email, role, department, manager_id, "
+    "avatar_initials, phone, email_verified, profile_picture, sub_role, created_at"
+)
+
+
 def _get_user_by_id(user_id: int) -> dict | None:
     # Check cache first
     cached = _user_cache.get(user_id)
@@ -281,7 +345,9 @@ def _get_user_by_id(user_id: int) -> dict | None:
         return cached
     try:
         db = get_db()
-        user = db.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        user = db.execute(
+            f"SELECT {_USER_SAFE_COLS} FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
         db.close()
         if user:
             result = dict(user)

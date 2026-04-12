@@ -4,7 +4,7 @@ Handles login, logout, register, password reset, and current-user endpoints.
 """
 import logging
 import secrets
-import time
+from datetime import datetime, timedelta
 from flask import Blueprint, request, jsonify, session
 from werkzeug.security import generate_password_hash
 from auth import (login_user, logout_user, get_current_user, verify_token,
@@ -15,9 +15,60 @@ from validators import ValidationError, validate_email, validate_password, valid
 
 logger = logging.getLogger(__name__)
 
-# In-memory token stores
-_reset_tokens = {}   # {code: {"user_id": int, "expires": float}}
-_verify_tokens = {}  # {code: {"user_id": int, "email": str, "expires": float}}
+
+# ── DB-backed one-time code helpers ──────────────────────────────────────────
+# Replaced the previous in-memory _reset_tokens / _verify_tokens dicts.
+# Storing codes in the database means they work correctly across all Cloud Run
+# instances — previously a code generated on instance A was invisible to instance B.
+
+def _store_auth_code(code: str, code_type: str, user_id: int,
+                     email: str = None, ttl_seconds: int = 900) -> None:
+    """Persist a one-time auth code to the database, replacing any prior code of the
+    same type for this user (enforces one active code at a time)."""
+    expires_at = (datetime.utcnow() + timedelta(seconds=ttl_seconds)).isoformat()
+    db = get_db()
+    try:
+        # Invalidate any existing code of the same type for this user
+        db.execute(
+            "DELETE FROM auth_codes WHERE user_id = ? AND type = ?",
+            (user_id, code_type),
+        )
+        db.execute(
+            "INSERT INTO auth_codes (code, type, user_id, email, expires_at) VALUES (?, ?, ?, ?, ?)",
+            (code, code_type, user_id, email, expires_at),
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+def _validate_auth_code(code: str, code_type: str) -> dict | None:
+    """Return the auth_codes row if the code is valid and unexpired, else None."""
+    db = get_db()
+    try:
+        row = db.execute(
+            "SELECT user_id, email, expires_at FROM auth_codes WHERE code = ? AND type = ?",
+            (code, code_type),
+        ).fetchone()
+        if not row:
+            return None
+        r = dict(row)
+        # Check expiry (stored as ISO string, lexicographic compare is correct)
+        if r["expires_at"] < datetime.utcnow().isoformat():
+            return None
+        return r
+    finally:
+        db.close()
+
+
+def _consume_auth_code(code: str) -> None:
+    """Delete a one-time code after successful use."""
+    db = get_db()
+    try:
+        db.execute("DELETE FROM auth_codes WHERE code = ?", (code,))
+        db.commit()
+    finally:
+        db.close()
 
 auth_bp = Blueprint("auth", __name__, url_prefix="/api/auth")
 
@@ -132,7 +183,7 @@ def register():
                 user_id = ex["id"]
                 db.close()
                 verify_code = f"{secrets.randbelow(1000000):06d}"
-                _verify_tokens[verify_code] = {"user_id": user_id, "email": email, "expires": time.time() + 900}
+                _store_auth_code(verify_code, "verify", user_id, email=email, ttl_seconds=900)
                 _send_verification_email(email, full_name, verify_code)
                 return jsonify({
                     "success": True,
@@ -165,7 +216,7 @@ def register():
             user_id = user["id"] if isinstance(user, dict) else user[0]
             # Generate and send verification code
             verify_code = f"{secrets.randbelow(1000000):06d}"
-            _verify_tokens[verify_code] = {"user_id": user_id, "email": email, "expires": time.time() + 900}
+            _store_auth_code(verify_code, "verify", user_id, email=email, ttl_seconds=900)
             _send_verification_email(email, full_name, verify_code)
 
             return jsonify({
@@ -190,13 +241,9 @@ def verify_email():
     if not code:
         return jsonify({"success": False, "error": "Verification code is required"}), 400
 
-    token_data = _verify_tokens.get(code)
+    token_data = _validate_auth_code(code, "verify")
     if not token_data:
-        return jsonify({"success": False, "error": "Invalid verification code"}), 400
-
-    if time.time() > token_data["expires"]:
-        _verify_tokens.pop(code, None)
-        return jsonify({"success": False, "error": "Code expired. Please register again."}), 400
+        return jsonify({"success": False, "error": "Invalid or expired verification code"}), 400
 
     try:
         db = get_db()
@@ -206,7 +253,7 @@ def verify_email():
         user = db.execute("SELECT * FROM users WHERE id = ?", (token_data["user_id"],)).fetchone()
         db.close()
 
-        _verify_tokens.pop(code, None)
+        _consume_auth_code(code)
 
         if user:
             u = dict(user)
@@ -272,12 +319,9 @@ def forgot_password():
         if not user:
             return jsonify({"success": True, "message": "If an account with that email exists, a reset link has been sent."}), 200
 
-        # Generate reset token (6-digit code for simplicity)
+        # Generate reset code and persist to DB (cross-instance safe)
         reset_code = f"{secrets.randbelow(1000000):06d}"
-        _reset_tokens[reset_code] = {
-            "user_id": user["id"],
-            "expires": time.time() + 900,  # 15 minutes
-        }
+        _store_auth_code(reset_code, "reset", user["id"], email=email, ttl_seconds=900)
 
         # Send reset email
         try:
@@ -314,14 +358,10 @@ def reset_password():
     except ValidationError as e:
         return jsonify({"success": False, "error": e.message}), 400
 
-    # Validate token
-    token_data = _reset_tokens.get(code)
+    # Validate code against DB (cross-instance safe)
+    token_data = _validate_auth_code(code, "reset")
     if not token_data:
         return jsonify({"success": False, "error": "Invalid or expired reset code"}), 400
-
-    if time.time() > token_data["expires"]:
-        _reset_tokens.pop(code, None)
-        return jsonify({"success": False, "error": "Reset code has expired. Please request a new one."}), 400
 
     try:
         db = get_db()
@@ -330,8 +370,8 @@ def reset_password():
         db.commit()
         db.close()
 
-        # Invalidate the token
-        _reset_tokens.pop(code, None)
+        # Consume the one-time code
+        _consume_auth_code(code)
 
         return jsonify({"success": True, "message": "Password has been reset. You can now log in."}), 200
     except Exception as e:

@@ -86,3 +86,21 @@ def configure_logging(app):
     # Quiet down noisy libraries
     for lib in ("engineio", "socketio", "urllib3", "werkzeug"):
         logging.getLogger(lib).setLevel(logging.WARNING)
+
+
+def get_request_id() -> str:
+    """Return the current request's correlation ID (set by RequestTracer).
+    Safe to call outside request context — returns '-' when unavailable."""
+    try:
+        return getattr(g, "request_id", "-")
+    except RuntimeError:
+        return "-"
+
+
+def outbound_headers() -> dict:
+    """Return headers to forward on outbound HTTP calls for request tracing.
+    Services should spread these into their `requests.get(..., headers=...)` calls."""
+    rid = get_request_id()
+    if rid and rid != "-":
+        return {"X-Request-ID": rid}
+    return {}

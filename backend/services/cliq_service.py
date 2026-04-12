@@ -7,7 +7,7 @@ Falls back silently when not configured.
 import os
 import time
 import logging
-import requests as http_requests
+from services.http_client import http as http_requests
 
 logger = logging.getLogger(__name__)
 

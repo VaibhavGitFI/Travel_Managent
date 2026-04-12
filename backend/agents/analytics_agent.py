@@ -161,6 +161,127 @@ def get_dashboard_stats(user_id: int = None) -> dict:
         total_requests = max(sum(compliance.values()), 1)
         compliance_score = round((compliance["compliant"] / total_requests) * 100)
 
+        # ── Next upcoming trip ────────────────────────────────────────
+        next_trip = None
+        if "start_date" in request_cols and "status" in request_cols:
+            try:
+                upcoming_row = db.execute(
+                    f"SELECT request_id, destination, origin, start_date, status"
+                    f" FROM travel_requests{req_where_clause}"
+                    f"{' AND ' if req_where_clause else ' WHERE '}"
+                    f"start_date >= ? AND status IN ('approved','booked','submitted','pending_approval')"
+                    f" ORDER BY start_date LIMIT 1",
+                    tuple(req_params) + (today,),
+                ).fetchone()
+                if upcoming_row:
+                    row_d = dict(upcoming_row)
+                    try:
+                        days_until = (
+                            datetime.strptime(row_d["start_date"], "%Y-%m-%d") - datetime.now()
+                        ).days
+                    except Exception:
+                        days_until = 0
+                    next_trip = {
+                        "destination": row_d.get("destination"),
+                        "origin": row_d.get("origin"),
+                        "start_date": row_d.get("start_date"),
+                        "days_until": max(0, days_until),
+                        "status": row_d.get("status"),
+                    }
+            except Exception:
+                pass
+
+        # ── Currently active trip ─────────────────────────────────────
+        active_trip = None
+        if "status" in request_cols:
+            try:
+                active_row = db.execute(
+                    f"SELECT request_id, destination, origin, start_date, end_date"
+                    f" FROM travel_requests{req_where_clause}"
+                    f"{' AND ' if req_where_clause else ' WHERE '}"
+                    f"status = 'in_progress' ORDER BY start_date DESC LIMIT 1",
+                    tuple(req_params),
+                ).fetchone()
+                if active_row:
+                    active_trip = dict(active_row)
+            except Exception:
+                pass
+
+        # ── Monthly budget vs actual spend ────────────────────────────
+        monthly_budget = 0.0
+        monthly_spend = 0.0
+        budget_utilization_pct = 0
+        try:
+            policy_row = db.execute(
+                "SELECT monthly_budget_inr FROM travel_policies LIMIT 1"
+            ).fetchone()
+            if policy_row:
+                monthly_budget = float(dict(policy_row).get("monthly_budget_inr") or 0)
+
+            month_key = datetime.now().strftime("%Y-%m")
+            date_col_exp = (
+                "created_at" if "created_at" in expense_cols
+                else "expense_date" if "expense_date" in expense_cols
+                else "date"
+            )
+            monthly_spend_row = db.execute(
+                f"SELECT COALESCE(SUM({amount_expr}), 0) FROM expenses_db"
+                f"{exp_where_clause}"
+                f"{' AND ' if exp_where_clause else ' WHERE '}"
+                f"strftime('%Y-%m', {date_col_exp}) = ?",
+                tuple(exp_params) + (month_key,),
+            ).fetchone()
+            monthly_spend = float(monthly_spend_row[0] or 0)
+            if monthly_budget > 0:
+                budget_utilization_pct = round(
+                    min((monthly_spend / monthly_budget) * 100, 100)
+                )
+        except Exception:
+            pass
+
+        # ── Nights away in last 30 days ───────────────────────────────
+        nights_away_30d = 0
+        try:
+            thirty_days_ago = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+            if "start_date" in request_cols and "end_date" in request_cols:
+                nights_row = db.execute(
+                    f"SELECT COALESCE(SUM("
+                    f"  CAST(JULIANDAY(COALESCE(end_date, start_date)) - JULIANDAY(start_date) AS INTEGER) + 1"
+                    f"), 0)"
+                    f" FROM travel_requests{req_where_clause}"
+                    f"{' AND ' if req_where_clause else ' WHERE '}"
+                    f"start_date >= ? AND status IN ('completed','in_progress','approved','booked')",
+                    tuple(req_params) + (thirty_days_ago,),
+                ).fetchone()
+                nights_away_30d = max(0, int(nights_row[0] or 0))
+        except Exception:
+            pass
+
+        # ── Meetings today ────────────────────────────────────────
+        today_meetings = 0
+        try:
+            mtg_cols = _table_columns(db, "client_meetings")
+            if "meeting_date" in mtg_cols and user_id:
+                today_meetings = int(db.execute(
+                    "SELECT COUNT(*) FROM client_meetings WHERE meeting_date = ? AND user_id = ?",
+                    (today, user_id),
+                ).fetchone()[0] or 0)
+        except Exception:
+            pass
+
+        # ── Expenses pending review ───────────────────────────────
+        expenses_pending = 0
+        try:
+            if "status" in expense_cols:
+                expenses_pending = int(db.execute(
+                    f"SELECT COUNT(*) FROM expenses_db{exp_where_clause}"
+                    f"{' AND ' if exp_where_clause else ' WHERE '}"
+                    f"status IN ('pending','submitted','under_review','review')",
+                    tuple(exp_params),
+                ).fetchone()[0] or 0)
+        except Exception:
+            pass
+
         payload = {
             "total_trips": int(total_trips or 0),
             "total_expenses": total_expenses,
@@ -170,6 +291,15 @@ def get_dashboard_stats(user_id: int = None) -> dict:
             "active_requests": int(active_requests or 0),
             "team_size": int(team_size or 0),
             "cities_visited": int(cities_visited or 0),
+            # ── New enriched fields ──
+            "next_trip": next_trip,
+            "active_trip": active_trip,
+            "monthly_budget": monthly_budget,
+            "monthly_spend": monthly_spend,
+            "budget_utilization_pct": budget_utilization_pct,
+            "nights_away_30d": nights_away_30d,
+            "today_meetings": today_meetings,
+            "expenses_pending": expenses_pending,
             "success": True,
         }
         payload["stats"] = payload.copy()

@@ -6,8 +6,8 @@ https://openexchangerates.org
 """
 import os
 import logging
-import requests
 from datetime import datetime
+from services.http_client import http as requests
 from cachetools import TTLCache
 
 logger = logging.getLogger(__name__)

@@ -521,7 +521,7 @@ Map the request to the closest real TravelSync capability without inventing user
 9. **For live counts or summaries** — answer directly from the live TravelSync data you were given; do not tell the user to open a dashboard when the answer is already available
 
 ## CRITICAL
-Your response goes directly to ElevenLabs text-to-speech. Write EXACTLY how it should sound when spoken aloud by a professional Indian voice assistant. No formatting. No lists. Natural sentences only."""
+Your response goes directly to text-to-speech. Write EXACTLY how it should sound when spoken aloud by a professional Indian voice assistant. No formatting. No lists. Natural sentences only."""
 
         return instruction
 

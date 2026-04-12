@@ -6,8 +6,7 @@ import {
   startOtisSession,
   stopOtisSession,
   sendOtisCommandRest,
-  transcribeOtisAudio,
-  otisSpeak,
+  voiceCommand,
 } from '../../api/otis'
 import useStore from '../../store/useStore'
 
@@ -48,13 +47,12 @@ function getSupportedMimeType() {
 
 // ── Browser TTS voice picker (fallback when ElevenLabs unavailable) ───────────
 const VOICE_PRIORITY = [
+  v => v.lang === 'hi-IN',
+  v => v.lang === 'en-IN',
+  v => v.name.toLowerCase().includes('india'),
+  v => v.name.toLowerCase().includes('hindi'),
   v => v.name === 'Google UK English Male',
   v => v.name === 'Daniel',
-  v => v.name === 'Microsoft George - English (United Kingdom)',
-  v => v.name === 'Microsoft David - English (United States)',
-  v => v.name === 'Alex',
-  v => v.name.toLowerCase().includes('daniel'),
-  v => v.name.toLowerCase().includes('david'),
   v => v.lang === 'en-GB',
   v => v.lang === 'en-US',
   v => v.lang.startsWith('en'),
@@ -109,6 +107,8 @@ export default function OtisVoiceWidget({ onClose, autoStart = false, entryMode 
   const [history, setHistory]       = useState([])
   const [showHistory, setShowHistory] = useState(false)
   const [inputText, setInputText]   = useState('')
+  const [language, setLanguage]     = useState('en-IN')
+  const [latencyMs, setLatencyMs]   = useState(null)
 
   // ── Refs — originals (unchanged) ────────────────────────────────────────────
   const stateRef       = useRef(S.IDLE)
@@ -129,6 +129,9 @@ export default function OtisVoiceWidget({ onClose, autoStart = false, entryMode 
   const autoListenPendingRef = useRef(Boolean(autoStart))
   const followUpPendingRef = useRef(false)
   const followUpTimerRef = useRef(null)
+  const wakeWordRef     = useRef(null)   // SpeechRecognition for wake word
+  const audioLevelRef   = useRef(0)      // live audio level 0-100
+  const isWidgetOpenRef = useRef(true)   // always open in widget mode
 
   // Keep refs in sync
   useEffect(() => { stateRef.current = state },       [state])
@@ -170,6 +173,43 @@ export default function OtisVoiceWidget({ onClose, autoStart = false, entryMode 
     }
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Wake word detection using browser SpeechRecognition
+  useEffect(() => {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition
+    if (!SpeechRecognition) return
+
+    const sr = new SpeechRecognition()
+    sr.continuous = true
+    sr.interimResults = true
+    sr.lang = 'en-IN'   // Indian English as default
+    wakeWordRef.current = sr
+
+    sr.onresult = (event) => {
+      const last = event.results[event.results.length - 1]
+      const heard = last[0].transcript.toLowerCase().trim()
+      const wakeWords = ['hey jarvis', 'ok jarvis', 'jarvis', 'hey otis', 'otis']
+      const triggered = wakeWords.some(w => heard.includes(w))
+      if (triggered && stateRef.current === S.READY) {
+        sr.stop()
+        setTimeout(() => startListening(), 200)
+      }
+    }
+    sr.onerror = () => {}
+    sr.onend = () => {
+      // Restart continuous wake word listening
+      if (stateRef.current === S.READY || stateRef.current === S.IDLE) {
+        try { sr.start() } catch {}
+      }
+    }
+
+    // Start wake word listening
+    try { sr.start() } catch {}
+
+    return () => {
+      try { sr.stop() } catch {}
+    }
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
   // ── Session init ─────────────────────────────────────────────────────────────
   const initSession = async () => {
     setState(S.CONNECTING)
@@ -178,6 +218,7 @@ export default function OtisVoiceWidget({ onClose, autoStart = false, entryMode 
       const welcome = 'Hey, I am Jarvis. How can I help?'
       setSessionId(session.session_id)
       setState(S.READY)
+      setTimeout(startWakeWord, 500)
       setTranscript('')
       setResponse(welcome)
       speakAndReturn(welcome)
@@ -200,7 +241,67 @@ export default function OtisVoiceWidget({ onClose, autoStart = false, entryMode 
     }
   }
 
+  const playBase64Audio = useCallback((b64, mime = 'audio/mpeg') => {
+    stopAudio()
+    try {
+      const byteString = atob(b64)
+      const ab = new ArrayBuffer(byteString.length)
+      const ia = new Uint8Array(ab)
+      for (let i = 0; i < byteString.length; i++) ia[i] = byteString.charCodeAt(i)
+      const blob = new Blob([ab], { type: mime })
+      const url = URL.createObjectURL(blob)
+      const audio = new Audio(url)
+      audioRef.current = audio
+      audio.onended = () => { URL.revokeObjectURL(url); audioRef.current = null; done() }
+      audio.onerror = () => { URL.revokeObjectURL(url); audioRef.current = null; done() }
+      audio.play().catch(() => done())
+    } catch { done() }
+
+    function done() {
+      const shouldAutoStart = autoListenPendingRef.current
+      const shouldFollowUp = followUpPendingRef.current
+      setState(S.READY)
+      if (shouldAutoStart || shouldFollowUp) {
+        if (followUpTimerRef.current) clearTimeout(followUpTimerRef.current)
+        followUpTimerRef.current = setTimeout(() => {
+          autoListenPendingRef.current = false
+          followUpPendingRef.current = false
+          followUpTimerRef.current = null
+          startListening()
+        }, 600)
+      }
+    }
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
   // ── MediaRecorder helpers ────────────────────────────────────────────────────
+  const startWakeWord = useCallback(() => {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition
+    if (!SR) return
+    try {
+      const rec = new SR()
+      rec.continuous = true
+      rec.interimResults = true
+      rec.lang = 'en-IN'
+      rec.onresult = (e) => {
+        const text = Array.from(e.results).map(r => r[0].transcript).join(' ').toLowerCase()
+        if (text.includes('hey jarvis') || text.includes('jarvis') || text.includes('hey otis')) {
+          rec.stop()
+          if (stateRef.current === S.READY || stateRef.current === S.IDLE) {
+            startListening()
+          }
+        }
+      }
+      rec.onerror = () => { setTimeout(startWakeWord, 3000) }
+      rec.onend   = () => {
+        if (stateRef.current === S.READY || stateRef.current === S.IDLE) {
+          setTimeout(startWakeWord, 1000)
+        }
+      }
+      rec.start()
+      wakeWordRef.current = rec
+    } catch {}
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
   /**
    * stopListening — halt any active recording.
    * @param {boolean} cancel  true = discard audio (user clicked stop)
@@ -283,30 +384,42 @@ export default function OtisVoiceWidget({ onClose, autoStart = false, entryMode 
           return
         }
 
-        // Too short — ignore
-        const blob = new Blob(chunksRef.current, { type: mimeType })
-        if (blob.size < 250) {
-          setResponse("I didn't catch that. Please ask again.")
-          if (stateRef.current === S.LISTENING) setState(S.READY)
-          return
-        }
-
+        // ── NEW: single all-in-one call ───────────────────────────────────────────
         setState(S.PROCESSING)
-
-        // ── Deepgram STT via backend ──────────────────────────────────────────
         try {
-          const result = await transcribeOtisAudio(blob)
-          if (result.success && result.text) {
-            setTranscript(result.text)
-            processCommand(result.text, { fromVoice: true })
-          } else {
-            toast.error(result.error || 'Could not understand audio')
-            setResponse("I couldn't understand that clearly. Please try again.")
+          const blob = new Blob(chunksRef.current, { type: mimeType })
+          if (blob.size < 250) {
+            setResponse("I didn't catch that. Please ask again.")
             setState(S.READY)
+            return
           }
-        } catch {
-          toast.error('Transcription failed — please try again')
-          setResponse('I had trouble hearing that. Please try again.')
+          const result = await voiceCommand(blob, sessionIdRef.current, true)
+          if (!result.success) {
+            setResponse(result.error || "Couldn't understand — please try again.")
+            setState(S.READY)
+            return
+          }
+          // Show transcript immediately
+          setTranscript(result.transcript || '')
+          setLanguage(result.language || 'en-IN')
+          setLatencyMs(result.latency_ms || null)
+          if (result.session_id) setSessionId(result.session_id)
+
+          const responseText = result.response || 'Done.'
+          setResponse(responseText)
+          setHistory(h => [...h, { role: 'user', text: result.transcript }, { role: 'assistant', text: responseText }])
+          followUpPendingRef.current = true
+
+          // Play audio if included in response
+          if (result.audio_b64) {
+            setState(S.SPEAKING)
+            playBase64Audio(result.audio_b64, result.audio_mime || 'audio/mpeg')
+          } else {
+            speakFallback(responseText)
+          }
+        } catch (err) {
+          console.error('[Jarvis] Voice command failed:', err)
+          setResponse('Sorry, something went wrong. Please try again.')
           setState(S.READY)
         }
       }
@@ -335,14 +448,14 @@ export default function OtisVoiceWidget({ onClose, autoStart = false, entryMode 
         if (Date.now() - startedAt > 60000) { stopListening(); return }   // 60 s max
         analyser.getByteFrequencyData(dataArr)
         const avg = dataArr.reduce((s, v) => s + v, 0) / dataArr.length
-        if (avg >= 18) {
+        if (avg >= 12) {
           heardSpeech = true
           silentSince = 0
         } else if (!heardSpeech) {
-          if (Date.now() - startedAt > 8000) { stopListening(); return }
+          if (Date.now() - startedAt > 5000) { stopListening(); return }
         } else {
           if (!silentSince) silentSince = Date.now()
-          else if (Date.now() - silentSince > 2200) { stopListening(); return }
+          else if (Date.now() - silentSince > 1000) { stopListening(); return }
         }
         animFrameRef.current = requestAnimationFrame(checkSilence)
       }
@@ -350,7 +463,7 @@ export default function OtisVoiceWidget({ onClose, autoStart = false, entryMode 
       // Give the microphone a moment to stabilize before evaluating silence.
       silenceTimerRef.current = setTimeout(
         () => { animFrameRef.current = requestAnimationFrame(checkSilence) },
-        1200,
+        600,
       )
 
     } catch (err) {
@@ -389,100 +502,35 @@ export default function OtisVoiceWidget({ onClose, autoStart = false, entryMode 
     }
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
+  const speakFallback = useCallback((text) => {
+    setState(S.SPEAKING)
+    if (!text || !('speechSynthesis' in window)) { setState(S.READY); return }
+    window.speechSynthesis.cancel()
+    const done = () => {
+      setState(S.READY)
+      if (followUpPendingRef.current) {
+        followUpPendingRef.current = false
+        setTimeout(() => startListening(), 500)
+      }
+    }
+    const utt = new SpeechSynthesisUtterance(text)
+    // Prefer Indian English voice
+    const voices = window.speechSynthesis.getVoices()
+    const indian = voices.find(v => v.lang === 'en-IN') || voices.find(v => v.lang.startsWith('en'))
+    if (indian) utt.voice = indian
+    utt.lang   = 'en-IN'
+    utt.rate   = 0.95
+    utt.onend  = done
+    utt.onerror = done
+    window.speechSynthesis.speak(utt)
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
   /**
-   * speakAndReturn — ElevenLabs TTS first, browser SpeechSynthesis as fallback.
+   * speakAndReturn — kept for backward compat (welcome message, error messages).
+   * Routes through speakFallback.
    */
   const speakAndReturn = useCallback(async (text) => {
-    setState(S.SPEAKING)
-    stopAudio()
-
-    // Safety net: never stay SPEAKING longer than 12 s — catches TTS hangs
-    const safetyTimer = setTimeout(() => {
-      if (stateRef.current === S.SPEAKING) {
-        const shouldAutoStart = autoListenPendingRef.current
-        const shouldFollowUp = followUpPendingRef.current
-        setState(S.READY)
-        if (shouldAutoStart || shouldFollowUp) {
-          followUpTimerRef.current = setTimeout(() => {
-            autoListenPendingRef.current = false
-            followUpPendingRef.current = false
-            followUpTimerRef.current = null
-            startListening()
-          }, shouldFollowUp ? 650 : 250)
-        }
-      }
-    }, 12000)
-
-    // Auto-start only once when the widget was opened by the wake word.
-    // Follow-up listening only continues after a voice-originated turn.
-    const done = () => {
-      const shouldAutoStart = autoListenPendingRef.current
-      const shouldFollowUp = followUpPendingRef.current
-      clearTimeout(safetyTimer)
-      setState(S.READY)
-      if (shouldAutoStart || shouldFollowUp) {
-        if (followUpTimerRef.current) clearTimeout(followUpTimerRef.current)
-        followUpTimerRef.current = setTimeout(() => {
-          autoListenPendingRef.current = false
-          followUpPendingRef.current = false
-          followUpTimerRef.current = null
-          startListening()
-        }, shouldFollowUp ? 650 : 250)
-      }
-    }
-
-    // ── Try ElevenLabs via backend API ────────────────────────────────────────
-    try {
-      const audioBlob = await otisSpeak(text)
-      if (audioBlob) {
-        const url   = URL.createObjectURL(audioBlob)
-        const audio = new Audio(url)
-        audioRef.current = audio
-
-        audio.onended = () => { URL.revokeObjectURL(url); audioRef.current = null; done() }
-        audio.onerror = () => { URL.revokeObjectURL(url); audioRef.current = null; done() }
-        await audio.play()
-        return   // ElevenLabs handled — done
-      }
-    } catch (err) {
-      console.warn('[Jarvis] ElevenLabs TTS failed, using browser fallback:', err)
-    }
-
-    // ── Fallback: browser SpeechSynthesis ─────────────────────────────────────
-    if (!('speechSynthesis' in window)) {
-      done()
-      return
-    }
-    window.speechSynthesis.cancel()
-
-    const doSpeak = () => {
-      const utt   = new SpeechSynthesisUtterance(text)
-      const voice = pickFallbackVoice()
-      if (voice) utt.voice = voice
-      utt.lang   = voice?.lang || 'en-GB'
-      utt.rate   = 0.95
-      utt.pitch  = 0.85
-      utt.volume = 1.0
-      utt.onend  = done
-      utt.onerror = done
-      window.speechSynthesis.speak(utt)
-    }
-
-    const voices = window.speechSynthesis.getVoices()
-    if (voices.length > 0) {
-      doSpeak()
-    } else {
-      // Voices not yet loaded — wait with a 2 s fallback so we're never stuck
-      const voiceTimer = setTimeout(() => {
-        window.speechSynthesis.onvoiceschanged = null
-        done()  // voices never loaded — skip TTS, just go READY
-      }, 2000)
-      window.speechSynthesis.onvoiceschanged = () => {
-        clearTimeout(voiceTimer)
-        window.speechSynthesis.onvoiceschanged = null
-        doSpeak()
-      }
-    }
+    speakFallback(text)
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Text input fallback ──────────────────────────────────────────────────────
@@ -777,7 +825,7 @@ export default function OtisVoiceWidget({ onClose, autoStart = false, entryMode 
         }}>
           {state === S.LISTENING
             ? 'Hands-free mode active. Speak naturally.'
-            : 'Say "Hey Jarvis" to wake, or tap the mic to talk.'}
+            : `Say "Hey Jarvis" to wake, or tap the mic to talk.${latencyMs ? ` · ${latencyMs}ms` : ''}`}
         </div>
 
         {/* Text input row */}
