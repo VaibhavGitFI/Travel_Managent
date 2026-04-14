@@ -22,7 +22,12 @@ if [[ -z "$CLOUDSQL_INSTANCE" ]]; then
   echo "No CLOUDSQL_INSTANCE set — deploying without Cloud SQL attachment (using external DB via DATABASE_URL secret)."
 fi
 
+# COMMIT_SHA is a Cloud Build built-in that's auto-populated by GitHub triggers
+# but is empty for manual gcloud builds submit. Derive it from git when running locally.
+_LOCAL_COMMIT_SHA="${COMMIT_SHA:-$(git rev-parse HEAD 2>/dev/null || echo 'manual')}"
+
 SUBSTITUTIONS=(
+  "COMMIT_SHA=${_LOCAL_COMMIT_SHA}"
   "_SERVICE_NAME=${SERVICE_NAME}"
   "_REGION=${REGION}"
   "_AR_REPOSITORY=${AR_REPOSITORY}"
