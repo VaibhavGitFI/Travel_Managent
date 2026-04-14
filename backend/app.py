@@ -159,37 +159,31 @@ def create_app() -> Flask:
             response.headers["X-CSRF-Token"] = csrf_token
         return response
 
-    # ── Lazy DB init ───────────────────────────────────────────────────────────
-    # init_db() opens the Supabase connection pool (3 connections, SSL handshake,
-    # schema migrations). Running it synchronously inside create_app() causes
-    # gunicorn's worker to hang during boot on Cloud Run — the worker is alive
-    # (TCP probe passes) but can't serve HTTP until the pool finishes.
+    # ── DB init in background thread ──────────────────────────────────────────
+    # init_db() runs 80+ SQL statements (CREATE TABLE IF NOT EXISTS, ALTER TABLE,
+    # CREATE INDEX) against Supabase. Running this synchronously — even deferred
+    # to the first request — blocks that request for 5-60s while schema checks
+    # complete over the cross-cloud link, causing client-visible timeouts.
     #
-    # Fix: defer init_db() to the FIRST real request via before_request.
-    # Startup is now instant. The first HTTP request (~50ms extra) pays the
-    # pool-creation cost once; all subsequent requests use the warm pool.
-    _db_ready = False
-    _db_init_lock = __import__('threading').Lock()
+    # Fix: run init_db() in a daemon background thread immediately at startup.
+    # The psycopg2 connection pool is created lazily (first get_db() call), so
+    # the DB is usable as soon as that first connection succeeds (~1-2s).
+    # init_db() schema migrations run concurrently without blocking HTTP traffic.
+    #
+    # In development (SQLite) init_db() is instant so the thread is a no-op cost.
+    import threading as _threading
 
-    @app.before_request
-    def _lazy_init_db():
-        nonlocal _db_ready
-        if _db_ready:
-            return
-        with _db_init_lock:
-            if _db_ready:
-                return
-            try:
-                init_db()
-                logger.info("[DB] Lazy init complete — pool ready")
-            except Exception as exc:
-                logger.error("[DB] Lazy init failed: %s", exc)
-                # Don't crash the request — let the route handler surface the error
-            _db_ready = True
+    def _bg_init_db():
+        try:
+            init_db()
+            logger.info("[DB] Background init complete — schema ready")
+        except Exception as exc:
+            logger.error("[DB] Background init failed: %s", exc)
+
+    _init_thread = _threading.Thread(target=_bg_init_db, daemon=True, name="db-init")
+    _init_thread.start()
 
     # Background threads: keep-alive + analytics warmup.
-    # These start immediately but do their first DB access only after a delay,
-    # by which time the lazy init will have been triggered by a real request.
     _start_supabase_keepalive()
 
     from services.analytics_warmup import start_analytics_warmup
