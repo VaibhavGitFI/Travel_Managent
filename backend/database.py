@@ -203,7 +203,7 @@ _PG_ACQUIRE_RETRIES = 3   # retries before giving up on pool
 _PG_ACQUIRE_BACKOFF = 0.1  # initial back-off seconds (doubles each retry)
 _PG_POOL_FAILURE_COOLDOWN = float(os.getenv("DB_POOL_FAILURE_COOLDOWN", "15"))
 # Per-connection timeouts added to the DSN to prevent runaway queries / stale conns
-_PG_CONNECT_TIMEOUT = int(os.getenv("DB_CONNECT_TIMEOUT", "5"))       # seconds
+_PG_CONNECT_TIMEOUT = int(os.getenv("DB_CONNECT_TIMEOUT", "10"))      # seconds (GCP→Supabase-AWS cross-cloud)
 _PG_STATEMENT_TIMEOUT = int(os.getenv("DB_STATEMENT_TIMEOUT", "15000"))  # milliseconds
 
 
@@ -223,23 +223,26 @@ def _get_pg_pool():
             return None
         try:
             from psycopg2 import pool as pg_pool
+            # NOTE: Do NOT pass `options` here. The Supabase session pooler (PgBouncer)
+            # can hang when processing the `-c statement_timeout=N` startup parameter,
+            # blocking pool creation indefinitely. Set statement_timeout per-connection
+            # after acquisition instead (see _ensure_clean_pg_conn).
+            #
             # keepalives_* prevent Supabase from silently dropping idle connections
-            # after 120s of inactivity (its default idle-in-transaction timeout).
-            # idle=30: start probing after 30s idle; interval=10: retry every 10s; count=3: drop after 3 failures.
+            # after 120s inactivity. idle=30s: start probing; interval=10s; count=3.
             _pg_pool = pg_pool.ThreadedConnectionPool(
                 minconn=_PG_MINCONN,
                 maxconn=_PG_MAXCONN,
                 dsn=database_url,
                 connect_timeout=_PG_CONNECT_TIMEOUT,
-                options=f"-c statement_timeout={_PG_STATEMENT_TIMEOUT}",
                 keepalives=1,
                 keepalives_idle=30,
                 keepalives_interval=10,
                 keepalives_count=3,
             )
             logger.info(
-                "[DB] PostgreSQL pool created (%d-%d conns, connect_timeout=%ds, statement_timeout=%dms, keepalives=on)",
-                _PG_MINCONN, _PG_MAXCONN, _PG_CONNECT_TIMEOUT, _PG_STATEMENT_TIMEOUT,
+                "[DB] PostgreSQL pool created (%d-%d conns, connect_timeout=%ds, keepalives=on)",
+                _PG_MINCONN, _PG_MAXCONN, _PG_CONNECT_TIMEOUT,
             )
             _pg_pool_last_failure = 0.0
             return _pg_pool
