@@ -41,11 +41,16 @@ from werkzeug.security import generate_password_hash
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _make_user(db, role="employee", suffix=None):
-    """Insert a pre-verified user directly into DB. Returns (email, password, user_id)."""
+    """Insert a pre-verified user directly into DB. Returns (email, password, user_id).
+    Idempotent: deletes any pre-existing user with the same username/email so that
+    repeated local test runs don't fail with UNIQUE constraint violations."""
     tag = suffix or secrets.token_hex(4)
     email = f"{role}_{tag}@audit.test"
     password = "AuditPass1"
     username = f"{role}_{tag}"
+    # Delete stale user from a previous run (no-op on a fresh DB)
+    db.execute("DELETE FROM users WHERE username = ? OR email = ?", (username, email))
+    db.commit()
     db.execute(
         """INSERT INTO users
                (username, password_hash, name, full_name, email,
