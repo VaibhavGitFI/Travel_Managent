@@ -4,7 +4,8 @@
   "version": "3.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "concurrently -n FLASK,VITE -c cyan,magenta \"cd .. && ./venv/bin/python run.py\" \"vite\"",
+    "dev:ui": "vite",
     "build": "vite build",
     "preview": "vite preview",
     "start": "concurrently -n FLASK,VITE -c cyan,magenta \"cd .. && ./venv/bin/python run.py\" \"vite\""

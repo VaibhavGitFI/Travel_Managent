@@ -660,49 +660,19 @@ The Login page also has **demo quick-fill buttons** — click any role to auto-f
 
 ## Deployment (GCP)
 
-### Prerequisites
+Production deployment is documented in [docs/gcp-production-deploy.md](docs/gcp-production-deploy.md).
 
-- Google Cloud project with billing enabled
-- `gcloud` CLI installed and authenticated
-- Enable APIs: Cloud Run, Cloud Build, Cloud SQL, Secret Manager, Artifact Registry
+The repo now includes:
 
-### Deploy to Cloud Run
+- `cloudbuild.yaml` for Artifact Registry + Cloud Run deployment
+- `scripts/gcp/bootstrap.sh` for one-time GCP setup
+- `scripts/gcp/deploy.sh` for parameterized production deploys
 
-```bash
-# Set your project
-gcloud config set project YOUR_PROJECT_ID
-
-# Build and deploy (Cloud Build handles everything)
-gcloud builds submit --config=cloudbuild.yaml
-```
-
-The `cloudbuild.yaml` will:
-1. Build the React frontend (`npm run build`)
-2. Build the Docker container
-3. Push to Artifact Registry
-4. Deploy to Cloud Run in `asia-south1`
-5. Inject secrets from Secret Manager
-
-### Store API Keys in Secret Manager
+Typical flow:
 
 ```bash
-# Create secrets for each API key
-echo -n "your-gemini-key" | gcloud secrets create GEMINI_API_KEY --data-file=-
-echo -n "your-amadeus-id" | gcloud secrets create AMADEUS_CLIENT_ID --data-file=-
-# ... repeat for all keys
-```
-
-### Set Up Cloud SQL (Production Database)
-
-```bash
-# Create Cloud SQL PostgreSQL instance
-gcloud sql instances create travelsync-db \
-  --database-version=POSTGRES_15 \
-  --region=asia-south1 \
-  --tier=db-f1-micro
-
-# Set DATABASE_URL in Cloud Run environment
-# postgresql://user:pass@/dbname?host=/cloudsql/PROJECT:REGION:INSTANCE
+PROJECT_ID=your-project-id REGION=asia-south1 ./scripts/gcp/bootstrap.sh
+PROJECT_ID=your-project-id CLOUDSQL_INSTANCE=your-project:asia-south1:travelsync-db ./scripts/gcp/deploy.sh
 ```
 
 ---

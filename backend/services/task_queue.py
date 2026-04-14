@@ -15,6 +15,7 @@ Usage:
 
     task_queue.get_status(task_id)  # → {status, progress, result, error}
 """
+import os
 import uuid
 import logging
 import threading
@@ -22,15 +23,23 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from cachetools import TTLCache
 
+# Configurable via env — default 12 covers burst trip-plan submissions on Cloud Run.
+# Each worker may spawn up to 6 inner agent threads (orchestrator), so
+# TASK_QUEUE_WORKERS=12 → up to 72 agent threads at peak. Tune down if RAM-constrained.
+_TASK_QUEUE_WORKERS = max(1, int(os.getenv("TASK_QUEUE_WORKERS", "12")))
+
+# Track up to 2000 in-flight/recent task states (TTL-evicted after 1 hour).
+_TASK_CACHE_MAXSIZE = max(200, int(os.getenv("TASK_QUEUE_CACHE_SIZE", "2000")))
+
 logger = logging.getLogger(__name__)
 
 
 class TaskQueue:
     """In-process background task runner with progress tracking."""
 
-    def __init__(self, max_workers: int = 4):
+    def __init__(self, max_workers: int = _TASK_QUEUE_WORKERS):
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="task")
-        self._tasks = TTLCache(maxsize=200, ttl=3600)  # Tasks expire after 1 hour
+        self._tasks = TTLCache(maxsize=_TASK_CACHE_MAXSIZE, ttl=3600)  # Tasks expire after 1 hour
         self._lock = threading.Lock()
 
     def submit(self, fn, args=(), kwargs=None, user_id=None, task_type="generic") -> str:
@@ -115,5 +124,5 @@ class TaskQueue:
             pass
 
 
-# Singleton instance
-task_queue = TaskQueue(max_workers=4)
+# Singleton instance — worker count driven by TASK_QUEUE_WORKERS env var (default 12)
+task_queue = TaskQueue()

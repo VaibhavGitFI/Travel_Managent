@@ -47,6 +47,22 @@ def _notify_manager_of_new_request(request_id: str, destination: str, requester_
     except Exception:
         logger.debug("[Requests] _notify_manager failed silently")
 
+
+def _get_approver_id(request_id: str):
+    """Return the pending approver_id for a request, or None. Silent on failure."""
+    try:
+        from database import get_db
+        db = get_db()
+        row = db.execute(
+            "SELECT approver_id FROM approvals WHERE request_id = ? AND status = 'pending' LIMIT 1",
+            (request_id,)
+        ).fetchone()
+        db.close()
+        return row["approver_id"] if row else None
+    except Exception:
+        return None
+
+
 requests_bp = Blueprint("requests", __name__, url_prefix="/api/requests")
 
 # Per diem rates (INR/day) by city tier
@@ -294,11 +310,14 @@ def create_travel_request():
                     user.get("full_name") or user.get("name") or user.get("username", "Someone"),
                 )
 
-        # Notify all tabs that requests data changed
+        # Targeted real-time refresh — requester's tabs + assigned approver's tabs
         try:
             from extensions import socketio
-            socketio.emit("data_changed", {"entity": "requests"}, namespace="/")
-            socketio.emit("data_changed", {"entity": "approvals"}, namespace="/")
+            socketio.emit("data_changed", {"entity": "requests"}, to=f"user_{user['id']}", namespace="/")
+            if result.get("request_id"):
+                approver_id = _get_approver_id(result["request_id"])
+                if approver_id:
+                    socketio.emit("data_changed", {"entity": "approvals"}, to=f"user_{approver_id}", namespace="/")
         except Exception:
             pass
 
@@ -364,23 +383,22 @@ def update_status(request_id):
             actor_role=user.get("role", "employee"),
         )
         if result.get("success"):
-            # Broadcast data_changed for real-time auto-refresh
-            try:
-                from extensions import socketio
-                socketio.emit("data_changed", {"entity": "requests"}, namespace="/")
-                socketio.emit("data_changed", {"entity": "analytics"}, namespace="/")
-            except Exception:
-                pass
-            # Notify the requester of the status change
+            # Targeted real-time refresh + notify requester — single DB fetch
             try:
                 from database import get_db
+                from extensions import socketio
                 db = get_db()
                 req = db.execute(
                     "SELECT user_id, destination FROM travel_requests WHERE request_id = ?",
                     (request_id,)
                 ).fetchone()
                 db.close()
+                # Always notify the actor (manager/admin updating status)
+                socketio.emit("data_changed", {"entity": "requests"}, to=f"user_{user['id']}", namespace="/")
+                socketio.emit("data_changed", {"entity": "analytics"}, to=f"user_{user['id']}", namespace="/")
+                # Also notify the requester if different from actor
                 if req and req["user_id"] != user["id"]:
+                    socketio.emit("data_changed", {"entity": "requests"}, to=f"user_{req['user_id']}", namespace="/")
                     from services.notification_service import notify
                     notify(
                         user_id=req["user_id"],
@@ -426,10 +444,13 @@ def submit_travel_request(request_id):
     try:
         result = submit_request(request_id, user_id=user["id"])
         if result.get("success"):
+            # Targeted real-time refresh — requester's tabs + assigned approver's tabs
             try:
                 from extensions import socketio
-                socketio.emit("data_changed", {"entity": "requests"}, namespace="/")
-                socketio.emit("data_changed", {"entity": "approvals"}, namespace="/")
+                socketio.emit("data_changed", {"entity": "requests"}, to=f"user_{user['id']}", namespace="/")
+                approver_id = _get_approver_id(request_id)
+                if approver_id:
+                    socketio.emit("data_changed", {"entity": "approvals"}, to=f"user_{approver_id}", namespace="/")
             except Exception:
                 pass
         if result.get("success") and result.get("status") == "pending_approval":

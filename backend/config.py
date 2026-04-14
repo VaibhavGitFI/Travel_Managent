@@ -168,92 +168,15 @@ class Config:
     # CORS — comma-separated list of allowed origins.
     # Default: localhost dev servers. Override in production:
     #   CORS_ORIGINS=https://app.travelsync.pro
-    CORS_ORIGINS = [
-        o.strip() for o in
-        os.getenv("CORS_ORIGINS", "http://localhost:5173,http://localhost:3399,http://127.0.0.1:5173,http://127.0.0.1:3399").split(",")
-        if o.strip()
-    ]
+    _cors_origins_raw = _get_env_or_secret(
+        "CORS_ORIGINS",
+        default="http://localhost:5173,http://localhost:3399,http://127.0.0.1:5173,http://127.0.0.1:3399",
+    ) or ""
+    CORS_ORIGINS = [o.strip() for o in _cors_origins_raw.split(",") if o.strip()]
 
     # GCP
     GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID") or os.getenv("GOOGLE_CLOUD_PROJECT")
-    GCS_BUCKET     = os.getenv("GCS_BUCKET")
-
-    # ── OTIS Voice Agent Configuration ────────────────────────────────────────
-    OTIS_ENABLED = os.getenv("OTIS_ENABLED", "False").lower() == "true"
-    OTIS_ADMIN_ONLY = os.getenv("OTIS_ADMIN_ONLY", "True").lower() == "true"
-    OTIS_DEBUG = os.getenv("OTIS_DEBUG", "False").lower() == "true"
-
-    # OTIS API Keys
-    PORCUPINE_ACCESS_KEY = _get_env_or_secret("PORCUPINE_ACCESS_KEY")
-    # Deepgram + ElevenLabs no longer used — OTIS now uses Gemini Live API
-    # (kept as None so existing code that checks them doesn't crash)
-    DEEPGRAM_API_KEY   = None
-    ELEVENLABS_API_KEY = None
-
-    # OTIS Voice Settings — Gemini Live voices
-    # Available: Puck, Charon, Kore, Fenrir, Aoede, Orus, Perseus
-    # Best for Indian English: Puck (energetic), Orus (calm), Charon (deep)
-    OTIS_LIVE_VOICE    = os.getenv("OTIS_LIVE_VOICE", "Puck")
-    OTIS_VOICE_LANGUAGE = os.getenv("OTIS_VOICE_LANGUAGE", "en-IN")
-    # Google Cloud TTS voice for REST /speak endpoint (Indian English Neural)
-    OTIS_GCP_TTS_VOICE = os.getenv("OTIS_GCP_TTS_VOICE", "en-IN-Neural2-B")
-
-    try:
-        OTIS_VOICE_SPEED = float(os.getenv("OTIS_VOICE_SPEED", "1.0"))
-    except (ValueError, TypeError):
-        OTIS_VOICE_SPEED = 1.0
-
-    try:
-        OTIS_VOICE_PITCH = float(os.getenv("OTIS_VOICE_PITCH", "0.0"))
-    except (ValueError, TypeError):
-        OTIS_VOICE_PITCH = 0.0
-
-    try:
-        OTIS_VOICE_STABILITY = float(os.getenv("OTIS_VOICE_STABILITY", "0.5"))
-    except (ValueError, TypeError):
-        OTIS_VOICE_STABILITY = 0.5
-
-    try:
-        OTIS_VOICE_SIMILARITY = float(os.getenv("OTIS_VOICE_SIMILARITY", "0.75"))
-    except (ValueError, TypeError):
-        OTIS_VOICE_SIMILARITY = 0.75
-
-    # OTIS Behavior
-    OTIS_WAKE_WORD = os.getenv("OTIS_WAKE_WORD", "Hey Otis")
-    OTIS_AUTO_EXECUTE = os.getenv("OTIS_AUTO_EXECUTE", "False").lower() == "true"
-    OTIS_REQUIRE_CONFIRMATION = os.getenv("OTIS_REQUIRE_CONFIRMATION", "True").lower() == "true"
-
-    try:
-        OTIS_MAX_SESSION_DURATION = int(os.getenv("OTIS_MAX_SESSION_DURATION", "600"))
-    except (ValueError, TypeError):
-        OTIS_MAX_SESSION_DURATION = 600
-
-    try:
-        OTIS_IDLE_TIMEOUT = int(os.getenv("OTIS_IDLE_TIMEOUT", "30"))
-    except (ValueError, TypeError):
-        OTIS_IDLE_TIMEOUT = 30
-
-    # OTIS Rate Limiting
-    try:
-        OTIS_MAX_SESSIONS_PER_HOUR = int(os.getenv("OTIS_MAX_SESSIONS_PER_HOUR", "10"))
-    except (ValueError, TypeError):
-        OTIS_MAX_SESSIONS_PER_HOUR = 10
-
-    try:
-        OTIS_MAX_COMMANDS_PER_SESSION = int(os.getenv("OTIS_MAX_COMMANDS_PER_SESSION", "50"))
-    except (ValueError, TypeError):
-        OTIS_MAX_COMMANDS_PER_SESSION = 50
-
-    # OTIS Cost Management
-    try:
-        OTIS_MONTHLY_BUDGET_USD = float(os.getenv("OTIS_MONTHLY_BUDGET_USD", "500"))
-    except (ValueError, TypeError):
-        OTIS_MONTHLY_BUDGET_USD = 500.0
-
-    try:
-        OTIS_WARN_AT_PERCENT = int(os.getenv("OTIS_WARN_AT_PERCENT", "80"))
-    except (ValueError, TypeError):
-        OTIS_WARN_AT_PERCENT = 80
+    GCS_BUCKET     = _get_env_or_secret("GCS_BUCKET")
 
     @classmethod
     def services_status(cls) -> dict:
@@ -270,11 +193,6 @@ class Config:
             "email_smtp":        bool(cls.SMTP_HOST and cls.SMTP_USER),
             "zoho_cliq":         bool(cls.ZOHO_CLIQ_API_ENDPOINT and cls.ZOHO_CLIQ_REFRESH_TOKEN),
             "slack":             bool(cls.SLACK_WEBHOOK_URL or cls.SLACK_BOT_TOKEN),
-            "otis_voice":        bool(cls.OTIS_ENABLED and cls.GEMINI_API_KEY),
-            # Wake word works with OpenWakeWord (no key) or Porcupine (with key)
-            "otis_wake_word":    True,
-            "otis_stt":          bool(cls.GEMINI_API_KEY),   # Gemini Live STT
-            "otis_tts":          bool(cls.GEMINI_API_KEY),   # Google Cloud TTS / Gemini Live TTS
         }
 
     @classmethod

@@ -24,6 +24,7 @@ load_dotenv(_env_path, override=False)
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "travelsync.db")
 logger = logging.getLogger(__name__)
+_pg_force_sqlite = False
 
 
 class _PGRow(dict):
@@ -66,6 +67,15 @@ class _PGCursor:
         )
         # Convert SQLite last_insert_rowid() to PostgreSQL lastval()
         pg_sql = re.sub(r"last_insert_rowid\(\s*\)", "lastval()", pg_sql, flags=re.IGNORECASE)
+        # Convert SQLite JULIANDAY(col) to PostgreSQL equivalent.
+        # JULIANDAY returns a float count of days; the PG equivalent uses epoch seconds / 86400.
+        # Handles both TEXT and DATE column types via explicit ::date cast.
+        pg_sql = re.sub(
+            r"\bJULIANDAY\(([^)]+)\)",
+            lambda m: f"(EXTRACT(EPOCH FROM ({m.group(1)})::date) / 86400.0)",
+            pg_sql,
+            flags=re.IGNORECASE,
+        )
         pg_sql = re.sub(r"\?", "%s", pg_sql)
         self._cur.execute(pg_sql, params or ())
         return self
@@ -92,7 +102,17 @@ class _PGAdapter:
 
     def execute(self, sql: str, params=()):
         cursor = _PGCursor(self._cur)
-        cursor.execute(sql, params)
+        try:
+            cursor.execute(sql, params)
+        except Exception:
+            # Rollback the failed statement so the connection stays usable.
+            # Without this, PostgreSQL leaves the connection in
+            # "InFailedSqlTransaction" state and all subsequent queries also fail.
+            try:
+                self._conn.rollback()
+            except Exception:
+                pass
+            raise
         return cursor
 
     def commit(self):
@@ -169,11 +189,15 @@ _pg_pool = None
 _pg_pool_lock = __import__('threading').Lock()
 _pg_pool_last_failure = 0.0
 
-# Pool tuning — defaults raised from 1-4 to 2-10 to handle moderate production
-# concurrency under eventlet (single Gunicorn worker, many green threads).
-# Supabase session-mode poolers typically allow 20-60 connections per project.
-_PG_MINCONN = max(1, int(os.getenv("DB_POOL_MINCONN", "2")))
-_PG_MAXCONN = max(_PG_MINCONN, int(os.getenv("DB_POOL_MAXCONN", "10")))
+# Pool tuning — per Cloud Run instance (single Gunicorn worker, eventlet green threads).
+# MINCONN=3: three warm connections ready at startup — negligible idle cost.
+# MAXCONN=20: matches realistic burst concurrency (Cloud Run concurrency=80 but not
+#   all green threads hold a DB connection simultaneously). After Fix 3, DATABASE_URL
+#   points to Supabase Supavisor (pooled endpoint) which multiplexes these 20
+#   psycopg2 connections into ~5 real PostgreSQL connections — no Postgres overload.
+#   Override via env vars: DB_POOL_MINCONN, DB_POOL_MAXCONN.
+_PG_MINCONN = max(1, int(os.getenv("DB_POOL_MINCONN", "3")))
+_PG_MAXCONN = max(_PG_MINCONN, int(os.getenv("DB_POOL_MAXCONN", "20")))
 _PG_ACQUIRE_RETRIES = 3   # retries before giving up on pool
 _PG_ACQUIRE_BACKOFF = 0.1  # initial back-off seconds (doubles each retry)
 _PG_POOL_FAILURE_COOLDOWN = float(os.getenv("DB_POOL_FAILURE_COOLDOWN", "15"))
@@ -217,6 +241,38 @@ def _get_pg_pool():
             _pg_pool_last_failure = time.time()
             logger.error("[DB] PostgreSQL pool creation failed: %s — falling back to direct Supabase connection", exc)
     return None
+
+
+def _running_managed_env() -> bool:
+    return bool(
+        os.getenv("K_SERVICE")
+        or os.getenv("GAE_APPLICATION")
+        or os.getenv("CLOUD_RUN_JOB")
+        or os.getenv("GCP_PROJECT_ID")
+    )
+
+
+def _allow_sqlite_fallback() -> bool:
+    """Allow local dev to boot even when Supabase/Postgres is unavailable."""
+    if os.getenv("DB_REQUIRE_POSTGRES", "").lower() == "true":
+        return False
+    return not _running_managed_env()
+
+
+def _sqlite_connect():
+    db = sqlite3.connect(DB_PATH)
+    db.row_factory = sqlite3.Row
+    db.execute("PRAGMA foreign_keys = ON")
+    db.execute("PRAGMA journal_mode = WAL")
+    return db
+
+
+def _fallback_sqlite(reason: str):
+    global _pg_force_sqlite
+    if not _pg_force_sqlite:
+        logger.warning("[DB] PostgreSQL unavailable, switching this process to SQLite: %s", reason)
+    _pg_force_sqlite = True
+    return _sqlite_connect()
 
 
 def _ensure_clean_pg_conn(conn, pool):
@@ -339,8 +395,9 @@ def get_db():
     If the pool is unrecoverable a direct connection is attempted as a final
     fallback before raising.
     """
+    global _pg_force_sqlite
     database_url = os.getenv("DATABASE_URL")
-    if database_url:
+    if database_url and not _pg_force_sqlite:
         pool = _get_pg_pool()
         if pool:
             try:
@@ -348,8 +405,12 @@ def get_db():
                 conn.autocommit = False
                 return _PGPoolAdapter(conn, pool)
             except RuntimeError:
+                if _allow_sqlite_fallback():
+                    return _fallback_sqlite("connection pool acquisition failed")
                 raise
             except Exception as exc:
+                if _allow_sqlite_fallback():
+                    return _fallback_sqlite(str(exc))
                 logger.error("[DB] Supabase pool getconn failed: %s", exc)
                 raise RuntimeError(f"Supabase PostgreSQL connection failed: {exc}") from exc
         # Pool creation failed — try direct connection as last resort
@@ -360,15 +421,13 @@ def get_db():
             logger.warning("[DB] Using direct Supabase connection (pool unavailable)")
             return _PGAdapter(conn)
         except Exception as exc:
+            if _allow_sqlite_fallback():
+                return _fallback_sqlite(str(exc))
             logger.error("[DB] Direct Supabase connection also failed: %s", exc)
             raise RuntimeError(f"Cannot connect to Supabase: {exc}") from exc
 
     # No DATABASE_URL — local dev / tests use SQLite
-    db = sqlite3.connect(DB_PATH)
-    db.row_factory = sqlite3.Row
-    db.execute("PRAGMA foreign_keys = ON")
-    db.execute("PRAGMA journal_mode = WAL")
-    return db
+    return _sqlite_connect()
 
 
 @contextmanager
@@ -666,110 +725,6 @@ def _create_tables(c, pg=None):
         created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )""")
 
-    # ── OTIS Voice Agent Tables ───────────────────────────────────────────────
-
-    c.execute(f"""
-    CREATE TABLE IF NOT EXISTS otis_sessions (
-        id                  {pk},
-        org_id              INTEGER REFERENCES organizations(id),
-        user_id             INTEGER REFERENCES users(id),
-        session_id          TEXT UNIQUE NOT NULL,
-        status              TEXT DEFAULT 'active',
-        wake_word_detected  INTEGER DEFAULT 0,
-        total_turns         INTEGER DEFAULT 0,
-        started_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        ended_at            TIMESTAMP,
-        duration_seconds    INTEGER DEFAULT 0
-    )""")
-
-    c.execute(f"""
-    CREATE TABLE IF NOT EXISTS otis_commands (
-        id                      {pk},
-        org_id                  INTEGER REFERENCES organizations(id),
-        user_id                 INTEGER REFERENCES users(id),
-        session_id              TEXT REFERENCES otis_sessions(session_id),
-
-        command_text            TEXT NOT NULL,
-        transcript              TEXT,
-        transcript_confidence   REAL,
-
-        intent                  TEXT,
-        intent_confidence       REAL,
-        entities_json           TEXT DEFAULT '{{}}',
-
-        function_called         TEXT,
-        function_params_json    TEXT DEFAULT '{{}}',
-        function_result_json    TEXT DEFAULT '{{}}',
-
-        response_text           TEXT,
-        response_audio_url      TEXT,
-
-        success                 INTEGER DEFAULT 1,
-        error_message           TEXT,
-
-        latency_ms              INTEGER,
-        cost_usd                REAL,
-
-        created_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )""")
-
-    c.execute(f"""
-    CREATE TABLE IF NOT EXISTS otis_conversations (
-        id              {pk},
-        session_id      TEXT REFERENCES otis_sessions(session_id),
-        turn_number     INTEGER NOT NULL,
-        role            TEXT NOT NULL,
-        content         TEXT NOT NULL,
-        audio_url       TEXT,
-        timestamp       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )""")
-
-    c.execute(f"""
-    CREATE TABLE IF NOT EXISTS otis_settings (
-        id                      {pk},
-        org_id                  INTEGER UNIQUE REFERENCES organizations(id),
-        user_id                 INTEGER UNIQUE REFERENCES users(id),
-
-        enabled                 INTEGER DEFAULT 1,
-        admin_only              INTEGER DEFAULT 1,
-
-        wake_word               TEXT DEFAULT 'Hey Otis',
-        voice_id                TEXT DEFAULT 'en-IN-male',
-        voice_speed             REAL DEFAULT 1.0,
-        voice_pitch             REAL DEFAULT 1.0,
-
-        auto_execute_actions    INTEGER DEFAULT 0,
-        require_confirmation    INTEGER DEFAULT 1,
-
-        max_session_duration    INTEGER DEFAULT 600,
-        idle_timeout_seconds    INTEGER DEFAULT 30,
-
-        settings_json           TEXT DEFAULT '{{}}',
-
-        created_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )""")
-
-    c.execute(f"""
-    CREATE TABLE IF NOT EXISTS otis_analytics (
-        id                      {pk},
-        org_id                  INTEGER REFERENCES organizations(id),
-        date                    TEXT NOT NULL,
-
-        total_sessions          INTEGER DEFAULT 0,
-        total_commands          INTEGER DEFAULT 0,
-        successful_commands     INTEGER DEFAULT 0,
-        failed_commands         INTEGER DEFAULT 0,
-
-        avg_latency_ms          REAL DEFAULT 0,
-        total_cost_usd          REAL DEFAULT 0,
-
-        most_used_function      TEXT,
-        total_active_users      INTEGER DEFAULT 0,
-
-        created_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )""")
-
     # ── Auth Security Tables ──────────────────────────────────────────────────
     # token_blacklist: persists revoked JWT hashes across processes/instances.
     # Rows are expired by the keepalive thread every 4 minutes.
@@ -851,17 +806,6 @@ def _create_indexes(c, pg=False):
         ("idx_audit_logs_created_at",         "audit_logs", "created_at"),
         # webhook_subscriptions
         ("idx_webhooks_org_event",            "webhook_subscriptions", "org_id"),
-        # OTIS voice agent
-        ("idx_otis_sessions_org_id",          "otis_sessions", "org_id"),
-        ("idx_otis_sessions_user_id",         "otis_sessions", "user_id"),
-        ("idx_otis_sessions_session_id",      "otis_sessions", "session_id"),
-        ("idx_otis_sessions_status",          "otis_sessions", "status"),
-        ("idx_otis_commands_org_id",          "otis_commands", "org_id"),
-        ("idx_otis_commands_user_id",         "otis_commands", "user_id"),
-        ("idx_otis_commands_session_id",      "otis_commands", "session_id"),
-        ("idx_otis_commands_function",        "otis_commands", "function_called"),
-        ("idx_otis_conversations_session",    "otis_conversations", "session_id"),
-        ("idx_otis_analytics_org_date",       "otis_analytics", "org_id"),
         # auth security tables
         ("idx_token_blacklist_expires",       "token_blacklist", "expires_at"),
         ("idx_auth_codes_user_type",          "auth_codes", "user_id"),
@@ -879,6 +823,45 @@ def _create_indexes(c, pg=False):
         c.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_org_members_org_user ON org_members (org_id, user_id)")
     except Exception as e:
         logger.debug("[DB] Unique index uq_org_members_org_user skipped: %s", e)
+
+    # ── Composite indexes for multi-column WHERE + ORDER BY patterns ──────────
+    # Single-column indexes above let Postgres find rows. These composite indexes
+    # let Postgres satisfy the full WHERE + ORDER BY from the index alone —
+    # no separate sort step, no table heap access for covered columns.
+    # All use CREATE INDEX IF NOT EXISTS + try/except: safe on every startup,
+    # silently skipped if a migrated column (org_id, approval_status) does not
+    # exist yet on a fresh database (it will succeed on next startup after migration).
+    _composite_indexes = [
+        # "My trips" list — user filter + date sort (trips.py:list_trips)
+        ("idx_travel_requests_user_created",
+         "travel_requests (user_id, created_at DESC)"),
+        # Admin/manager trips list — org filter + date sort (dashboard)
+        ("idx_travel_requests_org_created",
+         "travel_requests (org_id, created_at DESC)"),
+        # Analytics compliance count — org filter + status group (analytics_agent)
+        ("idx_travel_requests_org_status",
+         "travel_requests (org_id, status)"),
+        # Approval queue — pending approvals for a manager (chat_agent, approvals route)
+        ("idx_approvals_approver_status",
+         "approvals (approver_id, status)"),
+        # Expense history — user filter + date sort (expenses route)
+        ("idx_expenses_user_created",
+         "expenses_db (user_id, created_at DESC)"),
+        # Expense approval queue — org filter + approval status (expense_approvals route)
+        ("idx_expenses_org_approval_status",
+         "expenses_db (org_id, approval_status)"),
+        # Notification badge + list — user filter + unread flag + date sort
+        ("idx_notifications_user_read_created",
+         "notifications (user_id, read, created_at DESC)"),
+        # Chat history — user filter + date sort (chat_agent context builder)
+        ("idx_chat_messages_user_created",
+         "chat_messages (user_id, created_at DESC)"),
+    ]
+    for idx_name, spec in _composite_indexes:
+        try:
+            c.execute(f"CREATE INDEX IF NOT EXISTS {idx_name} ON {spec}")
+        except Exception as e:
+            logger.debug("[DB] Composite index %s skipped: %s", idx_name, e)
 
 
 # ── Migrations: safely add columns to existing databases ───────────────────────
@@ -961,9 +944,6 @@ def _apply_migrations_pg(db):
     _add_col("organizations", "status",        "TEXT DEFAULT 'active'")
     _add_col("organizations", "features_json", "TEXT DEFAULT '{}'")
     _add_col("organizations", "notes",         "TEXT")
-
-    # otis_settings — flexible JSON blob for custom per-user settings
-    _add_col("otis_settings", "settings_json", "TEXT DEFAULT '{}'")
 
     # Sync full_name from name for existing users
     db.execute("UPDATE users SET full_name = name WHERE full_name IS NULL OR full_name = ''")
@@ -1060,9 +1040,6 @@ def _apply_migrations(db, c):
     _add_col("organizations", "status",        "TEXT DEFAULT 'active'")
     _add_col("organizations", "features_json", "TEXT DEFAULT '{}'")
     _add_col("organizations", "notes",         "TEXT")
-
-    # otis_settings — flexible JSON blob for custom per-user settings
-    _add_col("otis_settings", "settings_json", "TEXT DEFAULT '{}'")
 
     # Sync full_name from name for existing users
     c.execute("""

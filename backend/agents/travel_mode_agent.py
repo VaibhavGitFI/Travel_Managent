@@ -34,8 +34,15 @@ def recommend_travel_mode(trip_details: dict, model=None) -> dict:
     distance_km = maps.get_distance_km(origin, destination) if origin and destination else 0
     region = _detect_region(origin, destination)
 
-    # Determine recommended mode
+    # Honour user's preferred mode (e.g. "flight", "train", "bus", "car"/"cab")
+    preferred_mode = (trip_details.get("preferred_mode") or "").lower().strip()
+    if preferred_mode == "car":
+        preferred_mode = "cab"  # normalise frontend value
+
+    # Determine recommended mode (distance-based, overridden by user preference)
     mode = _select_mode(distance_km, num_travelers, purpose)
+    if preferred_mode and preferred_mode in ("flight", "train", "bus", "cab"):
+        mode = {"primary": preferred_mode, "reason": f"Selected by user"}
 
     # Build response
     result = {
@@ -46,10 +53,12 @@ def recommend_travel_mode(trip_details: dict, model=None) -> dict:
         "modes": {},
         "ai_tip": "",
         "data_source": "live",
+        "user_preference": preferred_mode or None,
     }
 
     # ── Flights ──────────────────────────────────────────────
-    if distance_km > 300 or mode["primary"] == "flight":
+    # Show flights if: distance warrants it, AI recommends it, or user explicitly asked
+    if distance_km > 300 or mode["primary"] == "flight" or preferred_mode == "flight":
         origin_code = get_airport_code(origin)
         dest_code = get_airport_code(destination)
         flight_data = flights_svc.search_flights(

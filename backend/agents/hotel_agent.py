@@ -59,6 +59,7 @@ def search_hotels(data: dict) -> dict:
     is_rural = data.get("is_rural", False)
     require_veg = data.get("require_veg", False)
     client_address = data.get("client_address", "")
+    client_place_id = data.get("client_place_id", "")
     num_travelers = int(data.get("num_travelers", 1))
 
     # Resolve dates
@@ -75,18 +76,51 @@ def search_hotels(data: dict) -> dict:
     BUDGET_CAPS = {"budget": 4000, "moderate": 10000, "premium": 25000, "luxury": None}
     budget_max = BUDGET_CAPS.get(budget)
 
-    # Use Google Places for live hotel data; fall back to curated list
+    # --- Resolve meeting location coordinates early ---
+    # When the user picks a specific meeting spot we anchor the hotel search
+    # to that location so the Places radius captures hotels near there, not
+    # just near the city center.
+    meeting_coords = None
+    if client_address and maps.configured:
+        if client_place_id:
+            meeting_coords = maps.geocode_by_place_id(client_place_id)
+        else:
+            meeting_coords = maps.geocode(
+                client_address,
+                components=f"locality:{destination}" if destination else None,
+            )
+        # If resolution failed (fallback), discard so we don't bias the search wrongly
+        if meeting_coords and meeting_coords.get("source") == "fallback":
+            meeting_coords = None
+
+    # Use Google Places for live hotel data; fall back to curated list.
+    # Pass meeting_coords so the Places search is anchored to the meeting area.
     if maps.configured:
-        hotels = maps.search_hotels(destination, budget_max=budget_max, limit=8)
+        hotels = maps.search_hotels(
+            destination, budget_max=budget_max, limit=8,
+            coords=meeting_coords,
+        )
     else:
         hotels = []
 
     if not hotels:
         hotels = _fallback_hotels(destination, budget_max, limit=8)
 
-    # Proximity filter for rural trips
-    if is_rural and client_address and maps.configured:
-        hotels = _filter_by_proximity(hotels, client_address, max_km=2.0)
+    # Sort by proximity — meeting location is always within the destination city.
+    # Prefer place_id-based geocoding for the most precise pin.
+    # For rural sites use a strict 2 km radius filter instead.
+    if meeting_coords:
+        if is_rural:
+            hotels = _filter_by_proximity(hotels, client_address, max_km=2.0)
+        else:
+            # Coords already resolved — pass them directly so _soft_sort doesn't re-geocode
+            hotels = _soft_sort_by_coords(hotels, meeting_coords, destination)
+    elif client_address and maps.configured:
+        if is_rural:
+            hotels = _filter_by_proximity(hotels, client_address, max_km=2.0)
+        else:
+            hotels = _soft_sort_by_proximity(
+                hotels, client_address, destination, client_place_id=client_place_id)
     elif is_rural and client_address:
         for h in hotels:
             h["rural_note"] = ("Hotels near client site preferred (2 km radius). "
@@ -104,13 +138,15 @@ def search_hotels(data: dict) -> dict:
             hotel["booking_link"] = _build_booking_link(
                 hotel.get("name", ""), destination, check_in_str, check_out_str)
 
-    # PG / long-stay options for 5+ days
+    # PG / long-stay options for 5+ days — pass meeting coords so PGs
+    # are also anchored near the meeting location, not just city centre.
     pg_options = []
     if duration_days >= 5:
         pg_options = search_pg_options({
             "destination": destination,
             "duration_days": duration_days,
             "budget": budget,
+            "meeting_coords": meeting_coords,   # None when no meeting pin set
         })
 
     # AI recommendation
@@ -134,18 +170,29 @@ def search_hotels(data: dict) -> dict:
 
 
 def search_pg_options(data: dict) -> list:
-    """Search PG / serviced apartment options for long stays."""
+    """Search PG / serviced apartment options for long stays.
+
+    data may include:
+      meeting_coords: {lat, lng} — when set, search is anchored to the meeting
+                                   location pin so PGs near that area surface first.
+    """
     destination = data.get("destination", "")
     duration_days = int(data.get("duration_days", 7))
     budget = data.get("budget", "moderate")
+    meeting_coords = data.get("meeting_coords")   # {lat, lng} or None
 
     MONTHLY_BUDGET_CAPS = {"budget": 15000, "moderate": 30000, "premium": 60000, "luxury": None}
     budget_monthly = MONTHLY_BUDGET_CAPS.get(budget)
 
-    # Try real data via Google Places first
+    # Try real data via Google Places first, anchored to meeting location when available
     options = []
     if maps.configured:
-        options = maps.search_pg_options(destination, budget_monthly=budget_monthly, limit=6)
+        options = maps.search_pg_options(
+            destination,
+            budget_monthly=budget_monthly,
+            limit=6,
+            coords=meeting_coords,
+        )
 
     # Fall back to curated list
     if not options:
@@ -188,6 +235,69 @@ def _fallback_pg_options(destination: str, budget_monthly: int) -> list:
             continue
         options.append({**pg, "area": destination, "source": "fallback"})
     return options
+
+
+def _soft_sort_by_coords(hotels: list, meeting_coords: dict, destination: str) -> list:
+    """Sort hotels by distance from pre-resolved meeting coordinates.
+    Skips geocoding since coords are already known — avoids the extra API call."""
+    try:
+        origin = f"{meeting_coords['lat']},{meeting_coords['lng']}"
+        for h in hotels:
+            if h.get("latitude") and h.get("longitude"):
+                dest_str = f"{h['latitude']},{h['longitude']}"
+            else:
+                dest_str = f"{h.get('name', '')}, {h.get('area', destination)}, {destination}"
+            try:
+                dist = maps.get_distance_km(origin, dest_str)
+                h["distance_from_meeting_km"] = round(dist, 1)
+                h["distance_from_meeting"] = f"{dist:.1f} km from meeting location"
+            except Exception:
+                h["distance_from_meeting_km"] = 999
+        hotels.sort(key=lambda h: h.get("distance_from_meeting_km", 999))
+    except Exception:
+        pass
+    return hotels
+
+
+def _soft_sort_by_proximity(hotels: list, client_address: str, destination: str,
+                             client_place_id: str = None) -> list:
+    """Sort hotels by distance from client_address (same city — best-effort).
+
+    When client_place_id is provided (from Google Places autocomplete), we use
+    geocode/json?place_id=XXX for the exact confirmed Google pin rather than
+    ambiguous text geocoding.
+    """
+    try:
+        # Prefer place_id geocoding when available — exact confirmed Google pin
+        if client_place_id and maps.configured:
+            client_coords = maps.geocode_by_place_id(client_place_id)
+        else:
+            # Component-filtered geocoding: pins the address to the destination city
+            # e.g. "GTP Colony" + components="locality:Dhule" → precise Dhule result
+            # This prevents matching a same-named area in another city.
+            components = f"locality:{destination}" if destination else None
+            client_coords = maps.geocode(client_address, components=components)
+
+        if client_coords.get("source") == "fallback" or not client_coords.get("lat"):
+            return hotels
+
+        origin = f"{client_coords['lat']},{client_coords['lng']}"
+        for h in hotels:
+            # Prefer lat/lng already stored on the hotel (from Places API); fall back to name lookup
+            if h.get("latitude") and h.get("longitude"):
+                dest_str = f"{h['latitude']},{h['longitude']}"
+            else:
+                dest_str = f"{h.get('name', '')}, {h.get('area', destination)}, {destination}"
+            try:
+                dist = maps.get_distance_km(origin, dest_str)
+                h["distance_from_meeting_km"] = round(dist, 1)
+                h["distance_from_meeting"] = f"{dist:.1f} km from meeting location"
+            except Exception:
+                h["distance_from_meeting_km"] = 999
+        hotels.sort(key=lambda h: h.get("distance_from_meeting_km", 999))
+    except Exception:
+        pass
+    return hotels
 
 
 def _filter_by_proximity(hotels: list, client_address: str, max_km: float = 2.0) -> list:

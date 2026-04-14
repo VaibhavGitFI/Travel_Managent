@@ -3,9 +3,19 @@ TravelSync Pro — Analytics Agent
 Schema-tolerant analytics for dashboard, spend, and compliance views.
 """
 import json
+import logging
 from datetime import datetime, timedelta
 from database import get_db, table_columns as _tc
 from services.currency_service import currency
+from services.cache_service import CacheStore
+
+logger = logging.getLogger(__name__)
+
+# Analytics result caches — short TTL keeps data feeling live while cutting DB load
+# 60s for dashboard/spend/compliance (high-frequency endpoints)
+# 300s for carbon (expensive Maps + CPU computation, less time-sensitive)
+_stats_cache  = CacheStore(namespace="analytics_stats",   ttl=60,  maxsize=200)
+_carbon_cache = CacheStore(namespace="analytics_carbon",  ttl=300, maxsize=100)
 
 
 def _table_columns(db, table: str) -> set[str]:
@@ -55,7 +65,8 @@ def _compliance_counts(db, request_cols: set[str], user_id: int = None, org_id: 
             f"SELECT policy_compliance, COUNT(*) FROM travel_requests{where_clause} GROUP BY policy_compliance",
             tuple(params),
         ).fetchall()
-        for status, cnt in rows:
+        for row in rows:
+            status, cnt = row[0], row[1]
             key = (status or "unknown").lower()
             if key in counts:
                 counts[key] += int(cnt)
@@ -64,24 +75,50 @@ def _compliance_counts(db, request_cols: set[str], user_id: int = None, org_id: 
         return counts
 
     if "policy_compliance_json" in request_cols:
-        rows = db.execute(
-            f"SELECT policy_compliance_json FROM travel_requests{where_clause}",
-            tuple(params),
-        ).fetchall()
-        for r in rows:
-            raw = r[0] if not isinstance(r, dict) else r.get("policy_compliance_json")
-            if not raw:
-                counts["unknown"] += 1
-                continue
+        # Push JSON extraction + aggregation into SQL — one GROUP BY instead of N Python parse()
+        # Try each DB's JSON syntax; fall back to bounded Python loop as last resort.
+        _sql_done = False
+        for _json_expr in (
+            "json_extract(policy_compliance_json, '$.overall_status')",  # SQLite / JSON1 extension
+            "policy_compliance_json::jsonb->>'overall_status'",           # PostgreSQL / Supabase
+        ):
             try:
-                parsed = json.loads(raw)
-                key = (parsed.get("overall_status") or "unknown").lower()
-                if key in counts:
-                    counts[key] += 1
-                else:
+                rows = db.execute(
+                    f"SELECT {_json_expr}, COUNT(*)"
+                    f" FROM travel_requests{where_clause} GROUP BY 1",
+                    tuple(params),
+                ).fetchall()
+                for row in rows:
+                    status, cnt = row[0], row[1]
+                    key = (status or "unknown").lower()
+                    if key in counts:
+                        counts[key] += int(cnt)
+                    else:
+                        counts["unknown"] += int(cnt)
+                _sql_done = True
+                break
+            except Exception:
+                continue
+        if not _sql_done:
+            # Bounded fallback: cap at 10 000 rows to prevent OOM on large tables
+            rows = db.execute(
+                f"SELECT policy_compliance_json FROM travel_requests{where_clause} LIMIT 10000",
+                tuple(params),
+            ).fetchall()
+            for r in rows:
+                raw = r[0] if not isinstance(r, dict) else r.get("policy_compliance_json")
+                if not raw:
                     counts["unknown"] += 1
-            except (TypeError, json.JSONDecodeError):
-                counts["unknown"] += 1
+                    continue
+                try:
+                    parsed = json.loads(raw)
+                    key = (parsed.get("overall_status") or "unknown").lower()
+                    if key in counts:
+                        counts[key] += 1
+                    else:
+                        counts["unknown"] += 1
+                except (TypeError, json.JSONDecodeError):
+                    counts["unknown"] += 1
         return counts
 
     total = db.execute(
@@ -94,7 +131,13 @@ def _compliance_counts(db, request_cols: set[str], user_id: int = None, org_id: 
 
 def get_dashboard_stats(user_id: int = None) -> dict:
     """Dashboard KPI summary."""
+    _cache_key = f"dashboard:{user_id}"
+    _cached = _stats_cache.get(_cache_key)
+    if _cached:
+        return _cached
+
     db = get_db()
+    _result = None
     try:
         request_cols = _table_columns(db, "travel_requests")
         expense_cols = _table_columns(db, "expenses_db")
@@ -270,9 +313,18 @@ def get_dashboard_stats(user_id: int = None) -> dict:
             pass
 
         # ── Expenses pending review ───────────────────────────────
+        # Column name differs by schema: Supabase uses verification_status,
+        # older SQLite schema used status. Check both.
         expenses_pending = 0
         try:
-            if "status" in expense_cols:
+            if "verification_status" in expense_cols:
+                expenses_pending = int(db.execute(
+                    f"SELECT COUNT(*) FROM expenses_db{exp_where_clause}"
+                    f"{' AND ' if exp_where_clause else ' WHERE '}"
+                    f"verification_status IN ('pending','review_pending','flagged')",
+                    tuple(exp_params),
+                ).fetchone()[0] or 0)
+            elif "status" in expense_cols:
                 expenses_pending = int(db.execute(
                     f"SELECT COUNT(*) FROM expenses_db{exp_where_clause}"
                     f"{' AND ' if exp_where_clause else ' WHERE '}"
@@ -303,11 +355,14 @@ def get_dashboard_stats(user_id: int = None) -> dict:
             "success": True,
         }
         payload["stats"] = payload.copy()
-        return payload
+        _result = payload
+        return _result
     except Exception as e:
         return {"success": False, "error": str(e), "stats": {}}
     finally:
         db.close()
+        if _result is not None:
+            _stats_cache.set(_cache_key, _result)
 
 
 def get_spend_analysis(user_id: int = None, org_id: int = None, role: str = "employee") -> dict:
@@ -318,7 +373,13 @@ def get_spend_analysis(user_id: int = None, org_id: int = None, role: str = "emp
       - employees: see only their own expenses
       - no org_id: fall back to user_id scoping
     """
+    _cache_key = f"spend:{role}:{org_id}:{user_id}"
+    _cached = _stats_cache.get(_cache_key)
+    if _cached:
+        return _cached
+
     db = get_db()
+    _result = None
     try:
         expense_cols = _table_columns(db, "expenses_db")
         request_cols = _table_columns(db, "travel_requests")
@@ -406,7 +467,7 @@ def get_spend_analysis(user_id: int = None, org_id: int = None, role: str = "emp
             ]
 
         total_spend = float(sum(i["amount"] for i in category_breakdown))
-        return {
+        _result = {
             "success": True,
             "monthly_trend": monthly_trend,
             "category_breakdown": category_breakdown,
@@ -415,10 +476,13 @@ def get_spend_analysis(user_id: int = None, org_id: int = None, role: str = "emp
             "total_spend": total_spend,
             "total_spend_formatted": _format_amount(total_spend),
         }
+        return _result
     except Exception as e:
         return {"success": False, "error": str(e)}
     finally:
         db.close()
+        if _result is not None:
+            _stats_cache.set(_cache_key, _result)
 
 
 def get_budget_tracking(request_id: str = None) -> dict:
@@ -499,7 +563,13 @@ def get_policy_compliance_scorecard(user_id: int = None, org_id: int = None, rol
       - admins/managers with org_id: org-wide compliance
       - employees: own compliance only
     """
+    _cache_key = f"compliance:{role}:{org_id}:{user_id}"
+    _cached = _stats_cache.get(_cache_key)
+    if _cached:
+        return _cached
+
     db = get_db()
+    _result = None
     try:
         request_cols = _table_columns(db, "travel_requests")
         expense_cols = _table_columns(db, "expenses_db")
@@ -554,7 +624,7 @@ def get_policy_compliance_scorecard(user_id: int = None, org_id: int = None, rol
             {"name": "No non-compliant backlog spike", "passed": compliance["non_compliant"] <= max(1, compliance["compliant"])},
         ]
 
-        return {
+        _result = {
             "success": True,
             "overall_score": overall_score,
             "compliance_rate": compliance_rate,
@@ -574,10 +644,13 @@ def get_policy_compliance_scorecard(user_id: int = None, org_id: int = None, rol
             "checks": checks,
             "status": "excellent" if overall_score >= 80 else "good" if overall_score >= 60 else "needs_improvement",
         }
+        return _result
     except Exception as e:
         return {"success": False, "error": str(e)}
     finally:
         db.close()
+        if _result is not None:
+            _stats_cache.set(_cache_key, _result)
 
 
 def get_carbon_analytics(user_id: int = None, role: str = "employee") -> dict:
@@ -585,6 +658,11 @@ def get_carbon_analytics(user_id: int = None, role: str = "employee") -> dict:
     Compute carbon footprint analytics.
     Returns monthly CO₂ trend, department comparison, and greener-alternative suggestions.
     """
+    _cache_key = f"carbon:{role}:{user_id}"
+    _cached = _carbon_cache.get(_cache_key)
+    if _cached:
+        return _cached
+
     from agents.travel_mode_agent import calculate_carbon
     from services.maps_service import maps
 
@@ -689,7 +767,7 @@ def get_carbon_analytics(user_id: int = None, role: str = "employee") -> dict:
         for d, v in sorted(dept_totals.items(), key=lambda x: -x[1])
     ]
 
-    return {
+    _result = {
         "success": True,
         "total_co2_kg": round(total_co2, 2),
         "total_trips_analyzed": len(rows),
@@ -700,6 +778,8 @@ def get_carbon_analytics(user_id: int = None, role: str = "employee") -> dict:
         "top_trips": sorted(trip_carbon_list, key=lambda x: -x["co2_kg"])[:10],
         "greener_suggestions": greener_suggestions,
     }
+    _carbon_cache.set(_cache_key, _result)
+    return _result
 
 
 def _get_policy() -> dict:

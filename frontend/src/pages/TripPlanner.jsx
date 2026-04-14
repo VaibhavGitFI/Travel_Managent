@@ -4,7 +4,7 @@ import {
   Search, ChevronRight, Info, Clock, Sparkles, Lightbulb,
   ArrowRightLeft, Users, Briefcase, StickyNote, Star,
   Wind, Droplets, ThermometerSun, ExternalLink, Brain, ArrowRight,
-  Zap, ChevronDown, ChevronUp,
+  Zap, ChevronDown, ChevronUp, CheckSquare, BookOpen, AlertTriangle, CheckCircle,
 } from 'lucide-react'
 import toast from 'react-hot-toast'
 import { planTrip, getTripRecommendations } from '../api/trips'
@@ -102,24 +102,10 @@ export default function TripPlanner() {
     : null
 
   return (
-    <div className="mx-auto w-full max-w-7xl space-y-5">
-      {/* Page header */}
-      <div className="flex flex-col gap-1">
-        <div className="flex items-center gap-2">
-          <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-gradient-to-br from-blue-500 to-cyan-500">
-            <Brain size={14} className="text-white" />
-          </div>
-          <h1 className="font-heading text-xl font-bold text-gray-900">AI Trip Planner</h1>
-          <span className="rounded-full bg-blue-50 border border-blue-200 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-blue-600">
-            AI Powered
-          </span>
-        </div>
-        <p className="text-sm text-gray-500">Generate a complete trip plan with flights, hotels, weather and transport in seconds.</p>
-      </div>
-
+    <div className="mx-auto w-full max-w-7xl">
       <div className="grid grid-cols-1 gap-5 lg:grid-cols-12">
-        {/* ── Left: Form ──────────────────────────────── */}
-        <div className="lg:col-span-5 space-y-4">
+        {/* ── Left: Form — sticky, no internal scroll so form never moves ── */}
+        <div className="lg:col-span-4 space-y-4 lg:sticky lg:top-4 lg:self-start">
           <form onSubmit={handlePlan} className="rounded-xl border border-gray-200 bg-white shadow-card overflow-hidden">
             {/* Form header */}
             <div className="border-b border-gray-100 bg-gray-50/50 px-5 py-4">
@@ -251,15 +237,20 @@ export default function TripPlanner() {
             </div>
           </form>
 
-          {/* AI Recommendations */}
-          {recs?.success && <RecsPanel recs={recs} />}
         </div>
 
         {/* ── Right: Results ──────────────────────────── */}
-        <div className="lg:col-span-7 space-y-4">
+        <div className={cn(
+          'lg:col-span-8',
+          results
+            ? 'lg:sticky lg:top-4 lg:self-start lg:h-[calc(100dvh-5.5rem)] lg:flex lg:flex-col lg:overflow-hidden'
+            : 'space-y-4'
+        )}>
           {loading && <LoadingState />}
           {!loading && !results && <EmptyState />}
-          {results && <TripResults results={results} />}
+          {results && <TripResults key={results?.metadata?.destination + (results?.metadata?.travel_dates || '')} results={results} recs={recs} />}
+          {/* Show recs panel on the right even before trip is planned */}
+          {!results && recs?.success && <RecsPanel recs={recs} />}
         </div>
       </div>
     </div>
@@ -391,83 +382,168 @@ function TipCard({ icon: Icon, color, title, tip }) {
 }
 
 // ── Trip Results ────────────────────────────────────────────
-function TripResults({ results }) {
+const RESULT_TABS = [
+  { id: 'transport', label: 'Transport', icon: Plane      },
+  { id: 'stay',      label: 'Stay',      icon: Hotel      },
+  { id: 'weather',   label: 'Weather',   icon: CloudSun   },
+  { id: 'info',      label: 'Info',      icon: BookOpen   },
+  { id: 'tips',      label: 'AI Tips',   icon: Lightbulb  },
+]
+
+function TripResults({ results, recs }) {
   const r = results || {}
-  const modes = r.travel_options || r.travel?.modes || {}
-  const flights = modes.flights || modes.flight?.options || []
-  const hotels = Array.isArray(r.hotels) ? r.hotels : (r.hotels?.hotels || [])
-  const pgOptions = r.pg_options || r.hotels?.pg_options || []
-  const weather = normalizeWeather(r.weather)
+  const modes       = r.travel_options || r.travel?.modes || {}
+  const flights     = modes.flights || modes.flight?.options || []
+  const hotels      = Array.isArray(r.hotels) ? r.hotels : (r.hotels?.hotels || [])
+  const pgOptions   = r.pg_options || r.hotels?.pg_options || []
+  const weather     = normalizeWeather(r.weather)
   const summaryText = getSummaryText(r)
 
+  const hasTransport = flights.length > 0 || !!modes.train || !!modes.bus || !!modes.cab
+  const hasStay      = hotels.length > 0 || pgOptions.length > 0
+  const hasWeather   = !!weather
+  const hasInfo      = (r.checklist && !r.checklist.error) ||
+                       (r.guide && !r.guide.error && (r.guide.tourist_spots?.length > 0 || r.guide.ai_insights))
+  const hasTips      = !!(recs?.success)
+
+  const available = { transport: hasTransport, stay: hasStay, weather: hasWeather, info: hasInfo, tips: hasTips }
+  const visibleTabs = RESULT_TABS.filter(t => available[t.id])
+  const defaultTab  = visibleTabs[0]?.id || 'transport'
+  const [activeTab, setActiveTab] = useState(defaultTab)
+
+  // If the active tab isn't available in new results, fall back to first available
+  const safeTab = available[activeTab] ? activeTab : defaultTab
+
   return (
-    <div className="space-y-4 animate-fade-in">
-      {/* Summary */}
-      {summaryText && (
-        <div className="relative overflow-hidden rounded-xl bg-gradient-to-br from-brand-dark to-[#1a2744] p-5 shadow-card">
-          <div className="absolute top-0 right-0 h-20 w-20 rounded-full bg-brand-cyan/10 blur-2xl" />
-          <div className="relative flex items-start gap-3">
-            <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-brand-cyan/15">
-              <Brain size={16} className="text-brand-cyan" />
-            </div>
-            <div>
-              <h4 className="text-sm font-semibold text-white">AI Trip Summary</h4>
-              <p className="mt-1 text-sm leading-relaxed text-gray-300">{summaryText}</p>
-            </div>
-          </div>
-          {r.source && r.source !== 'fallback' && (
-            <div className="mt-3 flex items-center gap-1.5">
-              <span className="h-1.5 w-1.5 rounded-full bg-green-400" />
-              <span className="text-[10px] font-medium text-gray-400">Live data</span>
-            </div>
-          )}
+    <div className="flex flex-col h-full min-h-0 animate-fade-in">
+
+      {/* ── FIXED: AI Summary card ───────────────────────── */}
+      {r.trip_summary && (
+        <div className="shrink-0">
+          <TripSummaryCard summary={r.trip_summary} isLive={r.source && r.source !== 'fallback'} />
         </div>
       )}
 
-      {/* Flights */}
-      {flights.length > 0 && (
-        <ResultSection icon={Plane} title="Flight Options" count={flights.length} accent="blue">
-          {flights.slice(0, 5).map((f, i) => <FlightCard key={i} flight={f} />)}
-        </ResultSection>
+      {/* ── FIXED: Tab navigation ────────────────────────── */}
+      {visibleTabs.length > 0 && (
+        <div className="shrink-0 mt-4">
+          <div className="flex gap-1 rounded-xl border border-gray-200 bg-white p-1 shadow-card">
+            {visibleTabs.map(({ id, label, icon: Icon }) => (
+              <button
+                key={id}
+                type="button"
+                onClick={() => setActiveTab(id)}
+                className={cn(
+                  'flex flex-1 items-center justify-center gap-1.5 rounded-lg px-3 py-2 text-xs font-semibold transition-all',
+                  safeTab === id
+                    ? 'bg-gradient-to-r from-blue-600 to-cyan-500 text-white shadow-sm'
+                    : 'text-gray-500 hover:bg-gray-50 hover:text-gray-800'
+                )}
+              >
+                <Icon size={13} />
+                <span className="hidden sm:inline">{label}</span>
+              </button>
+            ))}
+          </div>
+        </div>
       )}
 
-      {/* Train / Bus / Cab */}
-      {modes.train && (
-        <ResultSection icon={Train} title="Train Options" accent="emerald">
-          <ModeCard mode={modes.train} type="train" />
-        </ResultSection>
-      )}
-      {modes.bus && (
-        <ResultSection icon={Bus} title="Bus Options" accent="emerald">
-          <ModeCard mode={modes.bus} type="bus" />
-        </ResultSection>
-      )}
-      {modes.cab && (
-        <ResultSection icon={Car} title="Cab / Self-Drive" accent="emerald">
-          <ModeCard mode={modes.cab} type="cab" />
-        </ResultSection>
-      )}
+      {/* ── SCROLLABLE: Tab content ──────────────────────── */}
+      <div className="flex-1 min-h-0 overflow-y-auto mt-4 pb-4 pr-0.5">
 
-      {/* Hotels */}
-      {hotels.length > 0 && (
-        <ResultSection icon={Hotel} title="Hotel Options" count={hotels.length} accent="violet">
-          {hotels.slice(0, 5).map((h, i) => <HotelCard key={i} hotel={h} />)}
-        </ResultSection>
-      )}
+        {/* Transport tab */}
+        {safeTab === 'transport' && (
+          <div className="space-y-4">
+            {flights.length > 0 && (
+              <ResultSection icon={Plane} title="Flight Options" count={flights.length} accent="blue">
+                {flights.slice(0, 5).map((f, i) => <FlightCard key={i} flight={f} />)}
+              </ResultSection>
+            )}
+            {modes.train && (
+              <ResultSection icon={Train} title="Train Options" accent="emerald">
+                <ModeCard mode={modes.train} type="train" />
+              </ResultSection>
+            )}
+            {modes.bus && (
+              <ResultSection icon={Bus} title="Bus Options" accent="emerald">
+                <ModeCard mode={modes.bus} type="bus" />
+              </ResultSection>
+            )}
+            {modes.cab && (
+              <ResultSection icon={Car} title="Cab / Self-Drive" accent="emerald">
+                <ModeCard mode={modes.cab} type="cab" />
+              </ResultSection>
+            )}
+            {!hasTransport && <EmptyTabState label="No transport options found for this route." />}
+          </div>
+        )}
 
-      {/* PG / Serviced */}
-      {pgOptions.length > 0 && (
-        <ResultSection icon={Hotel} title="PG / Serviced Apartments" count={pgOptions.length} accent="violet">
-          {pgOptions.slice(0, 4).map((pg, i) => <HotelCard key={i} hotel={pg} />)}
-        </ResultSection>
-      )}
+        {/* Stay tab */}
+        {safeTab === 'stay' && (
+          <div className="space-y-4">
+            {hotels.length > 0 && (
+              <ResultSection icon={Hotel} title="Hotel Options" count={hotels.length} accent="violet">
+                {hotels.slice(0, 5).map((h, i) => <HotelCard key={i} hotel={h} />)}
+              </ResultSection>
+            )}
+            {pgOptions.length > 0 && (
+              <ResultSection icon={Hotel} title="PG / Serviced Apartments" count={pgOptions.length} accent="violet">
+                {pgOptions.slice(0, 4).map((pg, i) => <HotelCard key={i} hotel={pg} />)}
+              </ResultSection>
+            )}
+            {!hasStay && <EmptyTabState label="No accommodation options found." />}
+          </div>
+        )}
 
-      {/* Weather */}
-      {weather && (
-        <ResultSection icon={CloudSun} title="Weather Forecast" accent="amber">
-          <WeatherCard weather={weather} />
-        </ResultSection>
-      )}
+        {/* Weather tab */}
+        {safeTab === 'weather' && (
+          <div className="space-y-4">
+            {weather
+              ? <ResultSection icon={CloudSun} title="Weather Forecast" accent="amber"><WeatherCard weather={weather} /></ResultSection>
+              : <EmptyTabState label="Weather data unavailable for these dates." />
+            }
+          </div>
+        )}
+
+        {/* Info tab (Checklist + Guide + Validation) */}
+        {safeTab === 'info' && (
+          <div className="space-y-4">
+            {r.validation?.validation_flags?.length > 0 && (
+              <ValidationPanel flags={r.validation.validation_flags} overall={r.validation.overall} />
+            )}
+            {r.checklist && !r.checklist.error && (
+              <ResultSection icon={CheckSquare} title="Packing Checklist" accent="emerald">
+                <ChecklistPanel checklist={r.checklist} />
+              </ResultSection>
+            )}
+            {r.guide && !r.guide.error && (r.guide.tourist_spots?.length > 0 || r.guide.ai_insights) && (
+              <ResultSection icon={BookOpen} title="Destination Guide" accent="violet">
+                <GuidePanel guide={r.guide} />
+              </ResultSection>
+            )}
+            {!hasInfo && <EmptyTabState label="No additional info available." />}
+          </div>
+        )}
+
+        {/* AI Tips tab */}
+        {safeTab === 'tips' && (
+          <div className="space-y-4">
+            {recs?.success
+              ? <RecsPanel recs={recs} />
+              : <EmptyTabState label="Click AI Tips on the form to load recommendations." />
+            }
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ── Empty tab placeholder ───────────────────────────────────
+function EmptyTabState({ label }) {
+  return (
+    <div className="rounded-xl border border-dashed border-gray-200 bg-gray-50/50 py-12 text-center">
+      <p className="text-sm text-gray-400">{label}</p>
     </div>
   )
 }
@@ -750,6 +826,262 @@ function WeatherCard({ weather: w }) {
   )
 }
 
+// ── Validation Panel ────────────────────────────────────────
+function ValidationPanel({ flags, overall }) {
+  const isPass = overall === 'pass' || !overall
+  return (
+    <div className={`rounded-xl border px-5 py-4 ${isPass ? 'border-green-200 bg-green-50' : 'border-amber-200 bg-amber-50'}`}>
+      <div className="flex items-center gap-2 mb-3">
+        {isPass
+          ? <CheckCircle size={15} className="text-green-600" />
+          : <AlertTriangle size={15} className="text-amber-600" />}
+        <h4 className={`text-sm font-semibold ${isPass ? 'text-green-800' : 'text-amber-800'}`}>
+          Policy Check — {isPass ? 'All Clear' : 'Flags Raised'}
+        </h4>
+      </div>
+      <ul className="space-y-1.5">
+        {flags.map((f, i) => (
+          <li key={i} className="flex items-start gap-2 text-xs">
+            <AlertTriangle size={11} className="mt-0.5 shrink-0 text-amber-500" />
+            <span className="text-amber-800">{f.message || f}</span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  )
+}
+
+// ── Checklist Panel ─────────────────────────────────────────
+// Checklist agent returns: {documents, clothing, electronics, toiletries, medical, business_items, tips}
+const CHECKLIST_SECTIONS = [
+  { key: 'documents',      label: 'Documents' },
+  { key: 'clothing',       label: 'Clothing' },
+  { key: 'electronics',    label: 'Electronics' },
+  { key: 'toiletries',     label: 'Toiletries' },
+  { key: 'medical',        label: 'Medical' },
+  { key: 'business_items', label: 'Business Items' },
+  { key: 'rural_extras',   label: 'Rural Extras' },
+]
+
+function ChecklistPanel({ checklist }) {
+  const sections = CHECKLIST_SECTIONS.filter(s => Array.isArray(checklist[s.key]) && checklist[s.key].length > 0)
+  const tips = checklist.tips || []
+
+  return (
+    <div className="p-5 space-y-4">
+      {sections.map(({ key, label }) => (
+        <div key={key}>
+          <p className="text-[10px] font-bold uppercase tracking-wide text-gray-400 mb-2">{label}</p>
+          <div className="grid grid-cols-1 gap-1 sm:grid-cols-2">
+            {checklist[key].map((item, i) => (
+              <div key={i} className="flex items-center gap-1.5 text-xs text-gray-700">
+                <CheckSquare size={11} className="shrink-0 text-emerald-500" />
+                {typeof item === 'string' ? item : item.name || item.item || String(item)}
+              </div>
+            ))}
+          </div>
+        </div>
+      ))}
+      {tips.length > 0 && (
+        <div>
+          <p className="text-[10px] font-bold uppercase tracking-wide text-gray-400 mb-2">Tips</p>
+          <ul className="space-y-1">
+            {tips.map((t, i) => (
+              <li key={i} className="flex items-start gap-1.5 text-xs text-gray-600">
+                <Lightbulb size={11} className="mt-0.5 shrink-0 text-amber-500" />
+                {t}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── Guide Panel ─────────────────────────────────────────────
+// Guide agent returns: {tourist_spots, ai_insights: {city_brief, cultural_notes, safety_tips, ...}, day_plan}
+function GuidePanel({ guide }) {
+  const ai = guide.ai_insights || {}
+  const spots = (guide.tourist_spots || []).slice(0, 6)
+
+  return (
+    <div className="p-5 space-y-4">
+      {ai.city_brief && (
+        <p className="text-sm text-gray-700 leading-relaxed">{ai.city_brief}</p>
+      )}
+      {spots.length > 0 && (
+        <div>
+          <p className="text-[10px] font-bold uppercase tracking-wide text-gray-400 mb-2">Top Spots</p>
+          <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
+            {spots.map((s, i) => (
+              <div key={i} className="flex items-start gap-2 text-xs text-gray-700">
+                <span className="mt-0.5 h-1.5 w-1.5 shrink-0 rounded-full bg-violet-400" />
+                {s.name || s}
+                {s.rating && <span className="ml-auto text-amber-500 font-semibold">{s.rating}★</span>}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+      {ai.cultural_notes?.length > 0 && (
+        <div>
+          <p className="text-[10px] font-bold uppercase tracking-wide text-gray-400 mb-2">Cultural Notes</p>
+          <ul className="space-y-1">
+            {ai.cultural_notes.map((t, i) => (
+              <li key={i} className="flex items-start gap-1.5 text-xs text-gray-600">
+                <Info size={11} className="mt-0.5 shrink-0 text-blue-400" />
+                {t}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {ai.safety_tips?.length > 0 && (
+        <div>
+          <p className="text-[10px] font-bold uppercase tracking-wide text-gray-400 mb-2">Safety Tips</p>
+          <ul className="space-y-1">
+            {ai.safety_tips.map((t, i) => (
+              <li key={i} className="flex items-start gap-1.5 text-xs text-gray-600">
+                <CheckCircle size={11} className="mt-0.5 shrink-0 text-emerald-500" />
+                {t}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {ai.best_areas_to_stay?.length > 0 && (
+        <p className="text-xs text-gray-500">
+          <span className="font-semibold">Best areas to stay: </span>
+          {ai.best_areas_to_stay.join(', ')}
+        </p>
+      )}
+      {guide.google_maps_url && (
+        <a href={guide.google_maps_url} target="_blank" rel="noreferrer"
+          className="inline-flex items-center gap-1.5 text-xs font-medium text-blue-600 hover:underline">
+          <MapPin size={11} /> Open in Google Maps <ExternalLink size={10} />
+        </a>
+      )}
+    </div>
+  )
+}
+
+// ── Trip Summary Card ───────────────────────────────────────
+function TripSummaryCard({ summary: s, isLive }) {
+  const origin      = s.origin_cities || '—'
+  const destination = s.destination   || '—'
+  const purpose     = s.purpose       || ''
+  const duration    = s.duration      || ''
+  const travelers   = s.num_travelers || 1
+  const dates       = s.travel_dates && s.travel_dates !== 'Not specified' ? s.travel_dates : null
+  const isMulti     = s.is_multi_origin
+  const isRural     = s.is_rural
+  const longStay    = s.long_stay
+
+  // Format "2026-04-12 to 2026-04-13" → "12 Apr – 13 Apr"
+  const formatDate = (str) => {
+    try {
+      return new Date(str).toLocaleDateString('en-IN', { day: 'numeric', month: 'short' })
+    } catch { return str }
+  }
+  const formattedDates = dates
+    ? dates.split(' to ').map(d => formatDate(d.trim())).join(' – ')
+    : null
+
+  return (
+    <div className="relative overflow-hidden rounded-xl bg-gradient-to-br from-[#0a1628] via-[#0d2a5e] to-[#1a3a7a] shadow-card">
+      {/* Background glow blobs */}
+      <div className="pointer-events-none absolute -top-6 -right-6 h-32 w-32 rounded-full bg-brand-cyan/10 blur-2xl" />
+      <div className="pointer-events-none absolute -bottom-6 -left-6 h-24 w-24 rounded-full bg-blue-500/10 blur-2xl" />
+      {/* Top dashed border (boarding-pass feel) */}
+      <div className="absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-brand-cyan/30 to-transparent" />
+
+      <div className="relative px-5 pt-4 pb-5">
+        {/* Header row */}
+        <div className="flex items-center justify-between mb-4">
+          <div className="flex items-center gap-2">
+            <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-brand-cyan/15 border border-brand-cyan/20">
+              <Brain size={14} className="text-brand-cyan" />
+            </div>
+            <span className="text-xs font-bold uppercase tracking-wider text-brand-cyan/80">AI Trip Summary</span>
+          </div>
+          <div className="flex items-center gap-2">
+            {isLive && (
+              <span className="flex items-center gap-1 rounded-full bg-green-500/10 border border-green-500/20 px-2 py-0.5 text-[10px] font-semibold text-green-400">
+                <span className="h-1.5 w-1.5 rounded-full bg-green-400 animate-pulse" />
+                Live
+              </span>
+            )}
+            <span className="rounded-full bg-white/5 border border-white/10 px-2 py-0.5 text-[10px] font-semibold text-gray-300">
+              Planned ✓
+            </span>
+          </div>
+        </div>
+
+        {/* Route — big visual centrepiece */}
+        <div className="flex items-center gap-3 mb-4">
+          <div className="flex-1 min-w-0">
+            <p className="text-[10px] font-semibold uppercase tracking-wider text-gray-500 mb-0.5">From</p>
+            <p className="text-lg font-bold text-white capitalize truncate">{origin}</p>
+          </div>
+          {/* Arrow with plane */}
+          <div className="flex shrink-0 flex-col items-center gap-1 px-2">
+            <div className="flex items-center gap-1">
+              <div className="h-px w-8 bg-gradient-to-r from-transparent to-brand-cyan/60" />
+              <div className="flex h-7 w-7 items-center justify-center rounded-full bg-brand-cyan/15 border border-brand-cyan/25">
+                <Plane size={13} className="text-brand-cyan" />
+              </div>
+              <div className="h-px w-8 bg-gradient-to-l from-transparent to-brand-cyan/60" />
+            </div>
+            {duration && <span className="text-[9px] font-medium text-gray-500">{duration}</span>}
+          </div>
+          <div className="flex-1 min-w-0 text-right">
+            <p className="text-[10px] font-semibold uppercase tracking-wider text-gray-500 mb-0.5">To</p>
+            <p className="text-lg font-bold text-white capitalize truncate">{destination}</p>
+          </div>
+        </div>
+
+        {/* Divider */}
+        <div className="mb-4 h-px bg-white/5" />
+
+        {/* Detail pills */}
+        <div className="flex flex-wrap gap-2">
+          {purpose && (
+            <span className="flex items-center gap-1 rounded-full bg-blue-500/10 border border-blue-500/20 px-3 py-1 text-[11px] font-semibold text-blue-300">
+              <Briefcase size={10} /> {purpose}
+            </span>
+          )}
+          {formattedDates && (
+            <span className="flex items-center gap-1 rounded-full bg-white/5 border border-white/10 px-3 py-1 text-[11px] font-semibold text-gray-300">
+              <Calendar size={10} /> {formattedDates}
+            </span>
+          )}
+          {travelers > 0 && (
+            <span className="flex items-center gap-1 rounded-full bg-white/5 border border-white/10 px-3 py-1 text-[11px] font-semibold text-gray-300">
+              <Users size={10} /> {travelers} {travelers === 1 ? 'Traveler' : 'Travelers'}
+            </span>
+          )}
+          {isMulti && (
+            <span className="flex items-center gap-1 rounded-full bg-amber-500/10 border border-amber-500/20 px-3 py-1 text-[11px] font-semibold text-amber-300">
+              <ArrowRightLeft size={10} /> Multi-city
+            </span>
+          )}
+          {isRural && (
+            <span className="flex items-center gap-1 rounded-full bg-emerald-500/10 border border-emerald-500/20 px-3 py-1 text-[11px] font-semibold text-emerald-300">
+              <MapPin size={10} /> Outstation
+            </span>
+          )}
+          {longStay && (
+            <span className="flex items-center gap-1 rounded-full bg-violet-500/10 border border-violet-500/20 px-3 py-1 text-[11px] font-semibold text-violet-300">
+              <Clock size={10} /> Long Stay
+            </span>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // ── Helpers ─────────────────────────────────────────────────
 function normalizeWeather(weather) {
   if (!weather) return null
@@ -762,10 +1094,25 @@ function normalizeWeather(weather) {
 
 function getSummaryText(result) {
   if (!result) return ''
-  if (typeof result.summary === 'string' && result.summary.trim()) return result.summary
   const trip = result.trip_summary
-  if (!trip) return ''
-  return `${trip.purpose || 'Business trip'} to ${trip.destination || 'your destination'} for ${trip.duration || 'the planned duration'}.`
+  if (trip) {
+    const parts = []
+    if (trip.purpose)       parts.push(trip.purpose)
+    if (trip.origin_cities && trip.destination)
+                            parts.push(`from ${trip.origin_cities} to ${trip.destination}`)
+    else if (trip.destination)
+                            parts.push(`to ${trip.destination}`)
+    if (trip.duration)      parts.push(`· ${trip.duration}`)
+    if (trip.travel_dates && trip.travel_dates !== 'Not specified')
+                            parts.push(`· ${trip.travel_dates}`)
+    if (trip.num_travelers > 1)
+                            parts.push(`· ${trip.num_travelers} travelers`)
+    const text = parts.join(' ').trim()
+    if (text) return text
+  }
+  // Fallback — only use result.summary if it's genuinely descriptive (not just trip_type)
+  if (typeof result.summary === 'string' && result.summary.length > 30) return result.summary
+  return ''
 }
 
 function formatTime(value) {

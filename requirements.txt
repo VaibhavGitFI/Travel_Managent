@@ -4,6 +4,7 @@
 # Core Flask
 flask==3.1.0
 flask-cors==4.0.0
+flask-compress==1.15
 python-dotenv==1.0.1
 werkzeug==3.1.3
 
@@ -45,17 +46,6 @@ redis==5.2.1
 # Utilities
 cachetools==5.5.0
 Pillow==10.4.0
-
-# OTIS Voice Agent — Gemini Live API
-# STT + LLM + TTS handled by Google Gemini Live (replaces Deepgram + ElevenLabs).
-# google-genai is the newer SDK required for Live API (separate from google-generativeai).
-google-genai==1.69.0
-
-# Wake word detection (optional — works without a key via OpenWakeWord)
-openwakeword==0.6.0
-pvporcupine==3.0.3
-websockets==13.1
-pyaudio==0.2.14
 
 # Twilio — WhatsApp webhook signature verification + sending
 twilio==9.0.5

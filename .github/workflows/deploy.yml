@@ -1,0 +1,235 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Deploy — triggered when code lands on main (PR merge or direct push).
+# Also available as a manual workflow_dispatch for emergency deploys.
+#
+# Pipeline:
+#   lint + test + frontend-build (parallel)
+#     └─ build-and-push Docker image to Artifact Registry
+#           └─ deploy to Cloud Run (asia-south1)
+#                 └─ verify /api/health returns 200
+#
+# Auth: Workload Identity Federation (keyless — no JSON service-account keys
+# stored in GitHub Secrets). Run scripts/gcp/setup-github-actions.sh once
+# to provision the WIF pool, OIDC provider, and deployer service account.
+#
+# Required GitHub Secrets (Settings → Secrets → Actions):
+#   GCP_PROJECT_ID          — GCP project ID  (e.g. my-project-123)
+#   WIF_PROVIDER            — WIF provider resource name
+#                             projects/PROJECT_NUMBER/locations/global/
+#                             workloadIdentityPools/github-pool/providers/github-provider
+#   WIF_SERVICE_ACCOUNT     — deployer SA email
+#                             github-deployer@PROJECT_ID.iam.gserviceaccount.com
+#   CLOUDSQL_INSTANCE       — Cloud SQL connection name
+#                             PROJECT_ID:asia-south1:travelsync-db
+#   RUNTIME_SERVICE_ACCOUNT — Cloud Run runtime SA email
+#                             travelsync-runtime@PROJECT_ID.iam.gserviceaccount.com
+# ─────────────────────────────────────────────────────────────────────────────
+name: Deploy to Production
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      skip_tests:
+        description: 'Skip tests (emergency deploys only — use sparingly)'
+        required: false
+        default: 'false'
+        type: boolean
+
+# Only one production deploy at a time.
+# A new push cancels any deploy still in progress for main.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: true
+
+# id-token:write is required for Workload Identity Federation to work.
+# All other permissions are locked down to least privilege.
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  REGION: asia-south1
+  SERVICE_NAME: travelsync-pro
+  AR_REPOSITORY: travelsync
+  IMAGE_NAME: app
+
+jobs:
+  # ── Backend lint ─────────────────────────────────────────────────────────────
+  backend-lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - run: pip install flake8 --quiet
+
+      - run: |
+          cd backend
+          flake8 \
+            --max-line-length=120 \
+            --exclude=__pycache__,migrations \
+            --count --statistics \
+            --exit-zero \
+            .
+
+  # ── Backend tests ─────────────────────────────────────────────────────────────
+  backend-test:
+    name: Tests
+    runs-on: ubuntu-latest
+    # skip_tests input is only set by workflow_dispatch; on push it is absent.
+    if: ${{ github.event.inputs.skip_tests != 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - run: pip install -r requirements.txt pytest --quiet
+
+      - run: |
+          cd backend
+          python -m pytest tests/ -x -q --tb=short
+
+  # ── Frontend build check ───────────────────────────────────────────────────
+  frontend-build:
+    name: Frontend build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - run: cd frontend && npm ci && npm run build
+
+  # ── Build image + Deploy ───────────────────────────────────────────────────
+  deploy:
+    name: Build & Deploy
+    needs: [backend-lint, backend-test, frontend-build]
+    runs-on: ubuntu-latest
+    # Run deploy even when backend-test was skipped (skip_tests=true).
+    # Require lint and frontend to be green in all cases.
+    if: |
+      always() &&
+      needs.backend-lint.result == 'success' &&
+      needs.frontend-build.result == 'success' &&
+      (needs.backend-test.result == 'success' || needs.backend-test.result == 'skipped')
+    environment: production   # Enables GitHub environment protection rules / approvals
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── Authenticate to GCP via Workload Identity Federation ───────────────
+      - name: Authenticate to Google Cloud
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      # Configure docker to push to Artifact Registry using the WIF credentials.
+      - name: Configure Docker for Artifact Registry
+        run: |
+          gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+
+      # ── Docker: build + push (with GitHub Actions layer cache) ────────────
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ env.AR_REPOSITORY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ env.REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ env.AR_REPOSITORY }}/${{ env.IMAGE_NAME }}:latest
+          # GitHub Actions Cache backend — dramatically speeds up repeat builds.
+          # Layer cache is keyed per branch; main always has a warm cache.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false   # disable SBOM/provenance (keeps image manifest simple)
+
+      # ── Deploy to Cloud Run ────────────────────────────────────────────────
+      - name: Deploy to Cloud Run
+        id: deploy
+        run: |
+          IMAGE_URI="${{ env.REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ env.AR_REPOSITORY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}"
+
+          gcloud run deploy "${{ env.SERVICE_NAME }}" \
+            --image "$IMAGE_URI" \
+            --region "${{ env.REGION }}" \
+            --platform managed \
+            --service-account "${{ secrets.RUNTIME_SERVICE_ACCOUNT }}" \
+            --add-cloudsql-instances "${{ secrets.CLOUDSQL_INSTANCE }}" \
+            --set-env-vars "DEBUG=False,GCP_PROJECT_ID=${{ secrets.GCP_PROJECT_ID }},GOOGLE_CLOUD_PROJECT=${{ secrets.GCP_PROJECT_ID }}" \
+            --cpu 2 \
+            --memory 2Gi \
+            --min-instances 1 \
+            --max-instances 10 \
+            --concurrency 80 \
+            --timeout 300 \
+            --allow-unauthenticated \
+            --quiet
+
+          # Capture the service URL for subsequent steps
+          SERVICE_URL=$(gcloud run services describe "${{ env.SERVICE_NAME }}" \
+            --region "${{ env.REGION }}" \
+            --format 'value(status.url)')
+          echo "service_url=$SERVICE_URL" >> "$GITHUB_OUTPUT"
+
+      # ── Health check — fail the workflow if the new revision is broken ─────
+      - name: Verify health endpoint
+        run: |
+          SERVICE_URL="${{ steps.deploy.outputs.service_url }}"
+          echo "Checking $SERVICE_URL/api/health ..."
+          for attempt in 1 2 3 4 5 6; do
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+              --max-time 15 \
+              "$SERVICE_URL/api/health" || echo "000")
+            echo "Attempt $attempt: HTTP $HTTP_STATUS"
+            if [[ "$HTTP_STATUS" == "200" ]]; then
+              echo "Health check passed."
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "Health check failed after 6 attempts — check Cloud Run logs."
+          exit 1
+
+      # ── Summary printed to the GitHub Actions run page ─────────────────────
+      - name: Deployment summary
+        if: always()
+        run: |
+          SERVICE_URL="${{ steps.deploy.outputs.service_url }}"
+          RESULT="${{ job.status }}"
+          {
+            echo "## Deployment $RESULT"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| Commit | \`${{ github.sha }}\` |"
+            echo "| Branch | \`${{ github.ref_name }}\` |"
+            echo "| Author | ${{ github.actor }} |"
+            echo "| Service | ${{ env.SERVICE_NAME }} |"
+            echo "| Region | ${{ env.REGION }} |"
+            echo "| URL | $SERVICE_URL |"
+          } >> "$GITHUB_STEP_SUMMARY"

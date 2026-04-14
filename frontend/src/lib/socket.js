@@ -4,6 +4,7 @@
  * The socket does NOT auto-connect — Layout.jsx connects it when the user logs in.
  */
 import { io } from 'socket.io-client'
+import { getAccessToken } from '../api/auth'
 
 // In dev mode Vite runs on :5173 and proxies /api to :3399.
 // SocketIO is on the Flask server directly, so connect straight to :3399.
@@ -15,6 +16,9 @@ const SOCKET_URL = import.meta.env.DEV
 const socket = io(SOCKET_URL, {
   withCredentials: true,   // send session cookie so Flask can identify the user
   autoConnect: false,      // Layout controls when to connect
+  auth: (cb) => {
+    cb({ token: getAccessToken() || null })
+  },
   reconnectionAttempts: 15,
   reconnectionDelay: 1000,
   reconnectionDelayMax: 10000,

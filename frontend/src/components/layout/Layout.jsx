@@ -9,7 +9,6 @@ import {
 } from 'lucide-react'
 import Sidebar from './Sidebar'
 import Topbar from './Topbar'
-import OtisLauncher from '../voice/OtisLauncher'
 import useStore from '../../store/useStore'
 import client from '../../api/client'
 import socket from '../../lib/socket'
@@ -103,9 +102,17 @@ export default function Layout() {
 
   // ── Real-time WebSocket ─────────────────────────────────────────────────────
   useEffect(() => {
-    if (!auth.isLoggedIn) return
+    if (!auth.isLoggedIn || !auth.user) return
 
-    socket.connect()
+    const handleConnect = () => {
+      socket.emit('join_user_room', {})
+    }
+
+    socket.on('connect', handleConnect)
+    if (!socket.connected) {
+      socket.connect()
+    }
+    if (socket.connected) handleConnect()
 
     const handleNotification = (data) => {
       const now = new Date()
@@ -209,12 +216,12 @@ export default function Layout() {
     socket.on('data_changed', handleDataChanged)
 
     return () => {
+      socket.off('connect', handleConnect)
       socket.off('notification', handleNotification)
       socket.off('trip_update', handleTripUpdate)
       socket.off('data_changed', handleDataChanged)
-      socket.disconnect()
     }
-  }, [auth.isLoggedIn, addNotification, markStale])
+  }, [auth.isLoggedIn, auth.user, addNotification, markStale, navigate])
 
   // Poll health every 60 s
   useEffect(() => {
@@ -439,9 +446,6 @@ export default function Layout() {
           </div>
         </main>
       </div>
-
-      {/* ── OTIS Voice Launcher ──────────────────────────────────────────── */}
-      <OtisLauncher />
 
       {/* ── Floating SOS Button ─────────────────────────────────────────── */}
       {auth.isLoggedIn && (

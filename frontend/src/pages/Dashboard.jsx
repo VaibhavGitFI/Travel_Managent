@@ -209,42 +209,64 @@ export default function Dashboard() {
         {/* Total Trips */}
         <KpiCard
           onClick={() => navigate('/requests')}
-          icon={<Plane size={15} />}
-          iconClass="bg-blue-50 text-blue-600"
+          icon={<Plane size={17} />}
+          iconClass="bg-blue-50 text-blue-600 border-blue-100"
+          accent="blue"
           value={loading ? '—' : (stats?.total_trips ?? 0)}
           label="Total Trips"
-          footer={<span className="text-gray-600">View all <ChevronRight size={10} className="inline" /></span>}
+          footer={
+            <span className="flex items-center gap-0.5 font-semibold text-blue-500 group-hover:text-blue-600 transition-colors">
+              View all <ChevronRight size={10} />
+            </span>
+          }
         />
 
         {/* Budget */}
         <button
           onClick={() => navigate('/expenses')}
-          className="group text-left rounded-xl border border-gray-200 bg-white shadow-card p-4 transition-all hover:shadow-md"
+          className="group relative text-left rounded-xl border border-gray-200 bg-white shadow-card p-4 transition-all hover:shadow-md overflow-hidden"
         >
+          {/* Accent top line */}
+          <div className="absolute inset-x-0 top-0 h-[2px] bg-gradient-to-r from-emerald-500 via-emerald-400 to-transparent opacity-70" />
           {loading ? <KpiSkeleton /> : (
             <div className="flex flex-col h-full">
-              <div className="flex items-center justify-between mb-2">
-                <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-emerald-50 border border-emerald-100">
-                  <Wallet size={14} className="text-emerald-600" />
+              <div className="flex items-center justify-between mb-3">
+                <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-emerald-50 border border-emerald-100">
+                  <Wallet size={17} className="text-emerald-600" />
                 </div>
                 {monthlyBudget > 0 && (
-                  <span className={`text-[11px] font-semibold ${bc.text}`}>{budgetPct}%</span>
+                  <span className={`rounded-full px-2 py-0.5 text-[10px] font-bold border ${
+                    budgetPct >= 90 ? 'bg-red-50 text-red-600 border-red-100' :
+                    budgetPct >= 75 ? 'bg-amber-50 text-amber-600 border-amber-100' :
+                    'bg-emerald-50 text-emerald-600 border-emerald-100'
+                  }`}>{budgetPct}%</span>
                 )}
               </div>
-              <div className="text-xl font-bold text-gray-900 leading-tight">
-                ₹{Number(monthlyBudget > 0 ? monthlySpend : (stats?.total_expenses ?? 0)).toLocaleString('en-IN')}
+              <div className="text-2xl font-black text-gray-900 leading-tight">
+                ₹{Number(
+                  monthlyBudget > 0 && monthlySpend > 0
+                    ? monthlySpend
+                    : (stats?.total_expenses ?? 0)
+                ).toLocaleString('en-IN')}
               </div>
-              <div className="text-[11px] text-gray-700 mt-0.5">
-                {monthlyBudget > 0 ? 'Spent This Month' : 'Total Expenses'}
+              <div className="text-[11px] font-medium text-gray-500 mt-0.5">
+                {monthlyBudget > 0 && monthlySpend > 0 ? 'Spent This Month' : 'Total Expenses'}
               </div>
-              {monthlyBudget > 0 && (
+              {monthlyBudget > 0 ? (
                 <div className="mt-2.5">
-                  <div className="h-1 w-full rounded-full bg-gray-100 overflow-hidden">
-                    <div className={`h-full rounded-full transition-all duration-700 ${bc.bar}`} style={{ width: `${budgetPct}%` }} />
+                  <div className="h-1.5 w-full rounded-full bg-gray-100 overflow-hidden">
+                    <div className={`h-full rounded-full transition-all duration-700 ${bc.bar}`} style={{ width: `${Math.min(budgetPct, 100)}%` }} />
                   </div>
-                  <div className="mt-1 text-[10px] text-gray-500">
-                    of ₹{Number(monthlyBudget).toLocaleString('en-IN')}
+                  <div className="mt-1.5 flex items-center justify-between">
+                    <span className="text-[10px] text-gray-400">Budget limit</span>
+                    <span className="text-[10px] font-semibold text-gray-500">₹{Number(monthlyBudget).toLocaleString('en-IN')}</span>
                   </div>
+                </div>
+              ) : (
+                <div className="mt-2.5">
+                  <span className="flex items-center gap-0.5 text-[11px] font-semibold text-emerald-500 group-hover:text-emerald-600 transition-colors">
+                    View expenses <ChevronRight size={10} />
+                  </span>
                 </div>
               )}
             </div>
@@ -254,28 +276,34 @@ export default function Dashboard() {
         {/* Pending Approvals */}
         <KpiCard
           onClick={() => navigate('/approvals')}
-          icon={<Clock size={15} />}
-          iconClass="bg-amber-50 text-amber-600"
+          icon={<Clock size={17} />}
+          iconClass="bg-amber-50 text-amber-600 border-amber-100"
+          accent="amber"
           value={loading ? '—' : (stats?.pending_approvals ?? 0)}
           label="Pending Approvals"
-          footer={<span className="text-gray-600">Review <ChevronRight size={10} className="inline" /></span>}
+          footer={
+            <span className="flex items-center gap-0.5 font-semibold text-amber-500 group-hover:text-amber-600 transition-colors">
+              Review <ChevronRight size={10} />
+            </span>
+          }
           highlight={!loading && (stats?.pending_approvals ?? 0) > 0}
         />
 
         {/* Compliance */}
         <KpiCard
           onClick={() => navigate('/analytics')}
-          icon={<Shield size={15} />}
-          iconClass="bg-sky-50 text-sky-600"
+          icon={<Shield size={17} />}
+          iconClass="bg-sky-50 text-sky-600 border-sky-100"
+          accent="sky"
           value={loading ? '—' : (stats?.compliance_score != null ? `${stats.compliance_score}%` : '—')}
           label="Compliance Score"
           footer={
             !loading && stats?.compliance_score != null ? (
               stats.compliance_score >= 80
-                ? <span className="text-emerald-500 flex items-center gap-0.5"><TrendingUp size={10} /> On track</span>
+                ? <span className="flex items-center gap-0.5 text-emerald-500 font-semibold"><TrendingUp size={10} /> On track</span>
                 : stats.compliance_score < 60
-                  ? <span className="text-red-400 flex items-center gap-0.5"><TrendingDown size={10} /> Needs attention</span>
-                  : <span className="text-amber-400">Moderate</span>
+                  ? <span className="flex items-center gap-0.5 text-red-400 font-semibold"><TrendingDown size={10} /> Needs attention</span>
+                  : <span className="text-amber-400 font-semibold">Moderate</span>
             ) : null
           }
         />
@@ -387,7 +415,7 @@ export default function Dashboard() {
             </section>}
 
             {/* Spend Sparkline */}
-            <section className="rounded-xl border border-gray-200 bg-white shadow-card overflow-hidden">
+            <section className="rounded-xl border border-gray-200 bg-white shadow-card overflow-hidden flex flex-col">
               <div className="flex items-center justify-between border-b border-gray-100 px-4 py-3">
                 <div className="flex items-center gap-2">
                   <div className="flex h-6 w-6 items-center justify-center rounded-md bg-amber-50">
@@ -399,39 +427,77 @@ export default function Dashboard() {
                   Full →
                 </button>
               </div>
-              <div className="px-3 pt-3 pb-2">
-                {loading || trend.length === 0 ? (
-                  <div className="flex items-end gap-1 h-16">
+
+              {/* Summary stat strip — fills height gap cleanly */}
+              {!loading && (() => {
+                const months = buildFullYear(trend)
+                const total  = months.reduce((s, m) => s + (m.amount || 0), 0)
+                const peak   = months.filter(m => m.amount > 0).sort((a, b) => b.amount - a.amount)[0]
+                if (!total) return null
+                return (
+                  <div className="flex items-center gap-5 border-b border-gray-100 px-4 py-2.5">
+                    <div>
+                      <p className="text-[9px] font-semibold uppercase tracking-wide text-gray-400">Year Total</p>
+                      <p className="text-sm font-bold text-gray-900">₹{Number(total).toLocaleString('en-IN')}</p>
+                    </div>
+                    {peak && (
+                      <div>
+                        <p className="text-[9px] font-semibold uppercase tracking-wide text-gray-400">Peak Month</p>
+                        <p className="text-sm font-bold text-gray-900">{peak.label}</p>
+                        <p className="text-[9px] text-gray-400">₹{Number(peak.amount).toLocaleString('en-IN')}</p>
+                      </div>
+                    )}
+                  </div>
+                )
+              })()}
+
+              {/* Chart — pushed to bottom */}
+              <div className="flex-1 flex flex-col justify-end pt-3 pb-2">
+                {loading ? (
+                  <div className="flex items-end gap-1.5 h-16 mb-1 px-3">
                     {[40, 60, 35, 70, 50, 85].map((h, i) => (
-                      <div key={i} className="skeleton flex-1 rounded-sm" style={{ height: `${h}%` }} />
+                      <div key={i} className="skeleton flex-1 rounded-t-md" style={{ height: `${h}%` }} />
                     ))}
                   </div>
-                ) : (
-                  <>
-                    <ResponsiveContainer width="100%" height={68}>
-                      <BarChart data={trend} barCategoryGap="20%" margin={{ top: 2, right: 2, left: 2, bottom: 0 }}>
-                        <ReTooltip
-                          formatter={(v) => [`₹${Number(v).toLocaleString('en-IN')}`, '']}
-                          labelFormatter={(l) => trend.find((m) => m.month === l || m.label === l)?.label || l}
-                          contentStyle={{ fontSize: 11, borderRadius: 8, border: '1px solid #e5e7eb', padding: '4px 8px' }}
-                          cursor={{ fill: 'rgba(0,0,0,0.03)' }}
-                        />
-                        <Bar dataKey="amount" radius={[3, 3, 0, 0]}>
-                          {trend.map((_, i) => (
-                            <Cell key={i} fill={i === trend.length - 1 ? '#4CC9F0' : 'rgba(76,201,240,0.2)'} />
-                          ))}
-                        </Bar>
-                      </BarChart>
-                    </ResponsiveContainer>
-                    <div className="flex mt-0.5">
-                      {trend.map((m, i) => (
-                        <span key={i} className={`flex-1 text-center text-[9px] ${i === trend.length - 1 ? 'font-semibold text-brand-cyan' : 'text-gray-500'}`}>
-                          {(m.label || m.month || '').slice(0, 3)}
-                        </span>
-                      ))}
+                ) : (() => {
+                  const months = buildFullYear(trend)
+                  const allZero = months.every((m) => !m.amount)
+                  if (allZero) return (
+                    <div className="flex flex-col items-center justify-center h-16 gap-1">
+                      <BarChart3 size={18} className="text-gray-300" />
+                      <p className="text-[10px] text-gray-400">No spend data yet</p>
                     </div>
-                  </>
-                )}
+                  )
+                  const BAR_COL = 48
+                  const totalW  = BAR_COL * 12
+                  return (
+                    <div className="overflow-x-auto" style={{ WebkitOverflowScrolling: 'touch' }}>
+                      <div style={{ width: totalW }}>
+                        <BarChart width={totalW} height={68} data={months}
+                          barCategoryGap="28%" margin={{ top: 2, right: 4, left: 4, bottom: 0 }}>
+                          <ReTooltip content={<SpendTooltip />} cursor={{ fill: 'rgba(76,201,240,0.06)' }} />
+                          <Bar dataKey="amount" radius={[4, 4, 0, 0]} minPointSize={3}>
+                            {months.map((m, i) => (
+                              <Cell key={i}
+                                fill={m.isCurrent ? '#4CC9F0' : m.isFuture ? 'rgba(76,201,240,0.12)' : 'rgba(76,201,240,0.45)'}
+                              />
+                            ))}
+                          </Bar>
+                        </BarChart>
+                        <div className="flex" style={{ width: totalW }}>
+                          {months.map((m, i) => (
+                            <div key={i} className="shrink-0 text-center" style={{ width: BAR_COL }}>
+                              <span className={`text-[9px] ${
+                                m.isCurrent ? 'font-bold text-brand-cyan' :
+                                m.isFuture  ? 'text-gray-300' : 'text-gray-400'
+                              }`}>{m.label}</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+                  )
+                })()}
               </div>
             </section>
           </div>
@@ -562,19 +628,38 @@ export default function Dashboard() {
 }
 
 // ── Reusable KPI Card ──────────────────────────────────────────
-function KpiCard({ onClick, icon, iconClass, value, label, footer, highlight }) {
+function KpiCard({ onClick, icon, iconClass, value, label, footer, highlight, accent }) {
+  const topLines = {
+    blue:    'from-blue-500 via-blue-400 to-transparent',
+    emerald: 'from-emerald-500 via-emerald-400 to-transparent',
+    amber:   'from-amber-500 via-amber-400 to-transparent',
+    sky:     'from-sky-500 via-sky-400 to-transparent',
+  }
+  const topLine = topLines[accent] || topLines.blue
+
   return (
     <button
       onClick={onClick}
-      className={`group text-left rounded-xl border bg-white shadow-card p-4 transition-all hover:shadow-md ${highlight ? 'border-amber-200' : 'border-gray-200'}`}
+      className={`group relative text-left rounded-xl border bg-white shadow-card p-4 transition-all hover:shadow-md overflow-hidden ${
+        highlight ? 'border-amber-200' : 'border-gray-200'
+      }`}
     >
-      <div className="flex items-center justify-between mb-2">
-        <div className={`flex h-7 w-7 items-center justify-center rounded-lg border ${iconClass} ${highlight ? 'border-amber-100' : 'border-transparent'}`}>
+      {/* Accent top gradient line */}
+      <div className={`absolute inset-x-0 top-0 h-[2px] bg-gradient-to-r ${topLine} opacity-70`} />
+
+      <div className="flex items-center justify-between mb-3">
+        <div className={`flex h-9 w-9 items-center justify-center rounded-xl border ${iconClass}`}>
           {icon}
         </div>
+        {highlight && (
+          <span className="relative flex h-2 w-2">
+            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75" />
+            <span className="relative inline-flex rounded-full h-2 w-2 bg-amber-500" />
+          </span>
+        )}
       </div>
-      <div className="text-xl font-bold text-gray-900 leading-tight">{value}</div>
-      <div className="text-[11px] text-gray-700 mt-0.5 mb-2">{label}</div>
+      <div className="text-2xl font-black text-gray-900 leading-tight">{value}</div>
+      <div className="text-[11px] font-medium text-gray-500 mt-0.5 mb-2.5">{label}</div>
       <div className="text-[11px]">{footer}</div>
     </button>
   )
@@ -583,9 +668,37 @@ function KpiCard({ onClick, icon, iconClass, value, label, footer, highlight }) 
 function KpiSkeleton() {
   return (
     <div className="space-y-2">
-      <div className="skeleton h-7 w-7 rounded-lg" />
+      <div className="skeleton h-9 w-9 rounded-xl" />
       <div className="skeleton h-6 w-20 mt-2" />
       <div className="skeleton h-3.5 w-28" />
+    </div>
+  )
+}
+
+// ── Build full Jan–Dec year from trend data ────────────────────
+function buildFullYear(trend) {
+  const currentMonth = new Date().getMonth() // 0-indexed
+  const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
+  const lookup = {}
+  for (const m of trend) {
+    const key = (m.label || m.month || '').slice(0, 3)
+    if (key) lookup[key] = (lookup[key] || 0) + (m.amount || 0)
+  }
+  return MONTHS.map((label, idx) => ({
+    label,
+    amount: lookup[label] || 0,
+    isCurrent: idx === currentMonth,
+    isFuture:  idx > currentMonth,
+  }))
+}
+
+// ── Spend Trend custom tooltip ─────────────────────────────────
+function SpendTooltip({ active, payload, label }) {
+  if (!active || !payload?.length) return null
+  return (
+    <div className="rounded-lg border border-gray-200 bg-white px-3 py-2 shadow-lg">
+      <p className="text-[10px] font-semibold text-gray-400 mb-0.5">{label}</p>
+      <p className="text-sm font-bold text-gray-900">₹{Number(payload[0].value).toLocaleString('en-IN')}</p>
     </div>
   )
 }
@@ -626,24 +739,31 @@ function StatusPill({ status }) {
 // ── Alert Card ─────────────────────────────────────────────────
 function AlertCard({ alert, onDismiss, onAction }) {
   const S = {
-    info:     { card: 'border-blue-200  bg-blue-50/80',  icon: 'text-blue-500',  text: 'text-blue-900'  },
-    warning:  { card: 'border-amber-200 bg-amber-50/80', icon: 'text-amber-500', text: 'text-amber-900' },
-    critical: { card: 'border-red-200   bg-red-50/80',   icon: 'text-red-500',   text: 'text-red-900'   },
+    info:     { card: 'border-blue-200  bg-blue-50/80',  icon: 'text-blue-500',  text: 'text-blue-900',  btn: 'border-blue-300  bg-blue-100  text-blue-700  hover:bg-blue-200',  dismiss: 'text-blue-400  hover:bg-blue-100'  },
+    warning:  { card: 'border-amber-200 bg-amber-50/80', icon: 'text-amber-500', text: 'text-amber-900', btn: 'border-amber-300 bg-amber-100 text-amber-700 hover:bg-amber-200', dismiss: 'text-amber-400 hover:bg-amber-100' },
+    critical: { card: 'border-red-200   bg-red-50/80',   icon: 'text-red-500',   text: 'text-red-900',   btn: 'border-red-300   bg-red-100   text-red-700   hover:bg-red-200',   dismiss: 'text-red-400   hover:bg-red-100'   },
   }
   const st = S[alert.severity] || S.info
   const Icon = alert.severity === 'info' ? Info : AlertTriangle
   return (
-    <div className={`flex items-start gap-3 rounded-xl border px-4 py-2.5 ${st.card}`}>
-      <Icon size={14} className={`mt-0.5 shrink-0 ${st.icon}`} />
+    <div className={`flex items-center gap-3 rounded-xl border px-4 py-2.5 ${st.card}`}>
+      <Icon size={14} className={`shrink-0 ${st.icon}`} />
       <div className={`min-w-0 flex-1 ${st.text}`}>
         <p className="text-xs font-semibold">{alert.title}</p>
         <p className="text-[11px] opacity-75">{alert.message}</p>
       </div>
-      <div className="flex items-center gap-1 shrink-0">
+      <div className="flex items-center gap-2 shrink-0">
         {alert.action?.target && (
-          <button onClick={onAction} className="rounded px-2 py-0.5 text-[11px] font-medium hover:bg-black/5">View</button>
+          <button onClick={onAction}
+            className={`rounded-lg border px-2.5 py-1 text-[11px] font-semibold transition-colors ${st.btn}`}>
+            View
+          </button>
         )}
-        <button onClick={onDismiss} className="rounded p-1 hover:bg-black/5" aria-label="Dismiss"><X size={12} /></button>
+        <button onClick={onDismiss}
+          className={`rounded-md p-1 transition-colors ${st.dismiss}`}
+          aria-label="Dismiss">
+          <X size={12} />
+        </button>
       </div>
     </div>
   )

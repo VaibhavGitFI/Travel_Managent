@@ -76,6 +76,10 @@ def _normalize_trip_input(data: dict, user: dict) -> dict:
 
     purpose = (data.get("purpose") or "client meeting").replace("_", " ")
 
+    # Normalise travel_mode: 'any' means no preference, otherwise honour it
+    raw_mode = (data.get("travel_mode") or "any").lower().strip()
+    preferred_mode = None if raw_mode in ("any", "") else raw_mode
+
     return {
         "destination": destination,
         "origin": origin,
@@ -97,6 +101,7 @@ def _normalize_trip_input(data: dict, user: dict) -> dict:
         "long_stay_mode": bool(data.get("long_stay_mode", False)),
         "client_address": data.get("client_address", ""),
         "is_rural": bool(data.get("is_rural", False)),
+        "preferred_mode": preferred_mode,
         "user_id": user.get("id", 1),
     }
 
@@ -122,7 +127,6 @@ def _serialize_trip(row: dict) -> dict:
 @trips_bp.route("/plan-trip", methods=["POST"])
 @trips_bp.route("/trips/plan", methods=["POST"])
 @limiter.limit("10 per minute")
-@require_json("destination")
 def plan_trip_route():
     """POST /api/plan-trip and /api/trips/plan — run the A2A orchestrator."""
     user = get_current_user()

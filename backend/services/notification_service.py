@@ -11,13 +11,18 @@ Single entry point for all notifications. Dispatches to:
 All channels are independently gated — unconfigured channels are silently skipped.
 Dispatch runs in a background thread so it never blocks the HTTP response.
 """
+import os
 import logging
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
 
-_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="notify")
+# 8 workers: each dispatch fan-out (DB + SocketIO + Email + Cliq + WhatsApp + Slack)
+# is I/O-bound, so more workers directly improves throughput during notification bursts
+# (SOS alerts, approval waves). Configurable via NOTIFY_WORKERS env var.
+_NOTIFY_WORKERS = max(1, int(os.getenv("NOTIFY_WORKERS", "8")))
+_executor = ThreadPoolExecutor(max_workers=_NOTIFY_WORKERS, thread_name_prefix="notify")
 
 
 def notify(

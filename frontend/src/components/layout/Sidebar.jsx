@@ -17,11 +17,11 @@ import {
   UserCircle,
   Settings,
   Globe,
-  Volume2,
 } from 'lucide-react'
 import { cn } from '../../lib/cn'
 import useStore from '../../store/useStore'
 import { logout as apiLogout } from '../../api/auth'
+import socket from '../../lib/socket'
 import toast from 'react-hot-toast'
 
 const ELEVATED = ['manager', 'admin', 'super_admin']
@@ -44,7 +44,6 @@ const navGroups = [
       { to: '/requests',  icon: FileText,    label: 'Requests' },
       { to: '/approvals', icon: CheckSquare, label: 'Approvals' },
       { to: '/analytics', icon: BarChart3,   label: 'Analytics', roles: ELEVATED },
-      { to: '/otis',      icon: Volume2,     label: 'OTIS Voice', roles: ELEVATED },
     ],
   },
   {
@@ -80,6 +79,7 @@ export default function Sidebar() {
     } catch {
       // silent — local logout still works
     }
+    socket.disconnect()
     storeLogout()
     navigate('/login')
     toast.success('Logged out successfully')

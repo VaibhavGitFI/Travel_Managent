@@ -8,12 +8,19 @@ import os
 import logging
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import hashlib
+import json
 import time as _time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from services.gemini_service import gemini
 from agents.registry import registry
+from services.cache_service import CacheStore
 
 logger = logging.getLogger(__name__)
+
+# Semantic trip-plan cache — route+purpose+budget keyed, 1-hour TTL
+# Covers hotels, travel, guide, checklist (stable). Weather and meetings always run fresh.
+_trip_cache = CacheStore(namespace="trips", ttl=3600, maxsize=500)
 
 
 def get_gemini_model():
@@ -39,6 +46,23 @@ def plan_trip(trip_input: dict) -> dict:
     is_rural = trip_input.get("is_rural", False)
     require_veg = trip_input.get("require_veg", False)
     user_id = trip_input.get("user_id", 1)
+
+    # Semantic cache key — route characteristics only, never user_id / exact dates
+    _cache_seed = {
+        "origin":      (origin or "").lower().strip(),
+        "destination": destination.lower().strip(),
+        "duration":    duration_days,
+        "purpose":     (purpose or "").lower().strip(),
+        "budget":      (str(budget) if budget else "moderate").lower().strip(),
+    }
+    _cache_key = hashlib.sha256(
+        json.dumps(_cache_seed, sort_keys=True).encode()
+    ).hexdigest()[:20]
+    _cached_stable = _trip_cache.get(_cache_key) or {}
+    if _cached_stable:
+        logger.info("[Orchestrator] Cache HIT (%s→%s, %sd %s) — skipping %d stable agents",
+                    _cache_seed["origin"], _cache_seed["destination"],
+                    duration_days, purpose, len(_cached_stable))
 
     # Build travelers list
     travelers = []
@@ -72,8 +96,20 @@ def plan_trip(trip_input: dict) -> dict:
         "start_date": travel_dates.split(" to ")[0].strip() if travel_dates else "",
     }
 
-    # Run all agents in parallel
-    results = _run_agents_parallel(trip_details, user_id)
+    # Run agents — cached stable agents are injected, fresh agents run for the rest
+    results = _run_agents_parallel(trip_details, user_id, pre_cached=_cached_stable)
+
+    # Store stable results (hotels, travel, guide, checklist) in cache for next identical route
+    if not _cached_stable:
+        stable_to_cache = {
+            k: v for k, v in results.items()
+            if k in ("hotels", "travel", "guide", "checklist")
+            and isinstance(v, dict) and "error" not in v
+        }
+        if stable_to_cache:
+            _trip_cache.set(_cache_key, stable_to_cache)
+            logger.info("[Orchestrator] Cached %d stable agents for %s→%s",
+                        len(stable_to_cache), _cache_seed["origin"], _cache_seed["destination"])
 
     # Run validation layer after agents complete
     try:
@@ -108,11 +144,19 @@ def plan_trip(trip_input: dict) -> dict:
     }
 
 
-def _run_agents_parallel(trip_details: dict, user_id: int) -> dict:
-    """Execute all agents concurrently using ThreadPoolExecutor."""
+def _run_agents_parallel(trip_details: dict, user_id: int, pre_cached: dict = None) -> dict:
+    """Execute all agents concurrently using ThreadPoolExecutor.
+
+    pre_cached: dict of already-computed stable results (hotels, travel, guide, checklist).
+    Weather and meetings are always run fresh (date-specific / user-specific).
+    """
     destination = trip_details["destination"]
     duration_days = trip_details["duration_days"]
     travel_dates = trip_details.get("travel_dates", "")
+
+    # Seed results with any pre-cached stable agent output
+    results = dict(pre_cached) if pre_cached else {}
+    _cached_keys = set(results.keys())
 
     # Parse dates for weather
     dates = travel_dates.split(" to ") if travel_dates else []
@@ -143,7 +187,6 @@ def _run_agents_parallel(trip_details: dict, user_id: int) -> dict:
         from agents.meeting_agent import get_meetings_for_destination
         return "meetings", get_meetings_for_destination(destination, user_id, travel_dates)
 
-    results = {}
     agent_map = {
         "run_hotels": "hotel_agent",
         "run_travel": "travel_mode_agent",
@@ -152,9 +195,16 @@ def _run_agents_parallel(trip_details: dict, user_id: int) -> dict:
         "run_guide": "guide_agent",
         "run_meetings": "meeting_agent",
     }
-    tasks = [run_hotels, run_travel, run_weather, run_checklist, run_guide, run_meetings]
+    # Weather and meetings are always fresh; stable agents skipped when cached
+    all_tasks = [run_hotels, run_travel, run_weather, run_checklist, run_guide, run_meetings]
+    tasks = [t for t in all_tasks
+             if t.__name__.replace("run_", "") not in _cached_keys]
 
-    with ThreadPoolExecutor(max_workers=6) as executor:
+    if not tasks:
+        registry.record_success("orchestrator")
+        return results
+
+    with ThreadPoolExecutor(max_workers=max(1, len(tasks))) as executor:
         start_times = {}
         futures = {}
         for task in tasks:

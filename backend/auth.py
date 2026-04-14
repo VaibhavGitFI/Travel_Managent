@@ -15,17 +15,19 @@ from cachetools import TTLCache
 
 logger = logging.getLogger(__name__)
 
-# In-memory user cache — avoids DB round-trip on every request (60s TTL)
-_user_cache = TTLCache(maxsize=100, ttl=60)
+# In-memory user cache — avoids DB round-trip on every request (60s TTL).
+# maxsize=5000 holds 5,000 active user records before LRU eviction kicks in.
+_user_cache = TTLCache(maxsize=5000, ttl=60)
 
 # ── JWT Token Blacklist ───────────────────────────────────────────────────────
 # Two-layer store:
-#   L1 — in-process dict: fast path, avoids a DB call on every non-revoked request.
-#         Entries expire automatically (keyed by expiry Unix timestamp).
+#   L1 — TTLCache (bounded): fast path, avoids a DB call on every non-revoked request.
+#         maxsize=50000 caps memory (~50MB worst-case); ttl=3600 auto-evicts stale
+#         entries hourly so the cache never grows unbounded even under heavy logout load.
 #   L2 — database (token_blacklist table): persists revocations across all Cloud Run
 #         instances and process restarts. L1 is populated on first DB hit so the
-#         same token does not cause a DB round-trip more than once per 5 minutes.
-_blacklist_l1: dict[str, float] = {}   # {token_hash: expiry_unix_float}
+#         same revoked token does not cause a DB round-trip more than once per hour.
+_blacklist_l1: TTLCache = TTLCache(maxsize=50000, ttl=3600)  # bounded, self-evicting
 _blacklist_last_cleanup = 0.0
 
 
@@ -65,11 +67,13 @@ def _is_token_blacklisted(token_hash: str) -> bool:
             same revoked token does not hammer the DB on every request.
     """
     now = time.time()
-    # L1 fast path
+    # L1 fast path — use .get() to avoid KeyError if TTLCache evicts the entry
+    # between the `in` check and the value read (TOCTOU on green-thread switches).
     if token_hash in _blacklist_l1:
-        if _blacklist_l1[token_hash] > now:
+        expiry = _blacklist_l1.get(token_hash)
+        if expiry is not None and expiry > now:
             return True
-        # Expired entry — remove it
+        # Expired or evicted — remove it
         _blacklist_l1.pop(token_hash, None)
 
     # L2 database (cross-instance)
@@ -183,8 +187,9 @@ def validate_csrf(f):
 
 # ── Multi-tenancy helpers ─────────────────────────────────────────────────────
 
-# Cache for org membership lookups (user_id → {org_id, org_role})
-_org_cache = TTLCache(maxsize=200, ttl=120)
+# Cache for org membership lookups (user_id → {org_id, org_role}).
+# maxsize=5000 holds 5,000 org memberships before LRU eviction; 120s TTL unchanged.
+_org_cache = TTLCache(maxsize=5000, ttl=120)
 
 
 def get_user_org(user_id: int) -> dict | None:

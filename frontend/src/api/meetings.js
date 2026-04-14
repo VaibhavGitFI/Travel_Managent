@@ -1,3 +1,4 @@
+
 import client from './client'
 
 export const getMeetings = async (tripIdOrParams) => {
