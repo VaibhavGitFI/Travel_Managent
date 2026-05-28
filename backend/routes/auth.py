@@ -4,7 +4,7 @@ Handles login, logout, register, password reset, and current-user endpoints.
 """
 import logging
 import secrets
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from flask import Blueprint, request, jsonify, session
 from werkzeug.security import generate_password_hash
 from auth import (login_user, logout_user, get_current_user, verify_token,
@@ -44,6 +44,21 @@ def _store_auth_code(code: str, code_type: str, user_id: int,
 
 def _validate_auth_code(code: str, code_type: str) -> dict | None:
     """Return the auth_codes row if the code is valid and unexpired, else None."""
+    def _coerce_expiry(value) -> datetime | None:
+        if isinstance(value, datetime):
+            expires_at = value
+        else:
+            raw = str(value or "").strip()
+            if not raw:
+                return None
+            try:
+                expires_at = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+        if expires_at.tzinfo is not None:
+            expires_at = expires_at.astimezone(timezone.utc).replace(tzinfo=None)
+        return expires_at
+
     db = get_db()
     try:
         row = db.execute(
@@ -53,9 +68,10 @@ def _validate_auth_code(code: str, code_type: str) -> dict | None:
         if not row:
             return None
         r = dict(row)
-        # Check expiry (stored as ISO string, lexicographic compare is correct)
-        if r["expires_at"] < datetime.utcnow().isoformat():
+        expires_at = _coerce_expiry(r.get("expires_at"))
+        if not expires_at or expires_at < datetime.utcnow():
             return None
+        r["expires_at"] = expires_at.isoformat()
         return r
     finally:
         db.close()
@@ -293,8 +309,18 @@ def _send_verification_email(email: str, name: str, code: str):
         email_service.send_notification(
             to_email=email,
             title="Verify Your Email",
-            message=f"Hi {name},\n\nYour verification code is:\n\n{code}\n\nEnter this code to activate your TravelSync Pro account. It expires in 15 minutes.",
-            notification_type="info",
+            message=(
+                f"Hi {name},\n\n"
+                "Use the verification code below to activate your TravelSync Pro account."
+            ),
+            notification_type="verification_code",
+            code=code,
+            code_label="Verification Code",
+            note=(
+                "This code expires in 15 minutes. "
+                "If you did not create this account, you can ignore this email."
+            ),
+            details={"Account": email, "Expires In": "15 minutes"},
         )
     except Exception as exc:
         logger.warning("[Auth] Failed to send verification email: %s", exc)
@@ -330,8 +356,18 @@ def forgot_password():
             email_service.send_notification(
                 to_email=email,
                 title="Password Reset Code",
-                message=f"Hi {name},\n\nYour password reset code is:\n\n{reset_code}\n\nThis code expires in 15 minutes. If you did not request this, please ignore this email.",
-                notification_type="info",
+                message=(
+                    f"Hi {name},\n\n"
+                    "Use the reset code below to choose a new password for your account."
+                ),
+                notification_type="reset_code",
+                code=reset_code,
+                code_label="Reset Code",
+                note=(
+                    "This code expires in 15 minutes. "
+                    "If you did not request a password reset, you can ignore this email."
+                ),
+                details={"Account": email, "Expires In": "15 minutes"},
             )
         except Exception as exc:
             logger.warning("[Auth] Failed to send reset email: %s", exc)

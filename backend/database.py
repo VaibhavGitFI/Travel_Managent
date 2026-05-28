@@ -760,6 +760,56 @@ def _create_tables(c, pg=None):
         created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )""")
 
+    # ── OTIS Voice Assistant Tables ───────────────────────────────────────────
+    c.execute(f"""
+    CREATE TABLE IF NOT EXISTS otis_sessions (
+        id                {pk},
+        org_id            INTEGER,
+        user_id           INTEGER REFERENCES users(id),
+        session_id        TEXT UNIQUE NOT NULL,
+        status            TEXT DEFAULT 'active',
+        wake_word_detected INTEGER DEFAULT 0,
+        total_turns       INTEGER DEFAULT 0,
+        started_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        ended_at          TIMESTAMP
+    )""")
+
+    c.execute(f"""
+    CREATE TABLE IF NOT EXISTS otis_commands (
+        id               {pk},
+        org_id           INTEGER,
+        user_id          INTEGER REFERENCES users(id),
+        session_id       TEXT,
+        command_text     TEXT,
+        transcript       TEXT,
+        response_text    TEXT,
+        success          INTEGER DEFAULT 1,
+        latency_ms       INTEGER DEFAULT 0,
+        function_called  TEXT,
+        function_result  TEXT,
+        created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+
+    c.execute(f"""
+    CREATE TABLE IF NOT EXISTS otis_analytics (
+        id               {pk},
+        org_id           INTEGER,
+        date             TEXT NOT NULL,
+        total_commands   INTEGER DEFAULT 0,
+        created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(org_id, date)
+    )""")
+
+    c.execute(f"""
+    CREATE TABLE IF NOT EXISTS otis_settings (
+        id               {pk},
+        org_id           INTEGER,
+        user_id          INTEGER REFERENCES users(id) UNIQUE,
+        settings_json    TEXT DEFAULT '{{}}',
+        created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+
     # ── Indexes for query performance ─────────────────────────────────────────
     _create_indexes(c, use_pg)
 
@@ -964,6 +1014,36 @@ def _apply_migrations_pg(db):
         db.execute("UPDATE users SET avatar_initials = ? WHERE id = ?", (initials, row["id"]))
     db.commit()
 
+    # OTIS voice tables
+    for _sql in [
+        """CREATE TABLE IF NOT EXISTS otis_sessions (
+            id SERIAL PRIMARY KEY, org_id INTEGER, user_id INTEGER,
+            session_id TEXT UNIQUE NOT NULL, status TEXT DEFAULT 'active',
+            wake_word_detected INTEGER DEFAULT 0, total_turns INTEGER DEFAULT 0,
+            started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, ended_at TIMESTAMP)""",
+        """CREATE TABLE IF NOT EXISTS otis_commands (
+            id SERIAL PRIMARY KEY, org_id INTEGER, user_id INTEGER,
+            session_id TEXT, command_text TEXT, transcript TEXT, response_text TEXT,
+            success INTEGER DEFAULT 1, latency_ms INTEGER DEFAULT 0,
+            function_called TEXT, function_result TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""",
+        """CREATE TABLE IF NOT EXISTS otis_analytics (
+            id SERIAL PRIMARY KEY, org_id INTEGER, date TEXT NOT NULL,
+            total_commands INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(org_id, date))""",
+        """CREATE TABLE IF NOT EXISTS otis_settings (
+            id SERIAL PRIMARY KEY, org_id INTEGER,
+            user_id INTEGER UNIQUE, settings_json TEXT DEFAULT '{}',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""",
+    ]:
+        try:
+            db.execute(_sql)
+            db.commit()
+        except Exception:
+            pass
+
 
 def _apply_migrations(db, c):
     """ALTER TABLE to add any columns that were added in later schema versions."""
@@ -1051,6 +1131,36 @@ def _apply_migrations(db, c):
     _add_col("organizations", "status",        "TEXT DEFAULT 'active'")
     _add_col("organizations", "features_json", "TEXT DEFAULT '{}'")
     _add_col("organizations", "notes",         "TEXT")
+
+    # OTIS voice tables (SQLite)
+    for _sql in [
+        """CREATE TABLE IF NOT EXISTS otis_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, org_id INTEGER, user_id INTEGER,
+            session_id TEXT UNIQUE NOT NULL, status TEXT DEFAULT 'active',
+            wake_word_detected INTEGER DEFAULT 0, total_turns INTEGER DEFAULT 0,
+            started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, ended_at TIMESTAMP)""",
+        """CREATE TABLE IF NOT EXISTS otis_commands (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, org_id INTEGER, user_id INTEGER,
+            session_id TEXT, command_text TEXT, transcript TEXT, response_text TEXT,
+            success INTEGER DEFAULT 1, latency_ms INTEGER DEFAULT 0,
+            function_called TEXT, function_result TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""",
+        """CREATE TABLE IF NOT EXISTS otis_analytics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, org_id INTEGER, date TEXT NOT NULL,
+            total_commands INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(org_id, date))""",
+        """CREATE TABLE IF NOT EXISTS otis_settings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, org_id INTEGER,
+            user_id INTEGER UNIQUE, settings_json TEXT DEFAULT '{}',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""",
+    ]:
+        try:
+            c.execute(_sql)
+            db.commit()
+        except Exception:
+            pass
 
     # Sync full_name from name for existing users
     c.execute("""

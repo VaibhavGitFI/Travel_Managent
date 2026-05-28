@@ -627,13 +627,29 @@ def _process_cliq_message(body: str, user: dict | None, phone_key: str) -> str:
         _add_to_history(phone_key, "assistant", result)
         return result
 
-    # Trip queries
-    if has("trip") or has("travel") and any(w in text for w in ("my", "status", "show", "list", "upcoming")):
-        if any(w in text for w in ("my", "status", "show", "list", "upcoming", "recent")):
-            result = _get_user_trips(user["id"])
-            _add_to_history(phone_key, "user", body)
-            _add_to_history(phone_key, "assistant", result)
-            return result
+    # Plan trip intent — must come BEFORE the "show trips" query block
+    if any(w in text for w in ("plan", "book", "create", "new", "add", "request")) and \
+       any(w in text for w in ("trip", "travel", "journey", "flight", "ticket")):
+        reply = (
+            "*Plan a New Trip*\n\n"
+            "Use the TravelSync web app for full AI trip planning:\n"
+            "• Flights, hotels, weather, packing list\n"
+            "• Auto-generates travel request for approval\n\n"
+            "Or create a quick travel request here:\n"
+            "Type: *trip <origin> to <destination> on <dates>*\n\n"
+            "Example:\n"
+            "trip Mumbai to Delhi on Apr 20-22 for client meeting"
+        )
+        _add_to_history(phone_key, "user", body)
+        _add_to_history(phone_key, "assistant", reply)
+        return reply
+
+    # Trip queries — show existing trips
+    if (has("trip") or has("travel")) and any(w in text for w in ("my", "status", "show", "list", "upcoming", "recent")):
+        result = _get_user_trips(user["id"])
+        _add_to_history(phone_key, "user", body)
+        _add_to_history(phone_key, "assistant", result)
+        return result
 
     # Meeting queries
     if any(w in text for w in ("meeting", "meetings")) and any(w in text for w in ("my", "upcoming", "next", "client", "show", "list", "schedule")):

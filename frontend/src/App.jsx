@@ -1,7 +1,7 @@
 import { useEffect, Suspense, lazy } from 'react'
 import { Routes, Route, Navigate } from 'react-router-dom'
 import useStore from './store/useStore'
-import { getAccessToken, getMe, refreshTokens } from './api/auth'
+import { getMe, refreshTokens } from './api/auth'
 import { getMyOrganization } from './api/organizations'
 import Layout from './components/layout/Layout'
 import Spinner from './components/ui/Spinner'
@@ -21,6 +21,7 @@ const Profile       = lazy(() => import('./pages/Profile'))
 const UserManagement = lazy(() => import('./pages/UserManagement'))
 const Organization   = lazy(() => import('./pages/Organization'))
 const PlatformAdmin  = lazy(() => import('./pages/PlatformAdmin'))
+const OtisDashboard  = lazy(() => import('./pages/OtisDashboard'))
 
 function PageLoader() {
   return (
@@ -42,8 +43,7 @@ export default function App() {
   // Re-validate session on mount — also restores JWT access token from sessionStorage
   // so that raw fetch() calls (e.g. streaming) have a Bearer token and bypass CSRF.
   useEffect(() => {
-    if (!auth.isLoggedIn) return
-    if (auth.user && getAccessToken()) return
+    if (!auth.isLoggedIn || auth.user) return
     setLoading(true)
 
     const restore = async () => {
@@ -189,6 +189,14 @@ export default function App() {
             element={
               <Suspense fallback={<PageLoader />}>
                 <PlatformAdmin />
+              </Suspense>
+            }
+          />
+          <Route
+            path="/otis"
+            element={
+              <Suspense fallback={<PageLoader />}>
+                <OtisDashboard />
               </Suspense>
             }
           />

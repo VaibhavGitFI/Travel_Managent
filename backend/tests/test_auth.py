@@ -83,6 +83,34 @@ def test_login_unverified_blocked(client):
     assert data.get("needs_verification") is True
 
 
+def test_verify_email_with_generated_code(client):
+    email = "verify_me@test.com"
+    resp = client.post("/api/auth/register", json={
+        "full_name": "Verify Me",
+        "email": email,
+        "password": "VerifyPass1",
+        "department": "Engineering",
+    })
+    assert resp.status_code in (200, 201)
+
+    from database import get_db
+    db = get_db()
+    row = db.execute(
+        "SELECT code FROM auth_codes WHERE email = ? AND type = 'verify' ORDER BY expires_at DESC LIMIT 1",
+        (email,),
+    ).fetchone()
+    db.close()
+
+    assert row is not None
+
+    verify = client.post("/api/auth/verify-email", json={"code": row["code"]})
+    data = verify.get_json()
+    assert verify.status_code == 200
+    assert data["success"] is True
+    assert "access_token" in data
+    assert data["user"]["email"] == email
+
+
 def test_me_endpoint(auth_client):
     resp = auth_client.get("/api/auth/me")
     data = resp.get_json()

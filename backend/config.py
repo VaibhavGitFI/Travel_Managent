@@ -99,7 +99,56 @@ class Config:
     OPENWEATHER_API_KEY   = _get_env_or_secret("OPENWEATHER_API_KEY")
     OPEN_EXCHANGE_APP_ID  = _get_env_or_secret("OPEN_EXCHANGE_APP_ID")
     GOOGLE_VISION_API_KEY = _get_env_or_secret("GOOGLE_VISION_API_KEY")
+    GOOGLE_TTS_API_KEY    = _get_env_or_secret("GOOGLE_TTS_API_KEY")
+    GOOGLE_STT_API_KEY    = _get_env_or_secret("GOOGLE_STT_API_KEY")
     GOOGLE_SEARCH_CX      = _get_env_or_secret("GOOGLE_SEARCH_CX")
+
+    # OTIS Voice Assistant
+    DEEPGRAM_API_KEY        = _get_env_or_secret("DEEPGRAM_API_KEY")
+    ELEVENLABS_API_KEY      = _get_env_or_secret("ELEVENLABS_API_KEY")
+    PORCUPINE_ACCESS_KEY    = _get_env_or_secret("PORCUPINE_ACCESS_KEY")
+    OTIS_ENABLED            = os.getenv("OTIS_ENABLED", "true").lower() == "true"
+    OTIS_ADMIN_ONLY         = os.getenv("OTIS_ADMIN_ONLY", "false").lower() == "true"
+    OTIS_REQUIRE_CONFIRMATION = os.getenv("OTIS_REQUIRE_CONFIRMATION", "false").lower() == "true"
+    OTIS_WAKE_WORD          = os.getenv("OTIS_WAKE_WORD", "Hey Otis")
+    OTIS_VOICE_ID           = os.getenv("OTIS_VOICE_ID", "").strip()
+    OTIS_VOICE_LABEL        = os.getenv("OTIS_VOICE_LABEL", "Indian English Male").strip()
+    OTIS_VOICE_LANGUAGE     = os.getenv("OTIS_VOICE_LANGUAGE", "en-IN").strip() or "en-IN"
+    OTIS_VOICE_GENDER       = os.getenv("OTIS_VOICE_GENDER", "male").strip().lower() or "male"
+    # ElevenLabs model — eleven_multilingual_v2 handles Indian-English accent best
+    OTIS_VOICE_MODEL_ID     = os.getenv("OTIS_VOICE_MODEL_ID", "eleven_multilingual_v2").strip() or "eleven_multilingual_v2"
+    # speaker_boost adds ~150 ms of processing — off by default for lower latency
+    OTIS_VOICE_USE_SPEAKER_BOOST = os.getenv("OTIS_VOICE_USE_SPEAKER_BOOST", "false").lower() == "true"
+    # Gemini TTS (natural conversational voice via Gemini Developer API)
+    GEMINI_TTS_MODEL        = os.getenv("GEMINI_TTS_MODEL", "gemini-2.5-flash-preview-tts").strip() or "gemini-2.5-flash-preview-tts"
+    GEMINI_TTS_VOICE        = os.getenv("GEMINI_TTS_VOICE", "Charon").strip() or "Charon"
+    # Google TTS (Indian voice fallback, REST API, no package needed)
+    # Voice options: en-IN-Neural2-C (male) | en-IN-Neural2-B (male) | en-IN-Neural2-D (female)
+    # Requires: enable "Cloud Text-to-Speech API" for your GOOGLE_TTS_API_KEY / GOOGLE_VISION_API_KEY in Cloud Console
+    GOOGLE_TTS_VOICE        = os.getenv("GOOGLE_TTS_VOICE", "en-IN-Neural2-C").strip() or "en-IN-Neural2-C"
+    # Provider order: "gemini" = Gemini first, "google" = Google Indian first, "elevenlabs" = ElevenLabs first
+    OTIS_TTS_PROVIDER       = os.getenv("OTIS_TTS_PROVIDER", "google").strip().lower() or "google"
+    # Speech-to-text provider order: "google" = Google STT first, "deepgram" = Deepgram first
+    OTIS_STT_PROVIDER       = os.getenv("OTIS_STT_PROVIDER", "deepgram").strip().lower() or "deepgram"
+    try:
+        OTIS_MAX_SESSION_DURATION   = int(os.getenv("OTIS_MAX_SESSION_DURATION", "3600"))
+        OTIS_IDLE_TIMEOUT           = int(os.getenv("OTIS_IDLE_TIMEOUT", "600"))
+        OTIS_MAX_COMMANDS_PER_SESSION = int(os.getenv("OTIS_MAX_COMMANDS_PER_SESSION", "50"))
+        OTIS_VOICE_SPEED            = float(os.getenv("OTIS_VOICE_SPEED", "1.0"))
+        OTIS_VOICE_PITCH            = float(os.getenv("OTIS_VOICE_PITCH", "0.0"))
+        OTIS_VOICE_STABILITY        = float(os.getenv("OTIS_VOICE_STABILITY", "0.5"))
+        OTIS_VOICE_SIMILARITY       = float(os.getenv("OTIS_VOICE_SIMILARITY", "0.75"))
+        # style=0 skips the style-transfer pass — saves ~50 ms per request
+        OTIS_VOICE_STYLE            = float(os.getenv("OTIS_VOICE_STYLE", "0.0"))
+    except (ValueError, TypeError):
+        OTIS_MAX_SESSION_DURATION   = 3600
+        OTIS_IDLE_TIMEOUT           = 600
+        OTIS_MAX_COMMANDS_PER_SESSION = 50
+        OTIS_VOICE_SPEED            = 1.0
+        OTIS_VOICE_PITCH            = 0.0
+        OTIS_VOICE_STABILITY        = 0.5
+        OTIS_VOICE_SIMILARITY       = 0.75
+        OTIS_VOICE_STYLE            = 0.0
 
     # Notifications — WhatsApp (Twilio)
     TWILIO_ACCOUNT_SID    = _get_env_or_secret("TWILIO_ACCOUNT_SID")

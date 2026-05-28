@@ -15,7 +15,13 @@ from services.gemini_service import gemini
 from services.flights_service import flights as flights_svc, get_airport_code
 
 
-def recommend_travel_mode(trip_details: dict, model=None) -> dict:
+def recommend_travel_mode(
+    trip_details: dict,
+    model=None,
+    *,
+    include_live_flights: bool = True,
+    include_ai_tip: bool = True,
+) -> dict:
     """
     Recommend optimal travel mode(s) based on distance and preferences.
     Returns flight options (live from Amadeus), train/bus/cab links.
@@ -58,7 +64,7 @@ def recommend_travel_mode(trip_details: dict, model=None) -> dict:
 
     # ── Flights ──────────────────────────────────────────────
     # Show flights if: distance warrants it, AI recommends it, or user explicitly asked
-    if distance_km > 300 or mode["primary"] == "flight" or preferred_mode == "flight":
+    if include_live_flights and (distance_km > 300 or mode["primary"] == "flight" or preferred_mode == "flight"):
         origin_code = get_airport_code(origin)
         dest_code = get_airport_code(destination)
         flight_data = flights_svc.search_flights(
@@ -120,7 +126,7 @@ def recommend_travel_mode(trip_details: dict, model=None) -> dict:
         }
 
     # AI tip
-    if gemini.is_available:
+    if include_ai_tip and gemini.is_available:
         prompt = (f"In one sentence, give the best travel advice for a business trip from "
                   f"{origin} to {destination} ({distance_km:.0f}km, {num_travelers} traveler(s), "
                   f"purpose: {purpose}). Mention the recommended mode.")

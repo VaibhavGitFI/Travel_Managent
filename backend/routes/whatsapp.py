@@ -30,6 +30,7 @@ from services.state_store import StateNamespace
 
 _conversations = StateNamespace("wa:conversations", ttl_seconds=7200)   # 2 hours
 _pending_expenses = StateNamespace("wa:pending_expenses", ttl_seconds=1800)  # 30 min
+_wa_expense_flow = StateNamespace("wa:expense_flow", ttl_seconds=1800)       # guided add-expense flow
 
 
 def _get_history(phone: str) -> list[dict]:
@@ -479,9 +480,10 @@ def _ai_chat(user: dict, message: str, phone: str) -> str:
         "- Currency conversion, weather forecasts, packing tips\n\n"
         "## Response Rules\n"
         "- Respond concisely in under 200 words\n"
-        "- Use *bold* only for section headings and key data\n"
+        "- DO NOT use markdown symbols like *, **, #, ##, or _ in responses — plain text only\n"
+        "- Use UPPERCASE for section headings (e.g. HOTEL OPTIONS, YOUR EXPENSES)\n"
         "- Use numbered lists (1. 2. 3.) for recommendations\n"
-        "- Use bullet points for details\n"
+        "- Use dashes (-) for bullet points\n"
         "- Add a blank line between sections\n"
         "- Never reveal AI model name — you are TravelSync Pro\n"
         "- Be professional, clear, and well-structured\n"
@@ -729,6 +731,116 @@ def _ai_categorize_receipt(ocr_text: str, caption: str, ocr_extracted: dict) -> 
 
     # Fallback: keyword categorization from OCR text
     return {"category": _categorize_text(ocr_text + " " + (caption or "")), "description": caption or ""}
+
+
+def _handle_wa_expense_flow(phone: str, text: str, raw: str, user: dict) -> str:
+    """Guided step-by-step expense submission via WhatsApp."""
+    import time as _time
+
+    CAT_LABELS = {
+        "flight": "Flight", "hotel": "Hotel", "food": "Food & Meals",
+        "transport": "Local Transport", "visa": "Visa / Docs",
+        "communication": "Communication", "other": "Other",
+    }
+    CAT_MAP = {
+        "1": "flight", "flight": "flight", "flights": "flight",
+        "2": "hotel", "hotel": "hotel", "accommodation": "hotel",
+        "3": "food", "food": "food", "meals": "food", "meal": "food",
+        "4": "transport", "transport": "transport", "cab": "transport", "taxi": "transport", "uber": "transport",
+        "5": "visa", "visa": "visa", "docs": "visa",
+        "6": "communication", "communication": "communication", "internet": "communication",
+        "7": "other", "other": "other", "misc": "other",
+    }
+
+    flow = _wa_expense_flow.get(phone, {})
+    step = flow.get("step")
+
+    if text == "cancel":
+        _wa_expense_flow.pop(phone, None)
+        return "Expense cancelled. Type add expense to start again."
+
+    if step == "amount":
+        cleaned = "".join(c for c in raw.strip() if c.isdigit() or c == ".")
+        try:
+            amount = float(cleaned)
+            if amount <= 0 or amount > 1000000:
+                return "Please enter a valid amount between 1 and 10,00,000.\n\nExample: 500"
+            flow["amount"] = amount
+            flow["step"] = "description"
+            _wa_expense_flow[phone] = flow
+            return f"Amount set: Rs. {amount:,.2f}\n\nNow describe the expense:\n\nExample: Uber cab to airport"
+        except (ValueError, TypeError):
+            return "Invalid amount. Please enter a number.\n\nExample: 500"
+
+    if step == "description":
+        if len(raw.strip()) < 2:
+            return "Please enter a brief description.\n\nExample: Uber cab to airport"
+        flow["description"] = raw.strip()
+        # Auto-detect category
+        auto_cat = _categorize_text(raw.strip())
+        if auto_cat and auto_cat != "other":
+            flow["category"] = auto_cat
+            flow["step"] = "confirm"
+            _wa_expense_flow[phone] = flow
+            return (
+                f"Expense Summary\n\n"
+                f"Amount: Rs. {flow['amount']:,.2f}\n"
+                f"Description: {flow['description']}\n"
+                f"Category: {CAT_LABELS.get(auto_cat, auto_cat)} (auto-detected)\n"
+                f"Date: {_time.strftime('%Y-%m-%d')}\n\n"
+                f"Reply yes to save or no to cancel."
+            )
+        else:
+            flow["step"] = "category"
+            _wa_expense_flow[phone] = flow
+            return (
+                f"Amount: Rs. {flow['amount']:,.2f}\n"
+                f"Description: {flow['description']}\n\n"
+                f"Select category:\n\n"
+                f"1 - Flight\n2 - Hotel\n3 - Food & Meals\n"
+                f"4 - Local Transport\n5 - Visa / Docs\n6 - Communication\n7 - Other"
+            )
+
+    if step == "category":
+        cat = CAT_MAP.get(text.lower())
+        if not cat:
+            return "Please reply with a number 1-7 or category name.\n\n1 - Flight\n2 - Hotel\n3 - Food & Meals\n4 - Local Transport\n5 - Visa / Docs\n6 - Communication\n7 - Other"
+        flow["category"] = cat
+        flow["step"] = "confirm"
+        _wa_expense_flow[phone] = flow
+        return (
+            f"Expense Summary\n\n"
+            f"Amount: Rs. {flow['amount']:,.2f}\n"
+            f"Description: {flow['description']}\n"
+            f"Category: {CAT_LABELS.get(cat, cat)}\n"
+            f"Date: {_time.strftime('%Y-%m-%d')}\n\n"
+            f"Reply yes to save or no to cancel."
+        )
+
+    if step == "confirm":
+        if text in ("yes", "confirm", "save", "ok", "y", "submit"):
+            saved = _save_expense(
+                flow["user_id"], flow["category"], flow["description"],
+                flow["amount"], "", _time.strftime("%Y-%m-%d"), source="whatsapp"
+            )
+            _wa_expense_flow.pop(phone, None)
+            if saved:
+                return (
+                    f"Expense Saved\n\n"
+                    f"Amount: Rs. {flow['amount']:,.2f}\n"
+                    f"Description: {flow['description']}\n"
+                    f"Category: {CAT_LABELS.get(flow['category'], flow['category'])}\n\n"
+                    f"Added to TravelSync Pro. Type expenses to view all."
+                )
+            return "Could not save the expense. Please try on the web app."
+        elif text in ("no", "cancel", "n"):
+            _wa_expense_flow.pop(phone, None)
+            return "Expense cancelled. Type add expense to start again."
+        else:
+            return "Reply yes to save or no to cancel."
+
+    _wa_expense_flow.pop(phone, None)
+    return "Something went wrong. Type add expense to try again."
 
 
 def _handle_quick_expense(user: dict, body: str, phone: str) -> str:
@@ -979,6 +1091,10 @@ def _process_message(from_number: str, body: str) -> str:
                 f"Type 'cancel' to discard this expense."
             )
 
+    # Guided expense flow — step-by-step if active for this user
+    if phone in _wa_expense_flow:
+        return _handle_wa_expense_flow(phone, text, body, user)
+
     # Commands (these don't need conversation context)
     if text in ("1", "trips", "my trips"):
         return _get_user_trips(user["id"])
@@ -1009,6 +1125,33 @@ def _process_message(from_number: str, body: str) -> str:
             "100 - Police\n"
             "101 - Fire\n\n"
             "To send an SOS alert to your manager, please use the TravelSync Pro app."
+        )
+
+    # Cancel expense flow
+    if text == "cancel" and phone in _wa_expense_flow:
+        _wa_expense_flow.pop(phone, None)
+        return "Expense cancelled. Type *add expense* to start again."
+
+    # Start guided expense flow — natural language triggers
+    _expense_add_words = ("add", "submit", "log", "record", "create", "enter", "help", "want", "new")
+    _expense_noun_words = ("expense", "expenses", "receipt", "bill", "cost")
+    if any(w in text for w in _expense_add_words) and any(w in text for w in _expense_noun_words):
+        _wa_expense_flow[phone] = {"step": "amount", "user_id": user["id"]}
+        return (
+            "*Add New Expense*\n\n"
+            "Enter the amount in Rupees:\n\n"
+            "Example: 500\n\n"
+            "Type *cancel* at any time to stop."
+        )
+
+    # Start via "start expense" command or menu button
+    if text in ("start expense", "add expense", "new expense", "log expense"):
+        _wa_expense_flow[phone] = {"step": "amount", "user_id": user["id"]}
+        return (
+            "*Add New Expense*\n\n"
+            "Enter the amount in Rupees:\n\n"
+            "Example: 500\n\n"
+            "Type *cancel* at any time to stop."
         )
 
     # Quick expense: "expense 500 uber cab to airport"
@@ -1063,13 +1206,29 @@ def _process_message(from_number: str, body: str) -> str:
         _add_to_history(phone, "assistant", result)
         return result
 
-    # Trip queries — "my trips", "trip status", "travel status"
-    if has("trip") or has("travel") and any(w in text for w in ("my", "status", "show", "list", "upcoming")):
-        if any(w in text for w in ("my", "status", "show", "list", "upcoming", "recent")):
-            result = _get_user_trips(user["id"])
-            _add_to_history(phone, "user", body)
-            _add_to_history(phone, "assistant", result)
-            return result
+    # Plan trip intent — must come BEFORE the "show trips" query block
+    if any(w in text for w in ("plan", "book", "create", "new", "add", "request")) and \
+       any(w in text for w in ("trip", "travel", "journey", "flight", "ticket")):
+        reply = (
+            "*Plan a New Trip*\n\n"
+            "Use the TravelSync web app for full AI trip planning:\n"
+            "• Flights, hotels, weather, packing list\n"
+            "• Auto-generates travel request for approval\n\n"
+            "Or create a quick travel request here:\n"
+            "Type: *trip <origin> to <destination> on <dates>*\n\n"
+            "Example:\n"
+            "trip Mumbai to Delhi on Apr 20-22 for client meeting"
+        )
+        _add_to_history(phone, "user", body)
+        _add_to_history(phone, "assistant", reply)
+        return reply
+
+    # Trip queries — show existing trips
+    if (has("trip") or has("travel")) and any(w in text for w in ("my", "status", "show", "list", "upcoming", "recent")):
+        result = _get_user_trips(user["id"])
+        _add_to_history(phone, "user", body)
+        _add_to_history(phone, "assistant", result)
+        return result
 
     # Meeting queries — "my meetings", "upcoming meetings", "next meeting"
     if any(w in text for w in ("meeting", "meetings")) and any(w in text for w in ("my", "upcoming", "next", "client", "show", "list", "schedule")):

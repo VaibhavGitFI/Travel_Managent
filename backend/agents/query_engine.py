@@ -774,3 +774,131 @@ def handle_query(user: dict, query_text: str, strict: bool = False) -> dict:
         # Default to expense query if ambiguous
         return {"type": "expenses", "data": query_expenses(user, query_text)}
 
+
+def format_query_result_for_voice(query_result: dict, query_text: str = "") -> str | None:
+    """Format a structured query result as a concise OTIS/Jarvis voice response."""
+    if not query_result or not query_result.get("data", {}).get("success"):
+        return None
+
+    query_type = query_result.get("type")
+    data = query_result.get("data", {})
+    query_lower = (query_text or "").lower()
+
+    if query_type == "users":
+        count = int(data.get("count", 0) or 0)
+        scope = data.get("scope", "self")
+        org_name = data.get("org_name")
+        scope_text = {
+            "all": "the platform",
+            "org": org_name or "your organisation",
+            "team": "your team",
+            "self": "your account",
+        }.get(scope, "your scope")
+
+        if scope == "self":
+            user_row = (data.get("users") or [{}])[0]
+            name = user_row.get("full_name") or user_row.get("name") or user_row.get("username") or "you"
+            role = _humanize_role(user_row.get("role", "user"))
+            return f"I found your user record. You are logged in as {name}, with the role of {role}."
+
+        first_sentence = f"There are {count} users in {scope_text} right now."
+
+        role_parts = []
+        for row in data.get("role_breakdown", [])[:3]:
+            role_count = int(row.get("count", 0) or 0)
+            role_name = _humanize_role(row.get("role", "user"))
+            role_parts.append(f"{role_count} {_pluralize(role_name, role_count)}")
+
+        second_sentence = None
+        if role_parts:
+            second_sentence = "That includes " + ", ".join(role_parts[:-1]) + (f", and {role_parts[-1]}." if len(role_parts) > 1 else f"{role_parts[0]}.")
+
+        if len(role_parts) == 2:
+            second_sentence = f"That includes {role_parts[0]} and {role_parts[1]}."
+
+        third_sentence = None
+        verified_count = data.get("verified_count")
+        if verified_count is not None and any(word in query_lower for word in ["overview", "summary", "verified", "verification"]):
+            third_sentence = f"{int(verified_count)} {_pluralize('account', int(verified_count))} have verified email."
+
+        preview_names = []
+        if any(word in query_lower for word in ["list", "show", "who", "which", "name"]):
+            for user_row in (data.get("users") or [])[:3]:
+                preview_names.append(
+                    user_row.get("full_name") or user_row.get("name") or user_row.get("username") or "Unknown user"
+                )
+        if preview_names:
+            third_sentence = f"The first few are {', '.join(preview_names[:-1]) + f', and {preview_names[-1]}' if len(preview_names) > 1 else preview_names[0]}."
+
+        return " ".join(part for part in [first_sentence, second_sentence, third_sentence] if part)
+
+    if query_type == "approvals":
+        count = int(data.get("count", 0) or 0)
+        approvals = data.get("approvals", []) or []
+        if count == 0:
+            return "You have no approvals waiting right now."
+        names = []
+        for approval in approvals[:3]:
+            destination = approval.get("destination") or "an unnamed trip"
+            requester = approval.get("requester_name")
+            if requester:
+                names.append(f"{destination} for {requester}")
+            else:
+                names.append(destination)
+        detail = f" The latest are {', '.join(names[:-1]) + f', and {names[-1]}' if len(names) > 1 else names[0]}." if names else ""
+        return f"You have {count} pending {_pluralize('approval', count)}.{detail}"
+
+    if query_type == "trips":
+        count = int(data.get("count", 0) or 0)
+        scope = data.get("scope", "self")
+        scope_text = {
+            "all": "the platform",
+            "org": "your organisation",
+            "team": "your team",
+            "self": "your account",
+        }.get(scope, "your scope")
+        trips = data.get("trips", []) or []
+        if count == 0:
+            return f"I could not find any travel requests in {scope_text}."
+        status_counts = {}
+        for trip in trips:
+            status = (trip.get("status") or "unknown").lower()
+            status_counts[status] = status_counts.get(status, 0) + 1
+        status_sentence = None
+        if status_counts:
+            parts = [f"{value} {status}" for status, value in status_counts.items()]
+            status_sentence = "In the latest results, " + ", ".join(parts[:-1]) + (f", and {parts[-1]}." if len(parts) > 1 else f"{parts[0]}.")
+            if len(parts) == 2:
+                status_sentence = f"In the latest results, {parts[0]} and {parts[1]}."
+        return " ".join(part for part in [f"I found {count} travel {_pluralize('request', count)} in {scope_text}.", status_sentence] if part)
+
+    if query_type == "expenses":
+        count = int(data.get("count", 0) or 0)
+        total_amount = float(data.get("total_amount", 0) or 0)
+        if count == 0:
+            return "I could not find any matching expenses."
+        return f"I found {count} {_pluralize('expense', count)} totalling {total_amount:,.0f} rupees."
+
+    if query_type == "meetings":
+        count = int(data.get("count", 0) or 0)
+        meetings = data.get("meetings", []) or []
+        if count == 0:
+            return "You have no matching meetings right now."
+        next_meeting = meetings[0]
+        client_name = next_meeting.get("client_name") or next_meeting.get("company")
+        meeting_date = next_meeting.get("meeting_date")
+        if client_name and meeting_date:
+            return f"You have {count} upcoming {_pluralize('meeting', count)}. The next one is with {client_name} on {meeting_date}."
+        return f"You have {count} upcoming {_pluralize('meeting', count)}."
+
+    if query_type == "analytics":
+        expense_count = int(data.get("expenses", {}).get("count", 0) or 0)
+        expense_total = float(data.get("expenses", {}).get("total_amount", 0) or 0)
+        trip_count = int(data.get("trips", {}).get("count", 0) or 0)
+        trip_total = float(data.get("trips", {}).get("total_budget", 0) or 0)
+        return (
+            f"Your analytics show {trip_count} {_pluralize('trip', trip_count)} worth {trip_total:,.0f} rupees, "
+            f"and {expense_count} {_pluralize('expense', expense_count)} totalling {expense_total:,.0f} rupees."
+        )
+
+    return None

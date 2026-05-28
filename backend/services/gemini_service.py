@@ -12,6 +12,8 @@ import logging
 import time
 from typing import Dict, List, Optional, Any
 
+from config import Config
+
 logger = logging.getLogger(__name__)
 
 GEMINI_MODELS = {
@@ -23,7 +25,7 @@ GEMINI_MODELS = {
 
 class GeminiService:
     def __init__(self):
-        self.api_key = os.getenv("GEMINI_API_KEY")
+        self.api_key = Config.GEMINI_API_KEY or os.getenv("GEMINI_API_KEY")
         self.configured = bool(self.api_key)
         self._genai = None
         self._cooldown_until = 0.0
@@ -206,6 +208,247 @@ class GeminiService:
                 return None
             logger.warning("[Gemini] Image analysis error: %s", e)
             return None
+
+    def _format_otis_context_value(self, value: Any) -> str | None:
+        """Convert context values into compact prompt-friendly text."""
+        if value is None:
+            return None
+        if isinstance(value, str):
+            text = value.strip()
+            return text or None
+        if isinstance(value, (int, float, bool)):
+            return str(value)
+        if isinstance(value, list):
+            if not value:
+                return None
+            items = []
+            for item in value[:3]:
+                formatted = self._format_otis_context_value(item)
+                if formatted:
+                    items.append(formatted)
+            if not items:
+                return None
+            extra = len(value) - len(items)
+            suffix = f" (+{extra} more)" if extra > 0 else ""
+            return "; ".join(items) + suffix
+        if isinstance(value, dict):
+            compact = {
+                k: v for k, v in value.items()
+                if v not in (None, "", [], {})
+            }
+            if not compact:
+                return None
+            try:
+                return json.dumps(compact, ensure_ascii=True, default=str, separators=(",", ":"))
+            except TypeError:
+                return str(compact)
+        return str(value)
+
+    def _build_otis_context_block(self, context: Dict[str, Any] | None) -> str:
+        """Serialize OTIS context into a concise block for Gemini."""
+        if not isinstance(context, dict) or not context:
+            return ""
+
+        preferred_order = [
+            "user_name",
+            "user_role",
+            "user_email",
+            "org_id",
+            "pending_expense_count",
+            "pending_expense_total",
+            "total_expenses",
+            "pending_approval_count",
+            "recent_trips",
+            "pending_approvals",
+            "upcoming_meetings",
+        ]
+        keys = preferred_order + [k for k in context.keys() if k not in preferred_order]
+        lines = []
+        seen = set()
+
+        for key in keys:
+            if key in seen:
+                continue
+            seen.add(key)
+            formatted = self._format_otis_context_value(context.get(key))
+            if not formatted:
+                continue
+            label = key.replace("_", " ")
+            lines.append(f"- {label}: {formatted}")
+
+        return "\n".join(lines)
+
+    def _normalize_otis_history(self, conversation_history: List[Dict[str, Any]] | None) -> List[Dict[str, str]]:
+        """Normalize OTIS history into user/assistant pairs."""
+        normalized = []
+        for turn in conversation_history or []:
+            if not isinstance(turn, dict):
+                continue
+            user_input = (
+                turn.get("user_input")
+                or turn.get("user")
+                or turn.get("prompt")
+                or ""
+            ).strip()
+            assistant_response = (
+                turn.get("assistant_response")
+                or turn.get("assistant")
+                or turn.get("response")
+                or ""
+            ).strip()
+            if not user_input and not assistant_response:
+                continue
+            normalized.append({
+                "user_input": user_input,
+                "assistant_response": assistant_response,
+            })
+        return normalized[-5:]
+
+    def _build_otis_system_instruction(self, context: Dict[str, Any] | None = None) -> str:
+        """System instruction for OTIS voice/text replies."""
+        user_bits = []
+        if isinstance(context, dict):
+            user_name = (context.get("user_name") or "").strip()
+            user_role = (context.get("user_role") or "").strip()
+            if user_name:
+                user_bits.append(f"You are speaking to {user_name}.")
+            if user_role:
+                user_bits.append(f"Their role is {user_role}.")
+
+        user_context = " ".join(user_bits)
+        return (
+            "You are OTIS, a friendly, smart travel assistant who talks like a real person — "
+            "warm, direct, and conversational, the way a knowledgeable colleague speaks, not a robot. "
+            f"{user_context} "
+            "Rules: plain text only — no markdown, bullets, headings, code blocks, or emojis. "
+            "Use contractions (I've, you'll, it's, don't, let's). "
+            "Keep voice replies compact and easy to listen to. "
+            "When a request is broad, open-ended, or missing constraints, give a short helpful answer and then ask one short follow-up question instead of giving a long monologue. "
+            "Only give a longer reply when the user clearly asks for depth or multiple examples. "
+            "Sound natural: vary sentence length, start with the answer not a preamble, "
+            "and never say 'Certainly!', 'Of course!', 'Sure thing!' or similar filler. "
+            "You can answer any user question: TravelSync tasks, general knowledge, explanations, planning, writing help, "
+            "productivity questions, and casual conversation. "
+            "Use the TravelSync context whenever it is relevant to the question. "
+            "If the question is outside TravelSync, answer it normally from general knowledge instead of refusing. "
+            "Don't invent private TravelSync data that isn't in the context. "
+            "Ask one short follow-up when something's unclear. "
+            "TravelSync-specific strengths include hotel search, flights/trains/buses, weather, currency conversion, "
+            "trip planning, travel requests, expenses, meetings, approvals, analytics, and SOS alerts."
+        ).strip()
+
+    def _build_otis_answer_instruction(self, prompt: str) -> str:
+        """Match answer depth to the user's request without producing long spoken monologues."""
+        prompt_lower = (prompt or "").strip().lower()
+
+        broad_markers = (
+            "what can you help me with", "what all can you do", "what can you do",
+            "help me with", "best", "options", "ideas", "recommend", "suggest",
+            "plan", "some jokes", "jokes options", "which is better", "what should i choose",
+        )
+        explicit_depth_markers = (
+            "explain", "why", "how", "compare", "difference", "tell me more",
+            "details", "walk me through", "what are", "what's the best",
+            "pros and cons",
+        )
+        multi_example_markers = (
+            "three jokes", "3 jokes", "five ideas", "5 ideas", "examples", "ways", "steps",
+            "list", "compare", "pros and cons",
+        )
+
+        if any(marker in prompt_lower for marker in broad_markers):
+            return (
+                "Answer as OTIS in plain text suitable for speech. "
+                "Give one short helpful answer, then ask exactly one short follow-up question to narrow the user's need. "
+                "Keep the whole reply brief and avoid listing too many options at once."
+            )
+
+        if any(marker in prompt_lower for marker in explicit_depth_markers):
+            if any(marker in prompt_lower for marker in multi_example_markers):
+                return (
+                    "Answer as OTIS in plain text suitable for speech. "
+                    "Give a helpful answer with a few useful points or examples, but keep it easy to listen to."
+                )
+            return (
+                "Answer as OTIS in plain text suitable for speech. "
+                "Answer directly in two to four short sentences."
+            )
+
+        return (
+            "Answer as OTIS in plain text suitable for speech. "
+            "Keep it brief and natural."
+        )
+
+    def _clean_voice_response(self, text: str | None) -> str | None:
+        """Remove markdown/noisy formatting while keeping text readable on screen."""
+        if not text:
+            return None
+
+        cleaned = text.strip()
+        cleaned = re.sub(r"```(?:[\w+-]+)?\s*", "", cleaned)
+        cleaned = cleaned.replace("```", "")
+        cleaned = re.sub(r"\[(.*?)\]\((.*?)\)", r"\1", cleaned)
+        cleaned = re.sub(r"\*\*(.*?)\*\*", r"\1", cleaned)
+        cleaned = re.sub(r"__(.*?)__", r"\1", cleaned)
+        cleaned = re.sub(r"`([^`]*)`", r"\1", cleaned)
+        cleaned = re.sub(r"^\s*[-*•]+\s+", "", cleaned, flags=re.MULTILINE)
+        cleaned = re.sub(r"^#{1,6}\s+", "", cleaned, flags=re.MULTILINE)
+        cleaned = re.sub(r"\n{2,}", ". ", cleaned)
+        cleaned = re.sub(r"\n+", " ", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
+        cleaned = re.sub(r"([.?!]){2,}", r"\1", cleaned)
+        return cleaned.strip()
+
+    def generate_voice_optimized(
+        self,
+        prompt: str,
+        context: Dict[str, Any] | None = None,
+        conversation_history: List[Dict[str, Any]] | None = None,
+        model_type: str = "flash",
+    ) -> str | None:
+        """
+        Generate a concise OTIS response suitable for both speech and UI display.
+        Compatible with existing OTIS route and agent call sites.
+        """
+        if not prompt or not prompt.strip():
+            return None
+        if not self.configured or not self._genai:
+            return None
+        if self._cooldown_until > time.time():
+            return None
+
+        system_instruction = self._build_otis_system_instruction(context)
+        context_block = self._build_otis_context_block(context)
+
+        prompt_parts = []
+        if context_block:
+            prompt_parts.append("[TravelSync Context]\n" + context_block)
+        prompt_parts.append("[User Request]\n" + prompt.strip())
+        prompt_parts.append(self._build_otis_answer_instruction(prompt))
+        current_message = "\n\n".join(prompt_parts)
+
+        messages = []
+        for turn in self._normalize_otis_history(conversation_history):
+            if turn["user_input"]:
+                messages.append({"role": "user", "parts": [turn["user_input"]]})
+            if turn["assistant_response"]:
+                messages.append({"role": "model", "parts": [turn["assistant_response"]]})
+        messages.append({"role": "user", "parts": [current_message]})
+
+        response_text = self.generate_with_history(
+            system_instruction=system_instruction,
+            messages=messages,
+            model_type=model_type,
+        )
+        if not response_text:
+            response_text = self.generate(
+                current_message,
+                model_type=model_type,
+                system_instruction=system_instruction,
+            )
+
+        return self._clean_voice_response(response_text)
 
     def generate_travel_plan(self, destination: str, duration: int, purpose: str, preferences: dict) -> dict | None:
         """Generate a structured travel plan using Gemini Pro."""

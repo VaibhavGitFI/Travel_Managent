@@ -59,8 +59,10 @@ class CliqService:
         if self._access_token and time.time() < self._token_expiry:
             return self._access_token
         try:
+            # Use accounts.zoho.com for global DC; zoho.in for India-only accounts
+            accounts_dc = "accounts.zoho.in" if "zoho.in" in (self.api_endpoint or "") else "accounts.zoho.com"
             resp = http_requests.post(
-                "https://accounts.zoho.in/oauth/v2/token",
+                f"https://{accounts_dc}/oauth/v2/token",
                 params={
                     "refresh_token": self.refresh_token,
                     "client_id": self.client_id,
