@@ -3,18 +3,274 @@ TravelSync Pro — Database Layer
 SQLite for development. Set DATABASE_URL for Cloud SQL PostgreSQL in production.
 
 Schema versioning via _apply_migrations() — safely adds new columns to existing DBs.
+
+get_db() returns a unified interface that works identically for both SQLite and PostgreSQL:
+  - Rows support both dict access (row["key"]) and attribute access
+  - SQL uses '?' placeholders (auto-converted to '%s' for PostgreSQL)
+  - .execute(), .fetchone(), .fetchall(), .commit(), .close() all work the same
 """
 import os
+import re
 import json
 import logging
 import sqlite3
 import datetime as dt
+from contextlib import contextmanager
+from dotenv import load_dotenv
+
+# Ensure .env is loaded before checking DATABASE_URL
+_env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+load_dotenv(_env_path, override=False)
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "travelsync.db")
 logger = logging.getLogger(__name__)
+_pg_force_sqlite = False
 
 
-def get_db():
+class _PGRow(dict):
+    """Dict-like row wrapper that also supports attribute access (like sqlite3.Row)."""
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return list(self.values())[key]
+        return super().__getitem__(key)
+
+    def get(self, key, default=None):
+        return super().get(key, default)
+
+    def keys(self):
+        return super().keys()
+
+
+def _sqlite_fmt_to_pg(fmt: str) -> str:
+    """Convert SQLite strftime format to PostgreSQL TO_CHAR format."""
+    return (fmt
+            .replace("%Y", "YYYY")
+            .replace("%m", "MM")
+            .replace("%d", "DD")
+            .replace("%H", "HH24")
+            .replace("%M", "MI")
+            .replace("%S", "SS"))
+
+
+class _PGCursor:
+    """sqlite3-compatible cursor wrapper around psycopg2 cursor."""
+
+    def __init__(self, cur):
+        self._cur = cur
+
+    def execute(self, sql: str, params=()):
+        # Convert SQLite strftime to PostgreSQL TO_CHAR
+        pg_sql = re.sub(
+            r"strftime\(\s*'([^']+)'\s*,\s*(\w+)\s*\)",
+            lambda m: f"TO_CHAR({m.group(2)}, '{_sqlite_fmt_to_pg(m.group(1))}')",
+            sql,
+        )
+        # Convert SQLite last_insert_rowid() to PostgreSQL lastval()
+        pg_sql = re.sub(r"last_insert_rowid\(\s*\)", "lastval()", pg_sql, flags=re.IGNORECASE)
+        # Convert SQLite JULIANDAY(col) to PostgreSQL equivalent.
+        # JULIANDAY returns a float count of days; the PG equivalent uses epoch seconds / 86400.
+        # Handles both TEXT and DATE column types via explicit ::date cast.
+        pg_sql = re.sub(
+            r"\bJULIANDAY\(([^)]+)\)",
+            lambda m: f"(EXTRACT(EPOCH FROM ({m.group(1)})::date) / 86400.0)",
+            pg_sql,
+            flags=re.IGNORECASE,
+        )
+        pg_sql = re.sub(r"\?", "%s", pg_sql)
+        self._cur.execute(pg_sql, params or ())
+        return self
+
+    def fetchone(self):
+        row = self._cur.fetchone()
+        return _PGRow(row) if row else None
+
+    def fetchall(self):
+        return [_PGRow(r) for r in self._cur.fetchall()]
+
+    def __iter__(self):
+        return (_PGRow(r) for r in self._cur)
+
+
+class _PGAdapter:
+    """sqlite3-compatible wrapper around psycopg2 connection."""
+
+    def __init__(self, conn):
+        self._conn = conn
+        import psycopg2.extras
+        self._cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        self.row_factory = None  # compatibility attribute
+
+    def execute(self, sql: str, params=()):
+        cursor = _PGCursor(self._cur)
+        try:
+            cursor.execute(sql, params)
+        except Exception:
+            # Rollback the failed statement so the connection stays usable.
+            # Without this, PostgreSQL leaves the connection in
+            # "InFailedSqlTransaction" state and all subsequent queries also fail.
+            try:
+                self._conn.rollback()
+            except Exception:
+                pass
+            raise
+        return cursor
+
+    def commit(self):
+        self._conn.commit()
+
+    def rollback(self):
+        self._conn.rollback()
+
+    def close(self):
+        try:
+            self._cur.close()
+        except Exception:
+            pass
+        try:
+            self._conn.close()
+        except Exception:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, *args):
+        if exc_type:
+            self._conn.rollback()
+        self.close()
+
+
+class _PGPoolAdapter(_PGAdapter):
+    """Pooled version — returns connection to pool on close instead of destroying it."""
+
+    def __init__(self, conn, pool):
+        super().__init__(conn)
+        self._pool = pool
+
+    def close(self):
+        try:
+            self._cur.close()
+        except Exception:
+            pass
+        # Roll back any uncommitted transaction before returning to pool.
+        # This prevents the "set_session cannot be used inside a transaction"
+        # error on the next getconn() call and avoids leaving dirty state.
+        try:
+            if self._conn.closed == 0:
+                import psycopg2.extensions as _ext
+                if self._conn.status not in (_ext.STATUS_READY,):
+                    self._conn.rollback()
+        except Exception:
+            pass
+        try:
+            self._pool.putconn(self._conn)
+        except Exception:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+
+    def rollback(self):
+        try:
+            self._conn.rollback()
+        except Exception:
+            pass
+
+    def __exit__(self, exc_type, *args):
+        if exc_type:
+            try:
+                self._conn.rollback()
+            except Exception:
+                pass
+        self.close()
+
+
+_pg_pool = None
+_pg_pool_lock = __import__('threading').Lock()
+_pg_pool_last_failure = 0.0
+
+# Pool tuning — per Cloud Run instance (single Gunicorn worker, eventlet green threads).
+# MINCONN=1: create only one initial connection so the lazy-init first request is fast
+#   (3 connections × TLS handshake was adding ~1.5s to the first request).
+#   The pool grows to MAXCONN on demand; additional connections are created lazily.
+# MAXCONN=20: matches realistic burst concurrency (Cloud Run concurrency=80 but not
+#   all green threads hold a DB connection simultaneously). DATABASE_URL points to
+#   Supabase Supavisor (session pooler) which multiplexes these connections.
+#   Override via env vars: DB_POOL_MINCONN, DB_POOL_MAXCONN.
+_PG_MINCONN = max(1, int(os.getenv("DB_POOL_MINCONN", "1")))
+_PG_MAXCONN = max(_PG_MINCONN, int(os.getenv("DB_POOL_MAXCONN", "20")))
+_PG_ACQUIRE_RETRIES = 3   # retries before giving up on pool
+_PG_ACQUIRE_BACKOFF = 0.1  # initial back-off seconds (doubles each retry)
+_PG_POOL_FAILURE_COOLDOWN = float(os.getenv("DB_POOL_FAILURE_COOLDOWN", "15"))
+# Per-connection timeouts added to the DSN to prevent runaway queries / stale conns
+_PG_CONNECT_TIMEOUT = int(os.getenv("DB_CONNECT_TIMEOUT", "10"))      # seconds (GCP→Supabase-AWS cross-cloud)
+_PG_STATEMENT_TIMEOUT = int(os.getenv("DB_STATEMENT_TIMEOUT", "15000"))  # milliseconds
+
+
+def _get_pg_pool():
+    """Get or create a PostgreSQL connection pool (lazy singleton)."""
+    global _pg_pool, _pg_pool_last_failure
+    if _pg_pool is not None:
+        return _pg_pool
+    with _pg_pool_lock:
+        if _pg_pool is not None:
+            return _pg_pool
+        import time
+        if _pg_pool_last_failure and (time.time() - _pg_pool_last_failure) < _PG_POOL_FAILURE_COOLDOWN:
+            return None
+        database_url = os.getenv("DATABASE_URL")
+        if not database_url:
+            return None
+        try:
+            from psycopg2 import pool as pg_pool
+            # NOTE: Do NOT pass `options` here. The Supabase session pooler (PgBouncer)
+            # can hang when processing the `-c statement_timeout=N` startup parameter,
+            # blocking pool creation indefinitely. Set statement_timeout per-connection
+            # after acquisition instead (see _ensure_clean_pg_conn).
+            #
+            # keepalives_* prevent Supabase from silently dropping idle connections
+            # after 120s inactivity. idle=30s: start probing; interval=10s; count=3.
+            _pg_pool = pg_pool.ThreadedConnectionPool(
+                minconn=_PG_MINCONN,
+                maxconn=_PG_MAXCONN,
+                dsn=database_url,
+                connect_timeout=_PG_CONNECT_TIMEOUT,
+                keepalives=1,
+                keepalives_idle=30,
+                keepalives_interval=10,
+                keepalives_count=3,
+            )
+            logger.info(
+                "[DB] PostgreSQL pool created (%d-%d conns, connect_timeout=%ds, keepalives=on)",
+                _PG_MINCONN, _PG_MAXCONN, _PG_CONNECT_TIMEOUT,
+            )
+            _pg_pool_last_failure = 0.0
+            return _pg_pool
+        except ImportError:
+            logger.warning("[DB] psycopg2 not installed — falling back to SQLite")
+        except Exception as exc:
+            _pg_pool_last_failure = time.time()
+            logger.error("[DB] PostgreSQL pool creation failed: %s — falling back to direct Supabase connection", exc)
+    return None
+
+
+def _running_managed_env() -> bool:
+    return bool(
+        os.getenv("K_SERVICE")
+        or os.getenv("GAE_APPLICATION")
+        or os.getenv("CLOUD_RUN_JOB")
+        or os.getenv("GCP_PROJECT_ID")
+    )
+
+
+def _allow_sqlite_fallback() -> bool:
+    """Allow local dev to boot even when Supabase/Postgres is unavailable."""
+    if os.getenv("DB_REQUIRE_POSTGRES", "").lower() == "true":
+        return False
+    return not _running_managed_env()
+
+
+def _sqlite_connect():
     db = sqlite3.connect(DB_PATH)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA foreign_keys = ON")
@@ -22,28 +278,242 @@ def get_db():
     return db
 
 
+def _fallback_sqlite(reason: str):
+    global _pg_force_sqlite
+    if not _pg_force_sqlite:
+        logger.warning("[DB] PostgreSQL unavailable, switching this process to SQLite: %s", reason)
+    _pg_force_sqlite = True
+    return _sqlite_connect()
+
+
+def _ensure_clean_pg_conn(conn, pool):
+    """
+    Make sure a psycopg2 connection is in a usable state before handing it
+    to a caller.
+
+    * If the connection is closed, discard it (put back with close=True).
+    * If the connection has a pending / errored transaction left over from a
+      previous use without a proper close, roll it back.
+
+    Returns True if the connection is healthy, False if it was discarded.
+    Never executes a query (to avoid opening a new transaction prematurely).
+    """
+    try:
+        import psycopg2.extensions as _ext
+        if conn.closed != 0:
+            try:
+                pool.putconn(conn, close=True)
+            except Exception:
+                pass
+            return False
+        # Roll back any leftover transaction without opening a new one
+        if conn.status not in (_ext.STATUS_READY, _ext.STATUS_IN_TRANSACTION):
+            # STATUS_INTRANS_INERROR or unknown — reset to ready
+            conn.rollback()
+        elif conn.status == _ext.STATUS_IN_TRANSACTION:
+            conn.rollback()
+    except Exception:
+        # If we can't even check, discard the connection
+        try:
+            pool.putconn(conn, close=True)
+        except Exception:
+            pass
+        return False
+    return True
+
+
+def _pool_getconn_with_retry(pool):
+    """
+    Acquire a connection from the pool with exponential-backoff retries.
+
+    On heavy load the pool may be momentarily exhausted.  Rather than
+    immediately raising (and returning a 500 to the client), we wait a
+    short time and retry up to _PG_ACQUIRE_RETRIES times.  If the pool
+    itself is broken (e.g. Supabase restarted) we recreate it once and
+    try again before giving up.
+    """
+    import time
+    global _pg_pool
+
+    last_exc = None
+    backoff = _PG_ACQUIRE_BACKOFF
+
+    for attempt in range(_PG_ACQUIRE_RETRIES):
+        try:
+            conn = pool.getconn()
+            # Ensure the connection is clean (no stale transaction, not closed).
+            # We check connection state without executing any SQL so we do not
+            # accidentally open a transaction before the caller is ready.
+            if not _ensure_clean_pg_conn(conn, pool):
+                raise Exception("Stale connection discarded — retrying")
+            return conn
+        except Exception as exc:
+            last_exc = exc
+            logger.warning(
+                "[DB] Pool getconn attempt %d/%d failed: %s — retrying in %.2fs",
+                attempt + 1, _PG_ACQUIRE_RETRIES, exc, backoff,
+            )
+            time.sleep(backoff)
+            backoff *= 2  # exponential back-off: 0.1 → 0.2 → 0.4 s
+
+            # Second-to-last attempt: try to recreate the pool in case it is broken.
+            if attempt == _PG_ACQUIRE_RETRIES - 2:
+                with _pg_pool_lock:
+                    database_url = os.getenv("DATABASE_URL")
+                    if database_url:
+                        try:
+                            from psycopg2 import pool as pg_pool_mod
+                            try:
+                                _pg_pool.closeall()
+                            except Exception:
+                                pass
+                            _pg_pool = pg_pool_mod.ThreadedConnectionPool(
+                                minconn=_PG_MINCONN,
+                                maxconn=_PG_MAXCONN,
+                                dsn=database_url,
+                                connect_timeout=_PG_CONNECT_TIMEOUT,
+                                options=f"-c statement_timeout={_PG_STATEMENT_TIMEOUT}",
+                            )
+                            pool = _pg_pool
+                            logger.info("[DB] PostgreSQL pool recreated after failure")
+                        except Exception as recreate_exc:
+                            logger.error("[DB] Pool recreation failed: %s", recreate_exc)
+
+    raise RuntimeError(
+        f"Supabase PostgreSQL connection failed after {_PG_ACQUIRE_RETRIES} attempts: {last_exc}"
+    ) from last_exc
+
+
+def table_columns(db, table: str) -> set:
+    """Return set of column names for a table. Works for both SQLite and PostgreSQL (Supabase)."""
+    if isinstance(db, _PGAdapter):
+        rows = db.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = ?",
+            (table,),
+        ).fetchall()
+        return {r["column_name"] for r in rows}
+    # SQLite
+    rows = db.execute(f"PRAGMA table_info({table})").fetchall()
+    return {r[1] for r in rows}
+
+
+def get_db():
+    """Return a database connection. Uses Supabase PostgreSQL when DATABASE_URL is set.
+    Falls back to SQLite only when no DATABASE_URL is configured (local dev without Supabase).
+
+    The pool is acquired with retry + exponential backoff so that transient
+    exhaustion under heavy load does not immediately surface as a 500 error.
+    If the pool is unrecoverable a direct connection is attempted as a final
+    fallback before raising.
+    """
+    global _pg_force_sqlite
+    database_url = os.getenv("DATABASE_URL")
+    if database_url and not _pg_force_sqlite:
+        pool = _get_pg_pool()
+        if pool:
+            try:
+                conn = _pool_getconn_with_retry(pool)
+                conn.autocommit = False
+                return _PGPoolAdapter(conn, pool)
+            except RuntimeError:
+                if _allow_sqlite_fallback():
+                    return _fallback_sqlite("connection pool acquisition failed")
+                raise
+            except Exception as exc:
+                if _allow_sqlite_fallback():
+                    return _fallback_sqlite(str(exc))
+                logger.error("[DB] Supabase pool getconn failed: %s", exc)
+                raise RuntimeError(f"Supabase PostgreSQL connection failed: {exc}") from exc
+        # Pool creation failed — try direct connection as last resort
+        try:
+            import psycopg2
+            conn = psycopg2.connect(database_url)
+            conn.autocommit = False
+            logger.warning("[DB] Using direct Supabase connection (pool unavailable)")
+            return _PGAdapter(conn)
+        except Exception as exc:
+            if _allow_sqlite_fallback():
+                return _fallback_sqlite(str(exc))
+            logger.error("[DB] Direct Supabase connection also failed: %s", exc)
+            raise RuntimeError(f"Cannot connect to Supabase: {exc}") from exc
+
+    # No DATABASE_URL — local dev / tests use SQLite
+    return _sqlite_connect()
+
+
+@contextmanager
+def transaction():
+    """Context manager for atomic multi-step database operations.
+
+    Usage:
+        with transaction() as db:
+            db.execute("INSERT ...")
+            db.execute("UPDATE ...")
+        # Auto-commits on success, auto-rolls back on exception.
+
+    Non-DB side effects (email, webhook) should happen AFTER the with block.
+    """
+    conn = get_db()
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
+
+
+def _is_pg():
+    """Check if PostgreSQL is configured."""
+    return bool(os.getenv("DATABASE_URL"))
+
+
 def init_db(app=None):
     """Initialize all tables, apply migrations, and seed demo data."""
-    db = sqlite3.connect(DB_PATH)
-    c = db.cursor()
-    _create_tables(c)
-    db.commit()
-    _apply_migrations(db, c)
-    _seed_users(c, db)
-    _seed_policy(c, db)
-    _seed_requests(c, db)
-    _seed_meetings(c, db)
-    _seed_expenses(c, db)
-    db.close()
-    logger.info("[DB] Database initialized")
+    # Try PostgreSQL first; if connection fails, get_db() falls back to SQLite
+    db = get_db()
+    using_pg = isinstance(db, _PGAdapter)
+
+    if using_pg:
+        _create_tables(db, pg=True)
+        db.commit()
+        _apply_migrations_pg(db)
+        _seed_users(db, db)
+        _seed_policy(db, db)
+        _seed_requests(db, db)
+        _seed_meetings(db, db)
+        _seed_expenses(db, db)
+        db.close()
+    else:
+        db.close()
+        db = sqlite3.connect(DB_PATH)
+        c = db.cursor()
+        _create_tables(c, pg=False)
+        db.commit()
+        _apply_migrations(db, c)
+        _seed_users(c, db)
+        _seed_policy(c, db)
+        _seed_requests(c, db)
+        _seed_meetings(c, db)
+        _seed_expenses(c, db)
+        db.close()
+    logger.info("[DB] Database initialized (%s)", "PostgreSQL" if using_pg else "SQLite")
 
 
 # ── Table Creation ─────────────────────────────────────────────────────────────
 
-def _create_tables(c):
-    c.execute("""
+def _create_tables(c, pg=None):
+    # PostgreSQL uses SERIAL instead of INTEGER PRIMARY KEY AUTOINCREMENT
+    use_pg = pg if pg is not None else _is_pg()
+    pk = "SERIAL PRIMARY KEY" if use_pg else "INTEGER PRIMARY KEY AUTOINCREMENT"
+
+    c.execute(f"""
     CREATE TABLE IF NOT EXISTS users (
-        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        id               {pk},
         username         TEXT UNIQUE NOT NULL,
         password_hash    TEXT NOT NULL,
         name             TEXT NOT NULL,
@@ -57,9 +527,38 @@ def _create_tables(c):
         created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )""")
 
-    c.execute("""
+    # ── Multi-tenancy: Organizations ──────────────────────────────────────────
+    c.execute(f"""
+    CREATE TABLE IF NOT EXISTS organizations (
+        id               {pk},
+        name             TEXT NOT NULL,
+        slug             TEXT UNIQUE NOT NULL,
+        logo_url         TEXT,
+        plan             TEXT DEFAULT 'free',
+        status           TEXT DEFAULT 'active',
+        settings_json    TEXT DEFAULT '{{}}',
+        billing_email    TEXT,
+        max_members      INTEGER DEFAULT 50,
+        features_json    TEXT DEFAULT '{{}}',
+        notes            TEXT,
+        created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+
+    c.execute(f"""
+    CREATE TABLE IF NOT EXISTS org_members (
+        id               {pk},
+        org_id           INTEGER NOT NULL REFERENCES organizations(id),
+        user_id          INTEGER NOT NULL REFERENCES users(id),
+        org_role         TEXT DEFAULT 'member',
+        department       TEXT DEFAULT 'General',
+        invited_by       INTEGER,
+        joined_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+
+    c.execute(f"""
     CREATE TABLE IF NOT EXISTS travel_policies (
-        id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+        id                      {pk},
+        org_id                  INTEGER REFERENCES organizations(id),
         name                    TEXT NOT NULL,
         flight_class            TEXT DEFAULT 'economy',
         hotel_budget_per_night  INTEGER DEFAULT 5000,
@@ -72,9 +571,10 @@ def _create_tables(c):
         created_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )""")
 
-    c.execute("""
+    c.execute(f"""
     CREATE TABLE IF NOT EXISTS travel_requests (
-        id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+        id                      {pk},
+        org_id                  INTEGER REFERENCES organizations(id),
         request_id              TEXT UNIQUE,
         user_id                 INTEGER REFERENCES users(id),
         destination             TEXT NOT NULL,
@@ -93,7 +593,7 @@ def _create_tables(c):
         budget_inr              REAL DEFAULT 0,
         status                  TEXT DEFAULT 'draft',
         policy_compliance       TEXT DEFAULT 'pending',
-        policy_compliance_json  TEXT DEFAULT '{}',
+        policy_compliance_json  TEXT DEFAULT '{{}}',
         compliance_details      TEXT,
         trip_plan               TEXT,
         notes                   TEXT,
@@ -101,9 +601,10 @@ def _create_tables(c):
         updated_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )""")
 
-    c.execute("""
+    c.execute(f"""
     CREATE TABLE IF NOT EXISTS approvals (
-        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        id           {pk},
+        org_id       INTEGER REFERENCES organizations(id),
         request_id   TEXT REFERENCES travel_requests(request_id),
         approver_id  INTEGER REFERENCES users(id),
         status       TEXT DEFAULT 'pending',
@@ -112,9 +613,10 @@ def _create_tables(c):
         created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )""")
 
-    c.execute("""
+    c.execute(f"""
     CREATE TABLE IF NOT EXISTS expenses_db (
-        id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+        id                   {pk},
+        org_id               INTEGER REFERENCES organizations(id),
         request_id           TEXT,
         trip_id              TEXT,
         user_id              INTEGER REFERENCES users(id),
@@ -135,9 +637,10 @@ def _create_tables(c):
         created_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )""")
 
-    c.execute("""
+    c.execute(f"""
     CREATE TABLE IF NOT EXISTS client_meetings (
-        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        id             {pk},
+        org_id         INTEGER REFERENCES organizations(id),
         user_id        INTEGER,
         destination    TEXT,
         client_name    TEXT NOT NULL,
@@ -155,9 +658,10 @@ def _create_tables(c):
         updated_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )""")
 
-    c.execute("""
+    c.execute(f"""
     CREATE TABLE IF NOT EXISTS sos_events (
-        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        id             {pk},
+        org_id         INTEGER REFERENCES organizations(id),
         user_id        INTEGER,
         destination    TEXT,
         location       TEXT,
@@ -167,10 +671,21 @@ def _create_tables(c):
         created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )""")
 
-    c.execute("""
+    c.execute(f"""
+    CREATE TABLE IF NOT EXISTS chat_sessions (
+        id          TEXT PRIMARY KEY,
+        org_id      INTEGER REFERENCES organizations(id),
+        user_id     INTEGER NOT NULL,
+        title       TEXT DEFAULT 'New Chat',
+        created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+
+    c.execute(f"""
     CREATE TABLE IF NOT EXISTS chat_messages (
-        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        id               {pk},
         user_id          INTEGER,
+        session_id       TEXT,
         role             TEXT NOT NULL,
         content          TEXT NOT NULL,
         intent           TEXT,
@@ -178,9 +693,10 @@ def _create_tables(c):
         created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )""")
 
-    c.execute("""
+    c.execute(f"""
     CREATE TABLE IF NOT EXISTS notifications (
-        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        id         {pk},
+        org_id     INTEGER REFERENCES organizations(id),
         user_id    INTEGER REFERENCES users(id),
         type       TEXT DEFAULT 'info',
         title      TEXT NOT NULL,
@@ -190,8 +706,344 @@ def _create_tables(c):
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )""")
 
+    c.execute(f"""
+    CREATE TABLE IF NOT EXISTS audit_logs (
+        id           {pk},
+        org_id       INTEGER,
+        actor_id     INTEGER,
+        actor_email  TEXT,
+        action       TEXT NOT NULL,
+        entity       TEXT NOT NULL,
+        entity_id    TEXT,
+        diff_json    TEXT,
+        ip_address   TEXT,
+        user_agent   TEXT,
+        created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+
+    c.execute(f"""
+    CREATE TABLE IF NOT EXISTS webhook_subscriptions (
+        id              {pk},
+        org_id          INTEGER REFERENCES organizations(id),
+        event_type      TEXT NOT NULL,
+        target_url      TEXT NOT NULL,
+        secret          TEXT NOT NULL,
+        headers_json    TEXT DEFAULT '{{}}',
+        active          INTEGER DEFAULT 1,
+        last_triggered  TIMESTAMP,
+        last_status     INTEGER,
+        failure_count   INTEGER DEFAULT 0,
+        created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+
+    # ── Auth Security Tables ──────────────────────────────────────────────────
+    # token_blacklist: persists revoked JWT hashes across processes/instances.
+    # Rows are expired by the keepalive thread every 4 minutes.
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS token_blacklist (
+        token_hash   TEXT PRIMARY KEY,
+        expires_at   TIMESTAMP NOT NULL,
+        created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+
+    # auth_codes: stores one-time codes for password reset and email verification.
+    # Replaces the previous in-memory _reset_tokens / _verify_tokens dicts so that
+    # codes work correctly across multiple Cloud Run instances.
+    c.execute(f"""
+    CREATE TABLE IF NOT EXISTS auth_codes (
+        id           {pk},
+        code         TEXT UNIQUE NOT NULL,
+        type         TEXT NOT NULL,
+        user_id      INTEGER NOT NULL REFERENCES users(id),
+        email        TEXT,
+        expires_at   TIMESTAMP NOT NULL,
+        created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+
+    # ── OTIS Voice Assistant Tables ───────────────────────────────────────────
+    c.execute(f"""
+    CREATE TABLE IF NOT EXISTS otis_sessions (
+        id                {pk},
+        org_id            INTEGER,
+        user_id           INTEGER REFERENCES users(id),
+        session_id        TEXT UNIQUE NOT NULL,
+        status            TEXT DEFAULT 'active',
+        wake_word_detected INTEGER DEFAULT 0,
+        total_turns       INTEGER DEFAULT 0,
+        started_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        ended_at          TIMESTAMP
+    )""")
+
+    c.execute(f"""
+    CREATE TABLE IF NOT EXISTS otis_commands (
+        id               {pk},
+        org_id           INTEGER,
+        user_id          INTEGER REFERENCES users(id),
+        session_id       TEXT,
+        command_text     TEXT,
+        transcript       TEXT,
+        response_text    TEXT,
+        success          INTEGER DEFAULT 1,
+        latency_ms       INTEGER DEFAULT 0,
+        function_called  TEXT,
+        function_result  TEXT,
+        created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+
+    c.execute(f"""
+    CREATE TABLE IF NOT EXISTS otis_analytics (
+        id               {pk},
+        org_id           INTEGER,
+        date             TEXT NOT NULL,
+        total_commands   INTEGER DEFAULT 0,
+        created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(org_id, date)
+    )""")
+
+    c.execute(f"""
+    CREATE TABLE IF NOT EXISTS otis_settings (
+        id               {pk},
+        org_id           INTEGER,
+        user_id          INTEGER REFERENCES users(id) UNIQUE,
+        settings_json    TEXT DEFAULT '{{}}',
+        created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+
+    # ── Indexes for query performance ─────────────────────────────────────────
+    _create_indexes(c, use_pg)
+
+
+# ── Indexes ───────────────────────────────────────────────────────────────────
+
+def _create_indexes(c, pg=False):
+    """Create indexes on foreign keys and frequently-queried columns.
+    Uses CREATE INDEX IF NOT EXISTS (safe to run on every startup).
+    """
+    indexes = [
+        # organizations & org_members
+        ("idx_org_members_org_id",            "org_members", "org_id"),
+        ("idx_org_members_user_id",           "org_members", "user_id"),
+        ("idx_organizations_slug",            "organizations", "slug"),
+        # travel_requests
+        ("idx_travel_requests_org_id",        "travel_requests", "org_id"),
+        ("idx_travel_requests_user_id",       "travel_requests", "user_id"),
+        ("idx_travel_requests_status",        "travel_requests", "status"),
+        ("idx_travel_requests_request_id",    "travel_requests", "request_id"),
+        ("idx_travel_requests_start_date",    "travel_requests", "start_date"),
+        # approvals
+        ("idx_approvals_org_id",              "approvals", "org_id"),
+        ("idx_approvals_request_id",          "approvals", "request_id"),
+        ("idx_approvals_approver_id",         "approvals", "approver_id"),
+        ("idx_approvals_status",              "approvals", "status"),
+        # expenses_db
+        ("idx_expenses_org_id",               "expenses_db", "org_id"),
+        ("idx_expenses_user_id",              "expenses_db", "user_id"),
+        ("idx_expenses_request_id",           "expenses_db", "request_id"),
+        ("idx_expenses_approval_status",      "expenses_db", "approval_status"),
+        # client_meetings
+        ("idx_meetings_org_id",               "client_meetings", "org_id"),
+        ("idx_meetings_user_id",              "client_meetings", "user_id"),
+        ("idx_meetings_meeting_date",         "client_meetings", "meeting_date"),
+        # chat_messages
+        ("idx_chat_messages_user_id",         "chat_messages", "user_id"),
+        ("idx_chat_messages_session_id",      "chat_messages", "session_id"),
+        # chat_sessions
+        ("idx_chat_sessions_org_id",          "chat_sessions", "org_id"),
+        ("idx_chat_sessions_user_id",         "chat_sessions", "user_id"),
+        # notifications
+        ("idx_notifications_org_id",          "notifications", "org_id"),
+        ("idx_notifications_user_id",         "notifications", "user_id"),
+        ("idx_notifications_read",            "notifications", "read"),
+        # sos_events
+        ("idx_sos_events_org_id",             "sos_events", "org_id"),
+        ("idx_sos_events_user_id",            "sos_events", "user_id"),
+        # travel_policies
+        ("idx_travel_policies_org_id",        "travel_policies", "org_id"),
+        # audit_logs
+        ("idx_audit_logs_org_id",             "audit_logs", "org_id"),
+        ("idx_audit_logs_actor_id",           "audit_logs", "actor_id"),
+        ("idx_audit_logs_entity",             "audit_logs", "entity"),
+        ("idx_audit_logs_created_at",         "audit_logs", "created_at"),
+        # webhook_subscriptions
+        ("idx_webhooks_org_event",            "webhook_subscriptions", "org_id"),
+        # auth security tables
+        ("idx_token_blacklist_expires",       "token_blacklist", "expires_at"),
+        ("idx_auth_codes_user_type",          "auth_codes", "user_id"),
+        ("idx_auth_codes_expires",            "auth_codes", "expires_at"),
+    ]
+    for idx_name, table, column in indexes:
+        try:
+            c.execute(f"CREATE INDEX IF NOT EXISTS {idx_name} ON {table} ({column})")
+        except Exception as e:
+            logger.debug("[DB] Index %s skipped: %s", idx_name, e)
+
+    # ── Unique constraints (safe to run on every startup) ────────────────────
+    # Prevents a user from being added to the same org multiple times.
+    try:
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_org_members_org_user ON org_members (org_id, user_id)")
+    except Exception as e:
+        logger.debug("[DB] Unique index uq_org_members_org_user skipped: %s", e)
+
+    # ── Composite indexes for multi-column WHERE + ORDER BY patterns ──────────
+    # Single-column indexes above let Postgres find rows. These composite indexes
+    # let Postgres satisfy the full WHERE + ORDER BY from the index alone —
+    # no separate sort step, no table heap access for covered columns.
+    # All use CREATE INDEX IF NOT EXISTS + try/except: safe on every startup,
+    # silently skipped if a migrated column (org_id, approval_status) does not
+    # exist yet on a fresh database (it will succeed on next startup after migration).
+    _composite_indexes = [
+        # "My trips" list — user filter + date sort (trips.py:list_trips)
+        ("idx_travel_requests_user_created",
+         "travel_requests (user_id, created_at DESC)"),
+        # Admin/manager trips list — org filter + date sort (dashboard)
+        ("idx_travel_requests_org_created",
+         "travel_requests (org_id, created_at DESC)"),
+        # Analytics compliance count — org filter + status group (analytics_agent)
+        ("idx_travel_requests_org_status",
+         "travel_requests (org_id, status)"),
+        # Approval queue — pending approvals for a manager (chat_agent, approvals route)
+        ("idx_approvals_approver_status",
+         "approvals (approver_id, status)"),
+        # Expense history — user filter + date sort (expenses route)
+        ("idx_expenses_user_created",
+         "expenses_db (user_id, created_at DESC)"),
+        # Expense approval queue — org filter + approval status (expense_approvals route)
+        ("idx_expenses_org_approval_status",
+         "expenses_db (org_id, approval_status)"),
+        # Notification badge + list — user filter + unread flag + date sort
+        ("idx_notifications_user_read_created",
+         "notifications (user_id, read, created_at DESC)"),
+        # Chat history — user filter + date sort (chat_agent context builder)
+        ("idx_chat_messages_user_created",
+         "chat_messages (user_id, created_at DESC)"),
+    ]
+    for idx_name, spec in _composite_indexes:
+        try:
+            c.execute(f"CREATE INDEX IF NOT EXISTS {idx_name} ON {spec}")
+        except Exception as e:
+            logger.debug("[DB] Composite index %s skipped: %s", idx_name, e)
+
 
 # ── Migrations: safely add columns to existing databases ───────────────────────
+
+def _apply_migrations_pg(db):
+    """PostgreSQL-compatible migrations using information_schema."""
+    def _add_col(table, col, definition):
+        try:
+            existing = {r["column_name"] for r in db.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_name = ?",
+                (table,)
+            ).fetchall()}
+            if col not in existing:
+                db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {definition}")
+                db.commit()
+                logger.info("[DB] Migration: added %s.%s", table, col)
+        except Exception as e:
+            logger.warning("[DB] Migration skipped %s.%s: %s", table, col, e)
+
+    _add_col("users", "full_name",       "TEXT")
+    _add_col("users", "avatar_initials", "TEXT")
+    _add_col("users", "phone",           "TEXT")
+    _add_col("travel_requests", "request_id",             "TEXT UNIQUE")
+    _add_col("travel_requests", "trip_type",              "TEXT DEFAULT 'domestic'")
+    _add_col("travel_requests", "start_date",             "TEXT")
+    _add_col("travel_requests", "end_date",               "TEXT")
+    _add_col("travel_requests", "num_travelers",          "INTEGER DEFAULT 1")
+    _add_col("travel_requests", "travelers_json",         "TEXT DEFAULT '[]'")
+    _add_col("travel_requests", "flight_class",           "TEXT DEFAULT 'economy'")
+    _add_col("travel_requests", "hotel_budget_per_night", "REAL DEFAULT 5000")
+    _add_col("travel_requests", "estimated_total",        "REAL DEFAULT 0")
+    _add_col("travel_requests", "policy_compliance_json", "TEXT DEFAULT '{}'")
+    _add_col("travel_requests", "notes",                  "TEXT")
+    _add_col("approvals", "decided_at", "TIMESTAMP")
+    _add_col("expenses_db", "request_id", "TEXT")
+    _add_col("chat_messages", "action_card_json", "TEXT")
+    _add_col("chat_messages", "session_id", "TEXT")
+    _add_col("users", "email_verified", "INTEGER DEFAULT 1")
+
+    # users — profile + role hierarchy
+    _add_col("users", "profile_picture", "TEXT")
+    _add_col("users", "sub_role", "TEXT")
+
+    # expenses_db — approval workflow
+    _add_col("expenses_db", "approval_status", "TEXT DEFAULT 'draft'")
+    _add_col("expenses_db", "approver_id", "INTEGER")
+    _add_col("expenses_db", "approval_comments", "TEXT")
+    _add_col("expenses_db", "submitted_at", "TIMESTAMP")
+    _add_col("expenses_db", "approved_at", "TIMESTAMP")
+
+    # expenses_db — source tracking and duplicate detection
+    _add_col("expenses_db", "source", "TEXT DEFAULT 'web'")  # whatsapp, cliq, web, manual
+    _add_col("expenses_db", "vendor", "TEXT")  # extracted vendor name for duplicate detection
+
+    # chat_sessions table (for existing databases)
+    try:
+        db.execute("""
+        CREATE TABLE IF NOT EXISTS chat_sessions (
+            id          TEXT PRIMARY KEY,
+            user_id     INTEGER NOT NULL,
+            title       TEXT DEFAULT 'New Chat',
+            created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""")
+        db.commit()
+    except Exception:
+        pass
+
+    # Multi-tenancy: org_id columns on all data tables
+    _add_col("travel_policies",  "org_id", "INTEGER")
+    _add_col("travel_requests",  "org_id", "INTEGER")
+    _add_col("approvals",        "org_id", "INTEGER")
+    _add_col("expenses_db",      "org_id", "INTEGER")
+    _add_col("client_meetings",  "org_id", "INTEGER")
+    _add_col("sos_events",       "org_id", "INTEGER")
+    _add_col("chat_sessions",    "org_id", "INTEGER")
+    _add_col("notifications",    "org_id", "INTEGER")
+
+    # Organizations: status + features columns
+    _add_col("organizations", "status",        "TEXT DEFAULT 'active'")
+    _add_col("organizations", "features_json", "TEXT DEFAULT '{}'")
+    _add_col("organizations", "notes",         "TEXT")
+
+    # Sync full_name from name for existing users
+    db.execute("UPDATE users SET full_name = name WHERE full_name IS NULL OR full_name = ''")
+    rows = db.execute("SELECT id, name FROM users WHERE avatar_initials IS NULL OR avatar_initials = ''").fetchall()
+    for row in rows:
+        initials = "".join(w[0].upper() for w in str(row["name"]).split()[:2])
+        db.execute("UPDATE users SET avatar_initials = ? WHERE id = ?", (initials, row["id"]))
+    db.commit()
+
+    # OTIS voice tables
+    for _sql in [
+        """CREATE TABLE IF NOT EXISTS otis_sessions (
+            id SERIAL PRIMARY KEY, org_id INTEGER, user_id INTEGER,
+            session_id TEXT UNIQUE NOT NULL, status TEXT DEFAULT 'active',
+            wake_word_detected INTEGER DEFAULT 0, total_turns INTEGER DEFAULT 0,
+            started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, ended_at TIMESTAMP)""",
+        """CREATE TABLE IF NOT EXISTS otis_commands (
+            id SERIAL PRIMARY KEY, org_id INTEGER, user_id INTEGER,
+            session_id TEXT, command_text TEXT, transcript TEXT, response_text TEXT,
+            success INTEGER DEFAULT 1, latency_ms INTEGER DEFAULT 0,
+            function_called TEXT, function_result TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""",
+        """CREATE TABLE IF NOT EXISTS otis_analytics (
+            id SERIAL PRIMARY KEY, org_id INTEGER, date TEXT NOT NULL,
+            total_commands INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(org_id, date))""",
+        """CREATE TABLE IF NOT EXISTS otis_settings (
+            id SERIAL PRIMARY KEY, org_id INTEGER,
+            user_id INTEGER UNIQUE, settings_json TEXT DEFAULT '{}',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""",
+    ]:
+        try:
+            db.execute(_sql)
+            db.commit()
+        except Exception:
+            pass
+
 
 def _apply_migrations(db, c):
     """ALTER TABLE to add any columns that were added in later schema versions."""
@@ -229,8 +1081,86 @@ def _apply_migrations(db, c):
     # expenses_db — add request_id linkage
     _add_col("expenses_db", "request_id", "TEXT")
 
-    # chat_messages — add action_card_json
+    # chat_messages — add action_card_json + session_id
     _add_col("chat_messages", "action_card_json", "TEXT")
+    _add_col("chat_messages", "session_id", "TEXT")
+
+    # chat_sessions table (for existing databases)
+    try:
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS chat_sessions (
+            id          TEXT PRIMARY KEY,
+            user_id     INTEGER NOT NULL,
+            title       TEXT DEFAULT 'New Chat',
+            created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""")
+        db.commit()
+    except Exception:
+        pass
+
+    # users — email verification flag (default 1 = verified for existing users)
+    _add_col("users", "email_verified", "INTEGER DEFAULT 1")
+
+    # users — profile + role hierarchy
+    _add_col("users", "profile_picture", "TEXT")
+    _add_col("users", "sub_role", "TEXT")
+
+    # expenses_db — approval workflow
+    _add_col("expenses_db", "approval_status", "TEXT DEFAULT 'draft'")
+    _add_col("expenses_db", "approver_id", "INTEGER")
+    _add_col("expenses_db", "approval_comments", "TEXT")
+    _add_col("expenses_db", "submitted_at", "TIMESTAMP")
+    _add_col("expenses_db", "approved_at", "TIMESTAMP")
+
+    # expenses_db — source tracking and duplicate detection
+    _add_col("expenses_db", "source", "TEXT DEFAULT 'web'")  # whatsapp, cliq, web, manual
+    _add_col("expenses_db", "vendor", "TEXT")  # extracted vendor name for duplicate detection
+
+    # Multi-tenancy: org_id columns on all data tables
+    _add_col("travel_policies",  "org_id", "INTEGER")
+    _add_col("travel_requests",  "org_id", "INTEGER")
+    _add_col("approvals",        "org_id", "INTEGER")
+    _add_col("expenses_db",      "org_id", "INTEGER")
+    _add_col("client_meetings",  "org_id", "INTEGER")
+    _add_col("sos_events",       "org_id", "INTEGER")
+    _add_col("chat_sessions",    "org_id", "INTEGER")
+    _add_col("notifications",    "org_id", "INTEGER")
+
+    # Organizations: status + features columns
+    _add_col("organizations", "status",        "TEXT DEFAULT 'active'")
+    _add_col("organizations", "features_json", "TEXT DEFAULT '{}'")
+    _add_col("organizations", "notes",         "TEXT")
+
+    # OTIS voice tables (SQLite)
+    for _sql in [
+        """CREATE TABLE IF NOT EXISTS otis_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, org_id INTEGER, user_id INTEGER,
+            session_id TEXT UNIQUE NOT NULL, status TEXT DEFAULT 'active',
+            wake_word_detected INTEGER DEFAULT 0, total_turns INTEGER DEFAULT 0,
+            started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, ended_at TIMESTAMP)""",
+        """CREATE TABLE IF NOT EXISTS otis_commands (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, org_id INTEGER, user_id INTEGER,
+            session_id TEXT, command_text TEXT, transcript TEXT, response_text TEXT,
+            success INTEGER DEFAULT 1, latency_ms INTEGER DEFAULT 0,
+            function_called TEXT, function_result TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""",
+        """CREATE TABLE IF NOT EXISTS otis_analytics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, org_id INTEGER, date TEXT NOT NULL,
+            total_commands INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(org_id, date))""",
+        """CREATE TABLE IF NOT EXISTS otis_settings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, org_id INTEGER,
+            user_id INTEGER UNIQUE, settings_json TEXT DEFAULT '{}',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""",
+    ]:
+        try:
+            c.execute(_sql)
+            db.commit()
+        except Exception:
+            pass
 
     # Sync full_name from name for existing users
     c.execute("""
@@ -247,28 +1177,28 @@ def _apply_migrations(db, c):
 
 # ── Seed Data ──────────────────────────────────────────────────────────────────
 
+def _count(c, table):
+    """Get row count — works with both SQLite cursor and PG adapter."""
+    row = c.execute(f"SELECT COUNT(*) as cnt FROM {table}").fetchone()
+    return row["cnt"] if isinstance(row, dict) else row[0]
+
+
+def _exec_many(c, sql, rows):
+    """executemany for both SQLite cursor and PG adapter (which lacks executemany)."""
+    if hasattr(c, "executemany"):
+        c.executemany(sql, rows)
+    else:
+        for row in rows:
+            c.execute(sql, row)
+
+
 def _seed_users(c, db):
-    from werkzeug.security import generate_password_hash
-    if c.execute("SELECT COUNT(*) FROM users").fetchone()[0] > 0:
-        return
-    users = [
-        ("vaibhav",   generate_password_hash("admin123"), "Vaibhav Sharma",  "Vaibhav Sharma",  "vaibhav@company.com",   "admin",    "Operations", "VS"),
-        ("rohit",     generate_password_hash("admin123"), "Rohit Mehta",     "Rohit Mehta",     "rohit@company.com",     "admin",    "Finance",    "RM"),
-        ("employee1", generate_password_hash("emp123"),   "Priya Patel",     "Priya Patel",     "priya@company.com",     "employee", "Sales",      "PP"),
-        ("employee2", generate_password_hash("emp123"),   "Arjun Kumar",     "Arjun Kumar",     "arjun@company.com",     "employee", "Engineering","AK"),
-        ("manager1",  generate_password_hash("mgr123"),   "Sunita Rao",      "Sunita Rao",      "sunita@company.com",    "manager",  "Sales",      "SR"),
-    ]
-    c.executemany(
-        """INSERT INTO users
-           (username, password_hash, name, full_name, email, role, department, avatar_initials)
-           VALUES (?,?,?,?,?,?,?,?)""",
-        users
-    )
-    db.commit()
+    """No-op — demo users removed. Users register through the signup flow."""
+    pass
 
 
 def _seed_policy(c, db):
-    if c.execute("SELECT COUNT(*) FROM travel_policies").fetchone()[0] > 0:
+    if _count(c, "travel_policies") > 0:
         return
     c.execute(
         """INSERT INTO travel_policies
@@ -281,116 +1211,15 @@ def _seed_policy(c, db):
 
 
 def _seed_requests(c, db):
-    if c.execute("SELECT COUNT(*) FROM travel_requests").fetchone()[0] > 0:
-        return
-    now = dt.datetime.now()
-    rows = [
-        (
-            "TR-2026-0310001",   # request_id
-            3,                   # user_id (Priya)
-            "Bangalore", "Mumbai",
-            "Client Meeting", "domestic",
-            f"{now.strftime('%Y-%m-%d')} to {(now + dt.timedelta(days=3)).strftime('%Y-%m-%d')}",
-            now.strftime("%Y-%m-%d"),
-            (now + dt.timedelta(days=3)).strftime("%Y-%m-%d"),
-            3, 1, "economy", 7000, 25000, 25000,
-            "approved", "compliant",
-            json.dumps({"status": "compliant", "checks": []}),
-            "Q4 client review",
-        ),
-        (
-            "TR-2026-0311002",
-            4,  # Arjun
-            "Hyderabad", "Delhi",
-            "Conference", "domestic",
-            f"{now.strftime('%Y-%m-%d')} to {(now + dt.timedelta(days=2)).strftime('%Y-%m-%d')}",
-            now.strftime("%Y-%m-%d"),
-            (now + dt.timedelta(days=2)).strftime("%Y-%m-%d"),
-            2, 1, "economy", 6000, 18000, 18000,
-            "pending_approval", "compliant",
-            json.dumps({"status": "compliant", "checks": []}),
-            "AWS re:Invent India",
-        ),
-        (
-            "TR-2026-0312003",
-            3,  # Priya
-            "Goa", "Pune",
-            "Team Offsite", "domestic",
-            f"{now.strftime('%Y-%m-%d')} to {(now + dt.timedelta(days=4)).strftime('%Y-%m-%d')}",
-            now.strftime("%Y-%m-%d"),
-            (now + dt.timedelta(days=4)).strftime("%Y-%m-%d"),
-            4, 5, "economy", 5000, 30000, 30000,
-            "draft", "partial",
-            json.dumps({"status": "partial", "checks": []}),
-            "Annual team offsite",
-        ),
-    ]
-    c.executemany(
-        """INSERT INTO travel_requests
-           (request_id, user_id, destination, origin, purpose, trip_type,
-            travel_dates, start_date, end_date, duration_days, num_travelers,
-            flight_class, hotel_budget_per_night, estimated_total, budget_inr,
-            status, policy_compliance, policy_compliance_json, notes)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        rows
-    )
-    # Create pending approval for the second request
-    c.execute(
-        "INSERT INTO approvals (request_id, approver_id, status) VALUES (?,?,?)",
-        ("TR-2026-0311002", 1, "pending")
-    )
-    db.commit()
+    """No-op — demo requests removed. Requests are created through the app."""
+    pass
 
 
 def _seed_meetings(c, db):
-    if c.execute("SELECT COUNT(*) FROM client_meetings").fetchone()[0] > 0:
-        return
-    now = dt.datetime.now()
-    rows = [
-        (3, "Bangalore", "Ravi Kumar",   "TCS Innovation Labs", "+91-9876543210",
-         "ravi@tcs.com",    (now + dt.timedelta(days=2)).strftime("%Y-%m-%d"),
-         "10:00 AM", "TCS Whitefield",         "Q4 Partnership Discussion",  "Via email",              "email",    "scheduled"),
-        (3, "Hyderabad", "Meena Reddy",  "Infosys",             "+91-8765432109",
-         "meena@infosys.com",(now + dt.timedelta(days=5)).strftime("%Y-%m-%d"),
-         "2:00 PM",  "Infosys Hitech City",    "Annual Review",              "Called Monday",          "phone",    "scheduled"),
-        (4, "Mumbai",    "Aryan Shah",   "Wipro Digital",       "+91-7654321098",
-         "aryan@wipro.com", (now + dt.timedelta(days=1)).strftime("%Y-%m-%d"),
-         "11:30 AM", "Wipro BKC",              "Product Demo",               "Meeting invite via WA",  "whatsapp", "scheduled"),
-        (5, "Chennai",   "Deepa Nair",   "HCL Technologies",    "+91-6543210987",
-         "deepa@hcl.com",  (now + dt.timedelta(days=7)).strftime("%Y-%m-%d"),
-         "3:00 PM",  "HCL Sholinganallur",     "Proposal Presentation",      "LinkedIn message",       "linkedin", "scheduled"),
-    ]
-    c.executemany(
-        """INSERT INTO client_meetings
-           (user_id, destination, client_name, company, contact_number, email,
-            meeting_date, meeting_time, venue, agenda, notes, source_type, status)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        rows
-    )
-    db.commit()
+    """No-op — demo meetings removed. Meetings are created through the app."""
+    pass
 
 
 def _seed_expenses(c, db):
-    if c.execute("SELECT COUNT(*) FROM expenses_db").fetchone()[0] > 0:
-        return
-    now = dt.datetime.now()
-    rows = [
-        ("TR-2026-0310001", 3, "flight",    "IndiGo BOM-BLR",    18500, None, 18500, "verified",  3,
-         now.strftime("%Y-%m-%d"), "INR", 18500, 0.92),
-        ("TR-2026-0310001", 3, "hotel",     "Marriott Whitefield",7500,  None, 7500,  "verified",  3,
-         now.strftime("%Y-%m-%d"), "INR", 7500,  0.88),
-        ("TR-2026-0310001", 3, "meals",     "Client lunch",        2800,  None, 2800,  "verified",  3,
-         now.strftime("%Y-%m-%d"), "INR", 2800,  0.75),
-        ("TR-2026-0311002", 4, "flight",    "Air India DEL-HYD",  12000, None, None,  "pending",   1,
-         now.strftime("%Y-%m-%d"), "INR", None,  None),
-    ]
-    c.executemany(
-        """INSERT INTO expenses_db
-           (request_id, user_id, category, description,
-            invoice_amount, payment_amount, verified_amount,
-            verification_status, stage, date, currency_code,
-            ocr_extracted_amount, ocr_confidence)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        rows
-    )
-    db.commit()
+    """No-op — demo expenses removed. Expenses are created through the app."""
+    pass

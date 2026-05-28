@@ -2,15 +2,20 @@
 TravelSync Pro — Weather Routes
 Travel weather forecasts and current conditions via OpenWeatherMap.
 """
+import logging
 from flask import Blueprint, request, jsonify
 from auth import get_current_user
 from agents.weather_agent import get_travel_weather
 from services.weather_service import weather as weather_service
+from extensions import limiter
+
+logger = logging.getLogger(__name__)
 
 weather_bp = Blueprint("weather", __name__, url_prefix="/api")
 
 
 @weather_bp.route("/weather", methods=["POST"])
+@limiter.limit("30 per minute")
 def forecast():
     """POST /api/weather — travel weather forecast for a city and date range."""
     user = get_current_user()
@@ -35,7 +40,8 @@ def forecast():
         result = get_travel_weather(city, start_date, end_date)
         return jsonify(result), 200
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        logger.exception("Failed to get weather forecast")
+        return jsonify({"success": False, "error": "Failed to get weather forecast"}), 500
 
 
 @weather_bp.route("/weather/current", methods=["GET"])
@@ -53,4 +59,5 @@ def current_weather():
         result = weather_service.get_current(city)
         return jsonify(result), 200
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        logger.exception("Failed to get current weather")
+        return jsonify({"success": False, "error": "Failed to get current weather"}), 500

@@ -1,7 +1,8 @@
 import { useEffect, Suspense, lazy } from 'react'
 import { Routes, Route, Navigate } from 'react-router-dom'
 import useStore from './store/useStore'
-import { getMe } from './api/auth'
+import { getMe, refreshTokens } from './api/auth'
+import { getMyOrganization } from './api/organizations'
 import Layout from './components/layout/Layout'
 import Spinner from './components/ui/Spinner'
 
@@ -16,6 +17,11 @@ const Requests      = lazy(() => import('./pages/Requests'))
 const Approvals     = lazy(() => import('./pages/Approvals'))
 const Analytics     = lazy(() => import('./pages/Analytics'))
 const Chat          = lazy(() => import('./pages/Chat'))
+const Profile       = lazy(() => import('./pages/Profile'))
+const UserManagement = lazy(() => import('./pages/UserManagement'))
+const Organization   = lazy(() => import('./pages/Organization'))
+const PlatformAdmin  = lazy(() => import('./pages/PlatformAdmin'))
+const OtisDashboard  = lazy(() => import('./pages/OtisDashboard'))
 
 function PageLoader() {
   return (
@@ -32,16 +38,31 @@ function ProtectedRoute({ children }) {
 }
 
 export default function App() {
-  const { auth, setUser, setLoading } = useStore()
+  const { auth, setUser, setLoading, setOrg } = useStore()
 
-  // Re-validate session on mount
+  // Re-validate session on mount — also restores JWT access token from sessionStorage
+  // so that raw fetch() calls (e.g. streaming) have a Bearer token and bypass CSRF.
   useEffect(() => {
     if (!auth.isLoggedIn || auth.user) return
     setLoading(true)
-    getMe()
-      .then((data) => setUser(data.user || data))
-      .catch(() => setUser(null))
-  }, [auth.isLoggedIn, auth.user, setLoading, setUser])
+
+    const restore = async () => {
+      // Silently try to restore access token from stored refresh token first.
+      // This ensures raw fetch() calls (chat streaming) send Bearer auth instead
+      // of falling back to cookie/session auth which requires CSRF headers.
+      if (sessionStorage.getItem('ts_refresh')) {
+        try { await refreshTokens() } catch { /* fall through to cookie auth */ }
+      }
+      const data = await getMe()
+      setUser(data.user || data)
+      try {
+        const orgData = await getMyOrganization()
+        setOrg(orgData.organization || null)
+      } catch { /* org is optional */ }
+    }
+
+    restore().catch(() => setUser(null))
+  }, [auth.isLoggedIn, auth.user, setLoading, setUser, setOrg])
 
   return (
     <Suspense fallback={<PageLoader />}>
@@ -136,6 +157,46 @@ export default function App() {
             element={
               <Suspense fallback={<PageLoader />}>
                 <Chat />
+              </Suspense>
+            }
+          />
+          <Route
+            path="/profile"
+            element={
+              <Suspense fallback={<PageLoader />}>
+                <Profile />
+              </Suspense>
+            }
+          />
+          <Route
+            path="/user-management"
+            element={
+              <Suspense fallback={<PageLoader />}>
+                <UserManagement />
+              </Suspense>
+            }
+          />
+          <Route
+            path="/organization"
+            element={
+              <Suspense fallback={<PageLoader />}>
+                <Organization />
+              </Suspense>
+            }
+          />
+          <Route
+            path="/platform-admin"
+            element={
+              <Suspense fallback={<PageLoader />}>
+                <PlatformAdmin />
+              </Suspense>
+            }
+          />
+          <Route
+            path="/otis"
+            element={
+              <Suspense fallback={<PageLoader />}>
+                <OtisDashboard />
               </Suspense>
             }
           />

@@ -14,10 +14,13 @@ sys.path.insert(0, BACKEND)
 os.chdir(BACKEND)
 os.environ.setdefault("FLASK_APP", os.path.join(BACKEND, "app.py"))
 
-from app import socketio, create_app, log_startup_banner  # noqa: E402
-from config import Config                                  # noqa: E402
-
-app = create_app()
+# Import the already-created app instance from app.py.
+# app.py creates the Flask app exactly once at module level (for Gunicorn
+# compatibility). Importing `app` here reuses that instance — we must NOT call
+# create_app() again, as that would double-register all 26 blueprints, run
+# init_db() twice, and register every SocketIO event handler twice.
+from app import app, socketio, log_startup_banner  # noqa: E402
+from config import Config                          # noqa: E402
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(message)s")

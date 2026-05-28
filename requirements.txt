@@ -1,12 +1,22 @@
+# All versions pinned exactly. To upgrade, edit the version and test.
+# Generated: 2026-04-02
+
 # Core Flask
 flask==3.1.0
 flask-cors==4.0.0
+flask-compress==1.15
 python-dotenv==1.0.1
 werkzeug==3.1.3
 
 # SocketIO
 flask-socketio==5.5.1
 eventlet==0.36.1
+
+# Rate Limiting
+flask-limiter==3.9.0
+
+# Anthropic Claude AI
+anthropic==0.40.0
 
 # Google APIs
 google-generativeai==0.8.3
@@ -22,9 +32,23 @@ googlemaps==4.10.0
 requests==2.32.3
 aiohttp==3.10.10
 
+# Database
+psycopg2-binary==2.9.10
+
+# Auth
+PyJWT==2.10.1
+
+# Redis — used by Flask-Limiter (global rate limits), Flask-SocketIO (cross-
+# instance message queue), and cache_service.py. Falls back gracefully when
+# REDIS_URL is not set — all features degrade to in-process memory.
+redis==5.2.1
+
 # Utilities
 cachetools==5.5.0
 Pillow==10.4.0
+
+# Twilio — WhatsApp webhook signature verification + sending
+twilio==9.0.5
 
 # Production server
 gunicorn==23.0.0

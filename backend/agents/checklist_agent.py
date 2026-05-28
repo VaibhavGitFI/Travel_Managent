@@ -4,7 +4,10 @@ Dynamic Gemini-powered packing lists and travel preparation.
 """
 import sys
 import os
+import logging
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+logger = logging.getLogger(__name__)
 
 from services.gemini_service import gemini
 from services.weather_service import weather
@@ -36,8 +39,8 @@ def generate_checklist(trip_details: dict, model=None) -> dict:
     weather_data = {}
     try:
         weather_data = weather.get_current(destination)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("[Checklist] Weather lookup failed for %s: %s", destination, exc)
 
     weather_context = ""
     if weather_data.get("temp"):

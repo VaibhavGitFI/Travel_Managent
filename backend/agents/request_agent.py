@@ -2,16 +2,171 @@
 Request Agent - Travel request CRUD + approval workflow
 Status flow: draft -> submitted -> pending_approval -> approved -> booked -> in_progress -> completed
 """
-from datetime import datetime
+import json
+import uuid
+import logging
+from datetime import datetime, date
 from database import get_db
 from agents.policy_agent import validate_request
 
+logger = logging.getLogger(__name__)
 
-def create_request(data, user_id):
+# Valid manual transitions per role
+# Format: { current_status: [allowed_next_statuses] }
+_ALLOWED_TRANSITIONS = {
+    "employee": {
+        "approved":    ["booked"],
+        "booked":      ["in_progress"],
+        "in_progress": ["completed"],
+    },
+    "manager": {
+        "approved":    ["booked"],
+        "booked":      ["in_progress"],
+        "in_progress": ["completed"],
+    },
+    "admin": {
+        "draft":         ["submitted"],
+        "submitted":     ["pending_approval", "approved"],
+        "pending_approval": ["approved", "rejected"],
+        "approved":      ["booked", "rejected"],
+        "booked":        ["in_progress"],
+        "in_progress":   ["completed"],
+        "completed":     [],
+        "rejected":      [],
+    },
+    "super_admin": {
+        "draft":         ["submitted"],
+        "submitted":     ["pending_approval", "approved"],
+        "pending_approval": ["approved", "rejected"],
+        "approved":      ["booked", "rejected"],
+        "booked":        ["in_progress"],
+        "in_progress":   ["completed"],
+        "completed":     [],
+        "rejected":      [],
+    },
+}
+
+# Approval thresholds: amount ranges that require escalation to higher roles
+_APPROVAL_THRESHOLDS = [
+    # (max_amount, required_role)
+    (50000,   "manager"),       # Up to 50K: any manager
+    (200000,  "admin"),         # 50K-200K: admin/finance
+    (float("inf"), "super_admin"),  # 200K+: super_admin/VP
+]
+
+
+def _build_approval_chain(db, requester_id: int, estimated_total: float, org_id=None) -> list:
+    """Build approval chain based on amount thresholds. Returns list of approver dicts."""
+    chain = []
+
+    # Find the requester's direct manager first
+    _row = db.execute("SELECT manager_id, role FROM users WHERE id = ?", (requester_id,)).fetchone()
+    requester = dict(_row) if _row else None
+    if requester and requester.get("manager_id"):
+        _mgr_row = db.execute("SELECT id, full_name, role FROM users WHERE id = ?", (requester["manager_id"],)).fetchone()
+        mgr = dict(_mgr_row) if _mgr_row else None
+        if mgr and mgr["id"] != requester_id:
+            chain.append(mgr)
+
+    # Determine required level based on amount
+    required_role = "manager"
+    for threshold, role in _APPROVAL_THRESHOLDS:
+        if estimated_total <= threshold:
+            required_role = role
+            break
+
+    # If chain already has someone at or above required level, we're done
+    role_hierarchy = {"employee": 0, "manager": 1, "admin": 2, "super_admin": 3}
+    if chain:
+        chain_max = max(role_hierarchy.get(a.get("role", ""), 0) for a in chain)
+        if chain_max >= role_hierarchy.get(required_role, 1):
+            return chain
+
+    # Need a higher-level approver — find one (excluding requester)
+    if not chain:
+        # No direct manager — find any manager in the org
+        if org_id:
+            mgr = db.execute("""
+                SELECT u.id, u.full_name, u.role FROM users u
+                JOIN org_members om ON om.user_id = u.id
+                WHERE om.org_id = ? AND u.role IN ('manager', 'admin', 'super_admin') AND u.id != ?
+                ORDER BY CASE u.role WHEN 'super_admin' THEN 3 WHEN 'admin' THEN 2 ELSE 1 END ASC
+                LIMIT 1
+            """, (org_id, requester_id)).fetchone()
+        else:
+            mgr = db.execute(
+                "SELECT id, full_name, role FROM users WHERE role IN ('manager','admin','super_admin') AND id != ? LIMIT 1",
+                (requester_id,)
+            ).fetchone()
+        if mgr:
+            chain.append(dict(mgr))
+
+    return chain
+
+
+def _get_next_chain_approver(db, request_id: str, current_approver_id: int,
+                              estimated_total: float, org_id=None) -> dict | None:
+    """Check if a higher-level approver is needed after current approval. Returns approver or None."""
+    required_role = "manager"
+    for threshold, role in _APPROVAL_THRESHOLDS:
+        if estimated_total <= threshold:
+            required_role = role
+            break
+
+    # If only manager-level needed, no escalation
+    if required_role == "manager":
+        return None
+
+    role_hierarchy = {"employee": 0, "manager": 1, "admin": 2, "super_admin": 3}
+    required_level = role_hierarchy.get(required_role, 1)
+
+    # Check current approver's level
+    current = db.execute("SELECT role FROM users WHERE id = ?", (current_approver_id,)).fetchone()
+    current_level = role_hierarchy.get(current["role"] if current else "", 0)
+
+    if current_level >= required_level:
+        return None  # Current approver has sufficient authority
+
+    # Find a higher-level approver
+    # Get all existing approvers for this request to exclude them
+    existing = db.execute("SELECT approver_id FROM approvals WHERE request_id = ?", (request_id,)).fetchall()
+    exclude_ids = {dict(r)["approver_id"] for r in existing}
+    exclude_ids.add(current_approver_id)
+
+    # Get the requester to exclude them too
+    req = db.execute("SELECT user_id FROM travel_requests WHERE request_id = ?", (request_id,)).fetchone()
+    if req:
+        exclude_ids.add(req["user_id"])
+
+    placeholders = ",".join("?" * len(exclude_ids))
+    params = list(exclude_ids)
+
+    if org_id:
+        higher = db.execute(f"""
+            SELECT u.id, u.full_name, u.role FROM users u
+            JOIN org_members om ON om.user_id = u.id
+            WHERE om.org_id = ? AND u.id NOT IN ({placeholders})
+            AND u.role IN ('admin', 'super_admin')
+            ORDER BY CASE u.role WHEN 'super_admin' THEN 3 WHEN 'admin' THEN 2 ELSE 1 END DESC
+            LIMIT 1
+        """, (org_id, *params)).fetchone()
+    else:
+        higher = db.execute(f"""
+            SELECT id, full_name, role FROM users
+            WHERE id NOT IN ({placeholders})
+            AND role IN ('admin', 'super_admin')
+            ORDER BY CASE role WHEN 'super_admin' THEN 3 WHEN 'admin' THEN 2 ELSE 1 END DESC
+            LIMIT 1
+        """, params).fetchone()
+
+    return dict(higher) if higher else None
+
+
+def create_request(data, user_id, org_id=None):
     """Create a new travel request."""
     db = get_db()
     now = datetime.now()
-    request_id = f"TR-{now.strftime('%Y')}-{now.strftime('%m%d%H%M%S')}"
+    request_id = f"TR-{now.strftime('%Y')}-{uuid.uuid4().hex[:10].upper()}"
 
     estimated_total = float(data.get("estimated_total", 0))
     if estimated_total == 0:
@@ -27,12 +182,12 @@ def create_request(data, user_id):
 
     db.execute("""
         INSERT INTO travel_requests
-        (request_id, user_id, destination, origin, purpose, trip_type, travel_dates,
+        (request_id, user_id, org_id, destination, origin, purpose, trip_type, travel_dates,
          start_date, end_date, duration_days, num_travelers, travelers_json,
          flight_class, hotel_budget_per_night, estimated_total, status, policy_compliance_json, notes)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (
-        request_id, user_id,
+        request_id, user_id, org_id,
         data.get("destination", ""),
         data.get("origin", ""),
         data.get("purpose", ""),
@@ -62,8 +217,8 @@ def create_request(data, user_id):
     }
 
 
-def get_requests(user_id=None, status=None):
-    """List travel requests, optionally filtered."""
+def get_requests(user_id=None, status=None, org_id=None):
+    """List travel requests, optionally filtered by user, status, and org."""
     db = get_db()
     query = """
         SELECT tr.*, u.full_name as requester_name, u.department, u.avatar_initials
@@ -72,6 +227,9 @@ def get_requests(user_id=None, status=None):
         WHERE 1=1
     """
     params = []
+    if org_id:
+        query += " AND tr.org_id = ?"
+        params.append(org_id)
     if user_id:
         query += " AND tr.user_id = ?"
         params.append(user_id)
@@ -197,21 +355,45 @@ def submit_request(request_id, user_id):
     db.execute("UPDATE travel_requests SET status='pending_approval', policy_compliance_json=?, updated_at=? WHERE request_id=?",
                (json.dumps(compliance), datetime.now().isoformat(), request_id))
 
-    # Find a manager to assign
-    manager = db.execute("SELECT id FROM users WHERE role IN ('manager','admin') LIMIT 1").fetchone()
-    approver_id = manager["id"] if manager else 1
+    # Determine approval chain based on estimated_total
+    req_dict = dict(req) if not isinstance(req, dict) else req
+    estimated = float(req_dict.get("estimated_total") or 0)
+    org_id = req_dict.get("org_id")
+    chain = _build_approval_chain(db, user_id, estimated, org_id)
 
-    db.execute("INSERT INTO approvals (request_id, approver_id, status) VALUES (?,?,?)",
-               (request_id, approver_id, "pending"))
+    # Create approval record for the first approver in the chain
+    if chain:
+        first_approver = chain[0]
+        db.execute(
+            "INSERT INTO approvals (request_id, org_id, approver_id, status, comments) VALUES (?,?,?,?,?)",
+            (request_id, org_id, first_approver["id"], "pending",
+             f"Level 1/{len(chain)}: {first_approver.get('role', 'manager')}" if len(chain) > 1 else None),
+        )
+    else:
+        # Fallback: find any manager
+        manager = db.execute("SELECT id FROM users WHERE role IN ('manager','admin') AND id != ? LIMIT 1", (user_id,)).fetchone()
+        approver_id = manager["id"] if manager else 1
+        db.execute("INSERT INTO approvals (request_id, org_id, approver_id, status) VALUES (?,?,?,?)",
+                   (request_id, org_id, approver_id, "pending"))
 
     db.commit()
     db.close()
-    return {"success": True, "status": "pending_approval", "message": "Submitted for manager approval"}
+    return {"success": True, "status": "pending_approval", "message": "Submitted for approval",
+            "approval_chain_levels": len(chain) if chain else 1}
 
 
 def process_approval(request_id, approver_id, action, comments=""):
-    """Approve or reject a travel request."""
+    """Approve or reject a travel request. Prevents self-approval."""
     db = get_db()
+
+    # Self-approval prevention: check if approver is the requester
+    _req_row = db.execute("SELECT user_id, estimated_total, org_id FROM travel_requests WHERE request_id = ?",
+                     (request_id,)).fetchone()
+    req = dict(_req_row) if _req_row else None
+    if req and req["user_id"] == approver_id:
+        db.close()
+        return {"success": False, "error": "Cannot approve your own request"}
+
     approval = db.execute(
         "SELECT * FROM approvals WHERE request_id = ? AND approver_id = ? AND status = 'pending'",
         (request_id, approver_id)
@@ -221,26 +403,64 @@ def process_approval(request_id, approver_id, action, comments=""):
         db.close()
         return {"success": False, "error": "No pending approval found"}
 
-    new_status = "approved" if action == "approve" else "rejected"
     now = datetime.now().isoformat()
 
-    db.execute("UPDATE approvals SET status=?, comments=?, decided_at=? WHERE id=?",
-               (new_status, comments, now, approval["id"]))
-    db.execute("UPDATE travel_requests SET status=?, updated_at=? WHERE request_id=?",
-               (new_status, now, request_id))
+    if action == "reject":
+        db.execute("UPDATE approvals SET status='rejected', comments=?, decided_at=? WHERE id=?",
+                   (comments, now, approval["id"]))
+        db.execute("UPDATE travel_requests SET status='rejected', updated_at=? WHERE request_id=?",
+                   (now, request_id))
+        db.commit()
+        db.close()
+        return {"success": True, "request_id": request_id, "status": "rejected", "message": "Request rejected"}
+
+    # Approve this level
+    db.execute("UPDATE approvals SET status='approved', comments=?, decided_at=? WHERE id=?",
+               (comments, now, approval["id"]))
+
+    # Check if more approval levels are needed (multi-level chain)
+    estimated = float(req["estimated_total"] or 0) if req else 0
+    all_approvals = db.execute(
+        "SELECT status FROM approvals WHERE request_id = ? ORDER BY id", (request_id,)
+    ).fetchall()
+    pending_remaining = sum(1 for a in all_approvals if dict(a)["status"] == "pending")
+
+    if pending_remaining > 0:
+        # More levels to go — request stays pending_approval
+        db.commit()
+        db.close()
+        approved_count = sum(1 for a in all_approvals if dict(a)["status"] == "approved") + 1
+        return {
+            "success": True, "request_id": request_id,
+            "status": "pending_approval",
+            "message": f"Level {approved_count} approved. Awaiting next approval.",
+        }
+
+    # Check if we need to escalate to a higher level
+    next_approver = _get_next_chain_approver(db, request_id, approver_id, estimated, req.get("org_id"))
+    if next_approver:
+        db.execute(
+            "INSERT INTO approvals (request_id, org_id, approver_id, status, comments) VALUES (?,?,?,?,?)",
+            (request_id, req.get("org_id"), next_approver["id"], "pending", "Escalated: higher approval needed"),
+        )
+        db.commit()
+        db.close()
+        return {
+            "success": True, "request_id": request_id,
+            "status": "pending_approval",
+            "message": f"Approved at this level. Escalated to {next_approver.get('role', 'senior')} for final approval.",
+        }
+
+    # All levels approved — mark request as approved
+    db.execute("UPDATE travel_requests SET status='approved', updated_at=? WHERE request_id=?",
+               (now, request_id))
     db.commit()
     db.close()
-
-    return {
-        "success": True,
-        "request_id": request_id,
-        "status": new_status,
-        "message": f"Request {new_status}",
-    }
+    return {"success": True, "request_id": request_id, "status": "approved", "message": "Request approved"}
 
 
-def get_pending_approvals(approver_id=None):
-    """Get pending approval queue."""
+def get_pending_approvals(approver_id=None, org_id=None):
+    """Get pending approval queue, scoped by org."""
     db = get_db()
     query = """
         SELECT a.*, tr.destination, tr.origin, tr.purpose, tr.duration_days,
@@ -253,6 +473,9 @@ def get_pending_approvals(approver_id=None):
         WHERE a.status = 'pending'
     """
     params = []
+    if org_id:
+        query += " AND a.org_id = ?"
+        params.append(org_id)
     if approver_id:
         query += " AND a.approver_id = ?"
         params.append(approver_id)
@@ -261,3 +484,233 @@ def get_pending_approvals(approver_id=None):
     rows = db.execute(query, params).fetchall()
     db.close()
     return [dict(r) for r in rows]
+
+
+def update_request_status(request_id: str, new_status: str, actor_user_id: int,
+                           actor_role: str = "employee") -> dict:
+    """
+    Transition a request to a new status.
+    Validates allowed transitions based on current status and actor role.
+    """
+    db = get_db()
+    req = db.execute(
+        "SELECT * FROM travel_requests WHERE request_id = ?", (request_id,)
+    ).fetchone()
+
+    if not req:
+        db.close()
+        return {"success": False, "error": "Request not found"}
+
+    req = dict(req)
+    current = req.get("status", "")
+
+    # Ownership check — non-admins can only change their own requests
+    if actor_role not in ("admin", "manager") and req.get("user_id") != actor_user_id:
+        db.close()
+        return {"success": False, "error": "You can only update your own requests"}
+
+    role_key = actor_role if actor_role in _ALLOWED_TRANSITIONS else "employee"
+    allowed = _ALLOWED_TRANSITIONS.get(role_key, {}).get(current, [])
+
+    if new_status not in allowed:
+        db.close()
+        return {
+            "success": False,
+            "error": f"Cannot transition from '{current}' to '{new_status}'",
+            "current_status": current,
+            "allowed_transitions": allowed,
+        }
+
+    now = datetime.now().isoformat()
+    db.execute(
+        "UPDATE travel_requests SET status=?, updated_at=? WHERE request_id=?",
+        (new_status, now, request_id)
+    )
+    db.commit()
+    db.close()
+
+    return {
+        "success": True,
+        "request_id": request_id,
+        "previous_status": current,
+        "status": new_status,
+        "message": f"Status updated to {new_status}",
+    }
+
+
+def check_and_auto_transition() -> list:
+    """
+    Auto-transition requests based on travel dates.
+    Call periodically or on list requests to keep statuses current.
+    - approved/booked + start_date <= today → in_progress
+    - in_progress + end_date < today → completed
+    Returns list of transitioned request_ids.
+    """
+    db = get_db()
+    today = date.today().isoformat()
+    transitioned = []
+
+    try:
+        # approved/booked → in_progress when start_date arrives
+        rows = db.execute("""
+            SELECT request_id, status, start_date, user_id, destination
+            FROM travel_requests
+            WHERE status IN ('approved', 'booked')
+              AND start_date IS NOT NULL AND start_date != ''
+              AND start_date <= ?
+        """, (today,)).fetchall()
+
+        for row in rows:
+            row = dict(row)
+            db.execute(
+                "UPDATE travel_requests SET status='in_progress', updated_at=? WHERE request_id=?",
+                (datetime.now().isoformat(), row["request_id"])
+            )
+            transitioned.append({"request_id": row["request_id"], "from": row["status"], "to": "in_progress"})
+            logger.info("[AutoTransition] %s: %s → in_progress", row["request_id"], row["status"])
+
+        # in_progress → completed when end_date has passed
+        rows = db.execute("""
+            SELECT request_id, user_id, destination
+            FROM travel_requests
+            WHERE status = 'in_progress'
+              AND end_date IS NOT NULL AND end_date != ''
+              AND end_date < ?
+        """, (today,)).fetchall()
+
+        for row in rows:
+            row = dict(row)
+            db.execute(
+                "UPDATE travel_requests SET status='completed', updated_at=? WHERE request_id=?",
+                (datetime.now().isoformat(), row["request_id"])
+            )
+            transitioned.append({"request_id": row["request_id"], "from": "in_progress", "to": "completed"})
+            logger.info("[AutoTransition] %s: in_progress → completed", row["request_id"])
+
+        db.commit()
+    except Exception as e:
+        logger.warning("[AutoTransition] Error: %s", e)
+    finally:
+        db.close()
+
+    return transitioned
+
+
+def generate_trip_report(request_id: str) -> dict:
+    """
+    Generate a post-trip summary report using Gemini AI.
+    Pulls expenses, meetings, compliance data from DB.
+    """
+    db = get_db()
+    try:
+        req = db.execute("""
+            SELECT tr.*, u.full_name as requester_name, u.department
+            FROM travel_requests tr
+            LEFT JOIN users u ON tr.user_id = u.id
+            WHERE tr.request_id = ?
+        """, (request_id,)).fetchone()
+
+        if not req:
+            return {"success": False, "error": "Request not found"}
+
+        req = dict(req)
+
+        expenses = db.execute(
+            "SELECT * FROM expenses_db WHERE request_id = ? OR trip_id = ?",
+            (request_id, request_id)
+        ).fetchall()
+        expenses = [dict(e) for e in expenses]
+        total_spent = sum(float(e.get("amount") or e.get("invoice_amount") or 0) for e in expenses)
+
+        meetings = db.execute(
+            "SELECT * FROM client_meetings WHERE user_id = ? AND LOWER(destination) LIKE ?",
+            (req.get("user_id"), f"%{(req.get('destination') or '').lower()}%")
+        ).fetchall()
+        meetings = [dict(m) for m in meetings]
+
+    finally:
+        db.close()
+
+    budget = float(req.get("estimated_total") or 0)
+
+    try:
+        from services.gemini_service import gemini
+        if gemini.is_available:
+            compliance_raw = req.get("policy_compliance_json") or "{}"
+            try:
+                compliance = json.loads(compliance_raw) if isinstance(compliance_raw, str) else compliance_raw
+            except Exception:
+                compliance = {}
+
+            expense_lines = "\n".join([
+                f"  - {e.get('category','misc')}: ₹{e.get('amount') or e.get('invoice_amount', 0)}"
+                for e in expenses[:10]
+            ]) or "  No expenses recorded"
+
+            meeting_lines = "\n".join([
+                f"  - {m.get('client_name')} ({m.get('company','')}) on {m.get('meeting_date','')} at {m.get('venue','')}"
+                for m in meetings[:10]
+            ]) or "  No meetings recorded"
+
+            prompt = f"""Generate a concise post-trip business report (3-5 paragraphs) for:
+
+Trip: {req.get('origin','N/A')} → {req.get('destination','N/A')}
+Employee: {req.get('requester_name','N/A')} ({req.get('department','N/A')})
+Dates: {req.get('start_date','N/A')} to {req.get('end_date','N/A')} ({req.get('duration_days',0)} days)
+Purpose: {req.get('purpose','N/A')}
+
+Budget: ₹{budget:,.0f} | Actual: ₹{total_spent:,.0f} | Variance: ₹{total_spent - budget:+,.0f}
+Policy Compliant: {compliance.get('is_compliant', 'N/A')}
+
+Expenses:
+{expense_lines}
+
+Client Meetings:
+{meeting_lines}
+
+Write a professional executive summary: key outcomes, budget performance, meetings conducted,
+and recommendations for future trips. Be specific and business-focused.
+"""
+            narrative = gemini.generate(prompt)
+            if narrative:
+                return {
+                    "success": True,
+                    "request_id": request_id,
+                    "report": {
+                        "narrative": narrative,
+                        "destination": req.get("destination"),
+                        "dates": f"{req.get('start_date')} to {req.get('end_date')}",
+                        "duration_days": req.get("duration_days"),
+                        "budget": budget,
+                        "actual_spend": total_spent,
+                        "variance": total_spent - budget,
+                        "expense_count": len(expenses),
+                        "meeting_count": len(meetings),
+                        "ai_generated": True,
+                    },
+                }
+    except Exception as e:
+        logger.warning("[TripReport] Gemini error: %s", e)
+
+    return {
+        "success": True,
+        "request_id": request_id,
+        "report": {
+            "narrative": (
+                f"Trip from {req.get('origin','N/A')} to {req.get('destination','N/A')} completed. "
+                f"Duration: {req.get('duration_days', 0)} days. "
+                f"Budget: ₹{budget:,.0f} | Spent: ₹{total_spent:,.0f}. "
+                f"Meetings conducted: {len(meetings)}. Expenses: {len(expenses)}. "
+                "Set GEMINI_API_KEY for an AI-generated executive summary."
+            ),
+            "destination": req.get("destination"),
+            "dates": f"{req.get('start_date')} to {req.get('end_date')}",
+            "duration_days": req.get("duration_days"),
+            "budget": budget,
+            "actual_spend": total_spent,
+            "variance": total_spent - budget,
+            "expense_count": len(expenses),
+            "meeting_count": len(meetings),
+            "ai_generated": False,
+        },
+    }

@@ -7,9 +7,9 @@ Configure OPENWEATHER_API_KEY for live data.
 """
 import os
 import logging
-import requests
 from datetime import datetime, timedelta
 from cachetools import TTLCache
+from services.http_client import http as requests
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +67,7 @@ class WeatherService:
                     resp2 = requests.get(
                         f"{self.BASE_URL}/weather",
                         params={"q": city, "appid": self.api_key, "units": "metric"},
+                        headers=outbound_headers(),
                         timeout=10
                     )
                     if resp2.status_code == 200:

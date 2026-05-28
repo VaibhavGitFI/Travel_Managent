@@ -8,10 +8,19 @@ import os
 import logging
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import hashlib
+import json
+import time as _time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from services.gemini_service import gemini
+from agents.registry import registry
+from services.cache_service import CacheStore
 
 logger = logging.getLogger(__name__)
+
+# Semantic trip-plan cache — route+purpose+budget keyed, 1-hour TTL
+# Covers hotels, travel, guide, checklist (stable). Weather and meetings always run fresh.
+_trip_cache = CacheStore(namespace="trips", ttl=3600, maxsize=500)
 
 
 def get_gemini_model():
@@ -37,6 +46,23 @@ def plan_trip(trip_input: dict) -> dict:
     is_rural = trip_input.get("is_rural", False)
     require_veg = trip_input.get("require_veg", False)
     user_id = trip_input.get("user_id", 1)
+
+    # Semantic cache key — route characteristics only, never user_id / exact dates
+    _cache_seed = {
+        "origin":      (origin or "").lower().strip(),
+        "destination": destination.lower().strip(),
+        "duration":    duration_days,
+        "purpose":     (purpose or "").lower().strip(),
+        "budget":      (str(budget) if budget else "moderate").lower().strip(),
+    }
+    _cache_key = hashlib.sha256(
+        json.dumps(_cache_seed, sort_keys=True).encode()
+    ).hexdigest()[:20]
+    _cached_stable = _trip_cache.get(_cache_key) or {}
+    if _cached_stable:
+        logger.info("[Orchestrator] Cache HIT (%s→%s, %sd %s) — skipping %d stable agents",
+                    _cache_seed["origin"], _cache_seed["destination"],
+                    duration_days, purpose, len(_cached_stable))
 
     # Build travelers list
     travelers = []
@@ -70,8 +96,28 @@ def plan_trip(trip_input: dict) -> dict:
         "start_date": travel_dates.split(" to ")[0].strip() if travel_dates else "",
     }
 
-    # Run all agents in parallel
-    results = _run_agents_parallel(trip_details, user_id)
+    # Run agents — cached stable agents are injected, fresh agents run for the rest
+    results = _run_agents_parallel(trip_details, user_id, pre_cached=_cached_stable)
+
+    # Store stable results (hotels, travel, guide, checklist) in cache for next identical route
+    if not _cached_stable:
+        stable_to_cache = {
+            k: v for k, v in results.items()
+            if k in ("hotels", "travel", "guide", "checklist")
+            and isinstance(v, dict) and "error" not in v
+        }
+        if stable_to_cache:
+            _trip_cache.set(_cache_key, stable_to_cache)
+            logger.info("[Orchestrator] Cached %d stable agents for %s→%s",
+                        len(stable_to_cache), _cache_seed["origin"], _cache_seed["destination"])
+
+    # Run validation layer after agents complete
+    try:
+        from agents.validator_agent import validate_trip_plan
+        validation = validate_trip_plan(trip_details, results)
+    except Exception as val_err:
+        logger.warning("[Orchestrator] Validator failed: %s", val_err)
+        validation = {"validation_flags": [], "overall": "pass", "ai_review": None, "flag_count": 0}
 
     # Build comprehensive response
     return {
@@ -84,6 +130,7 @@ def plan_trip(trip_input: dict) -> dict:
         "checklist": results.get("checklist", {}),
         "guide": results.get("guide", {}),
         "meetings": results.get("meetings", {}),
+        "validation": validation,
         "metadata": {
             "destination": destination,
             "duration_days": duration_days,
@@ -97,11 +144,19 @@ def plan_trip(trip_input: dict) -> dict:
     }
 
 
-def _run_agents_parallel(trip_details: dict, user_id: int) -> dict:
-    """Execute all agents concurrently using ThreadPoolExecutor."""
+def _run_agents_parallel(trip_details: dict, user_id: int, pre_cached: dict = None) -> dict:
+    """Execute all agents concurrently using ThreadPoolExecutor.
+
+    pre_cached: dict of already-computed stable results (hotels, travel, guide, checklist).
+    Weather and meetings are always run fresh (date-specific / user-specific).
+    """
     destination = trip_details["destination"]
     duration_days = trip_details["duration_days"]
     travel_dates = trip_details.get("travel_dates", "")
+
+    # Seed results with any pre-cached stable agent output
+    results = dict(pre_cached) if pre_cached else {}
+    _cached_keys = set(results.keys())
 
     # Parse dates for weather
     dates = travel_dates.split(" to ") if travel_dates else []
@@ -132,20 +187,68 @@ def _run_agents_parallel(trip_details: dict, user_id: int) -> dict:
         from agents.meeting_agent import get_meetings_for_destination
         return "meetings", get_meetings_for_destination(destination, user_id, travel_dates)
 
-    results = {}
-    tasks = [run_hotels, run_travel, run_weather, run_checklist, run_guide, run_meetings]
+    agent_map = {
+        "run_hotels": "hotel_agent",
+        "run_travel": "travel_mode_agent",
+        "run_weather": "weather_agent",
+        "run_checklist": "checklist_agent",
+        "run_guide": "guide_agent",
+        "run_meetings": "meeting_agent",
+    }
+    # Weather and meetings are always fresh; stable agents skipped when cached
+    all_tasks = [run_hotels, run_travel, run_weather, run_checklist, run_guide, run_meetings]
+    tasks = [t for t in all_tasks
+             if t.__name__.replace("run_", "") not in _cached_keys]
 
-    with ThreadPoolExecutor(max_workers=6) as executor:
-        futures = {executor.submit(task): task.__name__ for task in tasks}
-        for future in as_completed(futures, timeout=30):
-            try:
-                key, value = future.result(timeout=25)
-                results[key] = value
-            except Exception as e:
+    if not tasks:
+        registry.record_success("orchestrator")
+        return results
+
+    with ThreadPoolExecutor(max_workers=max(1, len(tasks))) as executor:
+        start_times = {}
+        futures = {}
+        for task in tasks:
+            agent_name = agent_map.get(task.__name__, task.__name__)
+            # Skip if circuit breaker is open
+            if not registry.allow_request(agent_name):
+                logger.info("[Orchestrator] Skipping %s (circuit open)", agent_name)
+                agent_info = registry.get(agent_name)
+                results[task.__name__.replace("run_", "")] = {
+                    "error": "Service temporarily unavailable (circuit open)",
+                    "agent_version": agent_info.version if agent_info else "unknown",
+                }
+                continue
+            f = executor.submit(task)
+            futures[f] = task.__name__
+            start_times[f] = _time.time()
+
+        try:
+            for future in as_completed(futures, timeout=30):
                 task_name = futures[future]
-                logger.warning("[Orchestrator] Agent %s failed: %s", task_name, e)
-                results[task_name.replace("run_", "")] = {"error": str(e)}
+                agent_name = agent_map.get(task_name, task_name)
+                elapsed_ms = (_time.time() - start_times[future]) * 1000
+                try:
+                    key, value = future.result(timeout=25)
+                    if isinstance(value, dict):
+                        agent_info = registry.get(agent_name)
+                        value["_agent_version"] = agent_info.version if agent_info else "unknown"
+                        value["_agent_latency_ms"] = round(elapsed_ms, 1)
+                    results[key] = value
+                    registry.record_success(agent_name, latency_ms=elapsed_ms)
+                except Exception as e:
+                    logger.warning("[Orchestrator] Agent %s failed: %s", task_name, e)
+                    results[task_name.replace("run_", "")] = {"error": str(e)}
+                    registry.record_failure(agent_name, error=str(e))
+        except TimeoutError:
+            logger.warning("[Orchestrator] Agent execution timed out after 30s")
+            for future, task_name in futures.items():
+                if not future.done():
+                    agent_name = agent_map.get(task_name, task_name)
+                    results[task_name.replace("run_", "")] = {"error": "Agent timed out"}
+                    registry.record_failure(agent_name, error="timeout")
 
+    # Record orchestrator itself
+    registry.record_success("orchestrator")
     return results
 
 

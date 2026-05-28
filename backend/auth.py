@@ -1,27 +1,386 @@
 """
-TravelSync Pro - Session-based Authentication
-Provides login_required/admin_required decorators and auth API endpoints
+TravelSync Pro - Authentication (Session + JWT)
+Session cookies for browser SPA; JWT Bearer tokens for Cloud Run horizontal scaling.
+Both auth methods are accepted by all protected endpoints.
 """
+import time
+import secrets
+import logging
+from datetime import datetime, timezone
 from functools import wraps
-from flask import session, jsonify, request
+from flask import session, jsonify, request, make_response
 from werkzeug.security import check_password_hash
 from database import get_db
+from cachetools import TTLCache
+
+logger = logging.getLogger(__name__)
+
+# In-memory user cache — avoids DB round-trip on every request (60s TTL).
+# maxsize=5000 holds 5,000 active user records before LRU eviction kicks in.
+_user_cache = TTLCache(maxsize=5000, ttl=60)
+
+# ── JWT Token Blacklist ───────────────────────────────────────────────────────
+# Two-layer store:
+#   L1 — TTLCache (bounded): fast path, avoids a DB call on every non-revoked request.
+#         maxsize=50000 caps memory (~50MB worst-case); ttl=3600 auto-evicts stale
+#         entries hourly so the cache never grows unbounded even under heavy logout load.
+#   L2 — database (token_blacklist table): persists revocations across all Cloud Run
+#         instances and process restarts. L1 is populated on first DB hit so the
+#         same revoked token does not cause a DB round-trip more than once per hour.
+_blacklist_l1: TTLCache = TTLCache(maxsize=50000, ttl=3600)  # bounded, self-evicting
+_blacklist_last_cleanup = 0.0
 
 
-def get_current_user():
-    """Get the currently logged-in user from session."""
-    user_id = session.get("user_id")
-    if not user_id:
-        return None
+# ── JWT helpers ────────────────────────────────────────────────────────────────
+
+def _jwt_secret() -> str:
+    from config import Config
+    return Config.JWT_SECRET_KEY or Config.SECRET_KEY
+
+
+def generate_tokens(user_id: int, org_id: int | None = None, org_role: str | None = None) -> dict:
+    """Generate access + refresh JWT tokens for a user.  Includes org context if provided."""
+    try:
+        import jwt
+        from config import Config
+        now = int(time.time())
+        base = {"sub": str(user_id), "iat": now}
+        if org_id:
+            base["org_id"] = org_id
+        if org_role:
+            base["org_role"] = org_role
+        access_payload = {**base, "exp": now + Config.JWT_ACCESS_TTL * 60, "type": "access"}
+        refresh_payload = {**base, "exp": now + Config.JWT_REFRESH_TTL * 86400, "type": "refresh"}
+        access_token = jwt.encode(access_payload, _jwt_secret(), algorithm="HS256")
+        refresh_token = jwt.encode(refresh_payload, _jwt_secret(), algorithm="HS256")
+        return {"access_token": access_token, "refresh_token": refresh_token}
+    except Exception as exc:
+        logger.warning("[Auth] JWT generation failed: %s", exc)
+        return {}
+
+
+def _is_token_blacklisted(token_hash: str) -> bool:
+    """Two-layer revocation check: L1 in-process cache, then L2 database.
+
+    L1 hit: O(1), no DB call — serves the common case (non-revoked tokens).
+    L2 hit: one SELECT on token_blacklist; populates L1 for 5 minutes so the
+            same revoked token does not hammer the DB on every request.
+    """
+    now = time.time()
+    # L1 fast path — use .get() to avoid KeyError if TTLCache evicts the entry
+    # between the `in` check and the value read (TOCTOU on green-thread switches).
+    if token_hash in _blacklist_l1:
+        expiry = _blacklist_l1.get(token_hash)
+        if expiry is not None and expiry > now:
+            return True
+        # Expired or evicted — remove it
+        _blacklist_l1.pop(token_hash, None)
+
+    # L2 database (cross-instance)
     try:
         db = get_db()
-        user = db.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        row = db.execute(
+            "SELECT expires_at FROM token_blacklist WHERE token_hash = ?",
+            (token_hash,),
+        ).fetchone()
         db.close()
-        if user:
-            return dict(user)
+        if row:
+            # Warm L1 so this path is taken at most once per ~5 min per token
+            _blacklist_l1[token_hash] = now + 300
+            return True
+    except Exception:
+        # DB unavailable — fall through (fail-open on revocation check is
+        # acceptable given the short JWT TTL)
+        pass
+    return False
+
+
+def verify_token(token: str, token_type: str = "access") -> int | None:
+    """Verify a JWT token; return user_id (int) or None. Rejects blacklisted tokens."""
+    try:
+        import jwt
+        import hashlib
+        payload = jwt.decode(token, _jwt_secret(), algorithms=["HS256"])
+        if payload.get("type") != token_type:
+            return None
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        if _is_token_blacklisted(token_hash):
+            return None
+        return int(payload["sub"])
+    except Exception:
+        return None
+
+
+def revoke_token(token: str) -> None:
+    """Revoke a JWT — writes to the DB (cross-instance) and warms the L1 cache."""
+    import hashlib
+    global _blacklist_last_cleanup
+    try:
+        import jwt
+        payload = jwt.decode(token, _jwt_secret(), algorithms=["HS256"], options={"verify_exp": False})
+        expiry_unix = payload.get("exp", int(time.time()) + 86400)
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        expires_iso = datetime.utcfromtimestamp(expiry_unix).isoformat()
+
+        # Write to DB so other instances see the revocation
+        try:
+            db = get_db()
+            db.execute(
+                "INSERT OR REPLACE INTO token_blacklist (token_hash, expires_at) VALUES (?, ?)",
+                (token_hash, expires_iso),
+            )
+            db.commit()
+            db.close()
+        except Exception as db_err:
+            logger.warning("[Auth] Failed to persist token revocation to DB: %s", db_err)
+
+        # Warm L1 cache
+        _blacklist_l1[token_hash] = float(expiry_unix)
+
+        # Periodic L1 cleanup (every 10 min) to prevent unbounded growth
+        now = time.time()
+        if now - _blacklist_last_cleanup > 600:
+            _blacklist_last_cleanup = now
+            expired_keys = [k for k, exp in list(_blacklist_l1.items()) if exp < now]
+            for k in expired_keys:
+                _blacklist_l1.pop(k, None)
+    except Exception:
+        pass
+
+
+def invalidate_user_cache(user_id: int) -> None:
+    """Explicitly bust the auth cache for a user (call after role/permission changes)."""
+    _user_cache.pop(user_id, None)
+
+
+# ── CSRF Protection ──────────────────────────────────────────────────────────
+
+def generate_csrf_token() -> str:
+    """Generate a new CSRF token and store it in the session."""
+    token = secrets.token_hex(32)
+    session["_csrf_token"] = token
+    return token
+
+
+def validate_csrf(f):
+    """Decorator: validate CSRF token on state-changing requests.
+    Token must be sent as X-CSRF-Token header.
+    Skips validation for JWT-authenticated requests (stateless, no CSRF risk).
+    """
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        # CSRF only applies to cookie/session auth, not Bearer token auth
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            return f(*args, **kwargs)
+        # Safe methods don't need CSRF
+        if request.method in ("GET", "HEAD", "OPTIONS"):
+            return f(*args, **kwargs)
+        # Validate token
+        csrf_token = request.headers.get("X-CSRF-Token", "")
+        session_token = session.get("_csrf_token", "")
+        if not csrf_token or not session_token or csrf_token != session_token:
+            return jsonify({"success": False, "error": "CSRF token missing or invalid"}), 403
+        return f(*args, **kwargs)
+    return decorated
+
+
+# ── Multi-tenancy helpers ─────────────────────────────────────────────────────
+
+# Cache for org membership lookups (user_id → {org_id, org_role}).
+# maxsize=5000 holds 5,000 org memberships before LRU eviction; 120s TTL unchanged.
+_org_cache = TTLCache(maxsize=5000, ttl=120)
+
+
+def get_user_org(user_id: int) -> dict | None:
+    """Return the user's active org membership: {org_id, org_role, org_name, org_slug}."""
+    cached = _org_cache.get(user_id)
+    if cached is not None:
+        return cached
+    try:
+        db = get_db()
+        row = db.execute("""
+            SELECT om.org_id, om.org_role, o.name AS org_name, o.slug AS org_slug
+            FROM org_members om
+            JOIN organizations o ON o.id = om.org_id
+            WHERE om.user_id = ?
+            ORDER BY om.joined_at ASC
+            LIMIT 1
+        """, (user_id,)).fetchone()
+        db.close()
+        if row:
+            result = dict(row)
+            _org_cache[user_id] = result
+            return result
         return None
     except Exception:
         return None
+
+
+def _attach_org_context(user: dict | None) -> dict | None:
+    """Return a copy of the user payload enriched with active org context."""
+    if not user:
+        return None
+
+    enriched = dict(user)
+    if enriched.get("org_id") and enriched.get("org_role"):
+        return enriched
+
+    org_id = None
+    org_role = None
+    org_name = None
+    org_slug = None
+
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:].strip()
+        try:
+            import jwt
+            payload = jwt.decode(token, _jwt_secret(), algorithms=["HS256"])
+            if payload.get("org_id"):
+                org_id = int(payload["org_id"])
+                org_role = payload.get("org_role")
+        except Exception:
+            pass
+
+    if not org_id:
+        org_id = session.get("org_id")
+        org_role = session.get("org_role", org_role)
+
+    membership = get_user_org(enriched.get("id")) if enriched.get("id") else None
+    if membership:
+        if not org_id:
+            org_id = membership.get("org_id")
+        if not org_role:
+            org_role = membership.get("org_role")
+        org_name = membership.get("org_name")
+        org_slug = membership.get("org_slug")
+
+    if org_id:
+        enriched["org_id"] = org_id
+        if org_role:
+            enriched["org_role"] = org_role
+        if org_name:
+            enriched["org_name"] = org_name
+        if org_slug:
+            enriched["org_slug"] = org_slug
+
+    return enriched
+
+
+def get_current_org() -> dict | None:
+    """Return current user's org context. Checks JWT claims first, then DB."""
+    # 1. JWT may carry org_id directly
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:].strip()
+        try:
+            import jwt
+            payload = jwt.decode(token, _jwt_secret(), algorithms=["HS256"])
+            if payload.get("org_id"):
+                return {
+                    "org_id": int(payload["org_id"]),
+                    "org_role": payload.get("org_role", "member"),
+                }
+        except Exception:
+            pass
+    # 2. Session may carry org_id
+    org_id = session.get("org_id")
+    if org_id:
+        return {"org_id": org_id, "org_role": session.get("org_role", "member")}
+    # 3. Look up from DB
+    user = get_current_user()
+    if user:
+        membership = get_user_org(user["id"])
+        if membership:
+            # Stash in session for future requests
+            session["org_id"] = membership["org_id"]
+            session["org_role"] = membership["org_role"]
+            return membership
+    return None
+
+
+def org_required(f):
+    """Decorator: require user to belong to an organization."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        user = get_current_user()
+        if not user:
+            return jsonify({"success": False, "error": "Authentication required"}), 401
+        org = get_current_org()
+        if not org:
+            return jsonify({"success": False, "error": "Organization membership required"}), 403
+        return f(*args, **kwargs)
+    return decorated
+
+
+def org_admin_required(f):
+    """Decorator: require org_owner or org_admin role within the org."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        user = get_current_user()
+        if not user:
+            return jsonify({"success": False, "error": "Authentication required"}), 401
+        org = get_current_org()
+        if not org:
+            return jsonify({"success": False, "error": "Organization membership required"}), 403
+        if org.get("org_role") not in ("org_owner", "org_admin"):
+            return jsonify({"success": False, "error": "Organization admin access required"}), 403
+        return f(*args, **kwargs)
+    return decorated
+
+
+def invalidate_org_cache(user_id: int) -> None:
+    """Bust org cache for a user (call after membership changes)."""
+    _org_cache.pop(user_id, None)
+
+
+# Columns returned by _get_user_by_id — excludes password_hash so it never
+# circulates through request handlers, caches, or downstream functions.
+_USER_SAFE_COLS = (
+    "id, username, name, full_name, email, role, department, manager_id, "
+    "avatar_initials, phone, email_verified, profile_picture, sub_role, created_at"
+)
+
+
+def _get_user_by_id(user_id: int) -> dict | None:
+    # Check cache first
+    cached = _user_cache.get(user_id)
+    if cached is not None:
+        return cached
+    try:
+        db = get_db()
+        user = db.execute(
+            f"SELECT {_USER_SAFE_COLS} FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+        db.close()
+        if user:
+            result = dict(user)
+            _user_cache[user_id] = result
+            return result
+        return None
+    except Exception:
+        return None
+
+
+def get_current_user():
+    """
+    Get the currently authenticated user.
+    Checks (in order): JWT Bearer header → Flask session cookie.
+    """
+    # 1. JWT Bearer token in Authorization header
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:].strip()
+        user_id = verify_token(token, "access")
+        if user_id:
+            return _attach_org_context(_get_user_by_id(user_id))
+
+    # 2. Session cookie (existing browser SPA flow)
+    user_id = session.get("user_id")
+    if not user_id:
+        return None
+    return _attach_org_context(_get_user_by_id(user_id))
 
 
 def login_required(f):
@@ -30,107 +389,103 @@ def login_required(f):
     def decorated(*args, **kwargs):
         user = get_current_user()
         if not user:
-            # Demo mode fallback: auto-login as admin if no DB auth
-            if session.get("demo_mode"):
-                return f(*args, **kwargs)
             return jsonify({"success": False, "error": "Authentication required"}), 401
         return f(*args, **kwargs)
     return decorated
 
 
 def admin_required(f):
-    """Decorator: require admin or manager role."""
+    """Decorator: require admin, manager, or super_admin role."""
     @wraps(f)
     def decorated(*args, **kwargs):
         user = get_current_user()
         if not user:
-            if session.get("demo_mode"):
-                return f(*args, **kwargs)
             return jsonify({"success": False, "error": "Authentication required"}), 401
-        if user["role"] not in ("admin", "manager"):
+        if user["role"] not in ("admin", "manager", "super_admin"):
             return jsonify({"success": False, "error": "Admin access required"}), 403
         return f(*args, **kwargs)
     return decorated
 
 
+def super_admin_required(f):
+    """Decorator: require super_admin role."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        user = get_current_user()
+        if not user:
+            return jsonify({"success": False, "error": "Authentication required"}), 401
+        if user["role"] != "super_admin":
+            return jsonify({"success": False, "error": "Super admin access required"}), 403
+        return f(*args, **kwargs)
+    return decorated
+
+
 def login_user(username, password):
-    """Authenticate user and create session."""
+    """Authenticate user and create session. Accepts username or email."""
     try:
         db = get_db()
+        # Try username first, then email
         user = db.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+        if not user and "@" in username:
+            user = db.execute("SELECT * FROM users WHERE email = ?", (username,)).fetchone()
         db.close()
 
         if user and check_password_hash(user["password_hash"], password):
+            # Block unverified accounts
+            u = dict(user)
+            if not u.get("email_verified", 1):
+                return {"success": False, "error": "Email not verified. Please check your inbox for the verification code.", "needs_verification": True, "email": u.get("email", "")}
             session["user_id"] = user["id"]
-            session["demo_mode"] = False
             u = dict(user)
             name = u.get("name") or u.get("full_name") or u["username"]
+
+            # Resolve org membership for JWT + session
+            membership = get_user_org(u["id"])
+            org_id = membership["org_id"] if membership else None
+            org_role = membership.get("org_role") if membership else None
+            if org_id:
+                session["org_id"] = org_id
+                session["org_role"] = org_role
+
+            tokens = generate_tokens(u["id"], org_id=org_id, org_role=org_role)
+            csrf_token = generate_csrf_token()
+
+            user_payload = {
+                "id": u["id"],
+                "username": u["username"],
+                "name": name,
+                "full_name": name,
+                "email": u.get("email", ""),
+                "role": u.get("role", "employee"),
+                "department": u.get("department", "General"),
+                "avatar_initials": "".join(w[0].upper() for w in name.split()[:2]),
+                "profile_picture": u.get("profile_picture"),
+                "sub_role": u.get("sub_role"),
+                "phone": u.get("phone"),
+            }
+            if membership:
+                user_payload["org_id"] = org_id
+                user_payload["org_role"] = org_role
+                user_payload["org_name"] = membership.get("org_name")
+                user_payload["org_slug"] = membership.get("org_slug")
+
             return {
                 "success": True,
-                "user": {
-                    "id": u["id"],
-                    "username": u["username"],
-                    "full_name": name,
-                    "email": u.get("email", ""),
-                    "role": u.get("role", "employee"),
-                    "department": u.get("department", "General"),
-                    "avatar_initials": "".join(w[0].upper() for w in name.split()[:2]),
-                }
+                **tokens,
+                "csrf_token": csrf_token,
+                "user": user_payload,
             }
         return {"success": False, "error": "Invalid username or password"}
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        logger.exception("[Auth] login_user failed for %s", username)
+        return {"success": False, "error": "Login failed. Please try again."}
 
 
-def demo_login():
-    """Auto-login as admin for demo mode."""
-    try:
-        db = get_db()
-        user = db.execute("SELECT * FROM users WHERE role = 'admin' LIMIT 1").fetchone()
-        db.close()
-
-        if user:
-            session["user_id"] = user["id"]
-            session["demo_mode"] = True
-            u = dict(user)
-            name = u.get("name") or u.get("full_name") or u["username"]
-            return {
-                "success": True,
-                "user": {
-                    "id": u["id"],
-                    "username": u["username"],
-                    "full_name": name,
-                    "email": u.get("email", ""),
-                    "role": u.get("role", "admin"),
-                    "department": u.get("department", "General"),
-                    "avatar_initials": "".join(w[0].upper() for w in name.split()[:2]),
-                }
-            }
-        # Fallback if no users exist
-        session["user_id"] = 1
-        session["demo_mode"] = True
-        return {
-            "success": True,
-            "user": {
-                "id": 1, "username": "admin", "full_name": "Demo Admin",
-                "email": "admin@demo.com", "role": "admin",
-                "department": "Management", "avatar_initials": "DA"
-            }
-        }
-    except Exception:
-        session["user_id"] = 1
-        session["demo_mode"] = True
-        return {
-            "success": True,
-            "user": {
-                "id": 1, "username": "admin", "full_name": "Demo Admin",
-                "email": "admin@demo.com", "role": "admin",
-                "department": "Management", "avatar_initials": "DA"
-            }
-        }
-
-
-def logout_user():
-    """Clear session."""
+def logout_user(access_token: str = None, refresh_token: str = None):
+    """Clear session and revoke JWT tokens."""
+    if access_token:
+        revoke_token(access_token)
+    if refresh_token:
+        revoke_token(refresh_token)
     session.clear()
     return {"success": True, "message": "Logged out"}

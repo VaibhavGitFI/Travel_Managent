@@ -24,7 +24,40 @@ const useStore = create(
       logout: () =>
         set({
           auth: { user: null, isLoggedIn: false, loading: false },
+          org: { current: null, members: [], loading: false },
         }),
+
+      // ── Organization ───────────────────────────────────
+      org: {
+        current: null,   // { id, name, slug, plan, my_role, member_count }
+        members: [],
+        loading: false,
+      },
+
+      setOrg: (orgData) =>
+        set((state) => ({
+          org: { ...state.org, current: orgData, loading: false },
+        })),
+
+      setOrgMembers: (members) =>
+        set((state) => ({
+          org: { ...state.org, members },
+        })),
+
+      setOrgLoading: (loading) =>
+        set((state) => ({
+          org: { ...state.org, loading },
+        })),
+
+      // ── Theme ───────────────────────────────────────────
+      theme: 'light', // 'light' | 'dark'
+
+      toggleTheme: () =>
+        set((state) => ({
+          theme: state.theme === 'dark' ? 'light' : 'dark',
+        })),
+
+      setTheme: (theme) => set({ theme }),
 
       // ── Sidebar ──────────────────────────────────────────
       sidebar: {
@@ -42,11 +75,13 @@ const useStore = create(
       // ── Notifications ────────────────────────────────────
       notifications: [],
 
+      setNotifications: (notifications) => set({ notifications }),
+
       addNotification: (notification) =>
         set((state) => ({
           notifications: [
             { id: Date.now(), read: false, ...notification },
-            ...state.notifications,
+            ...state.notifications.filter((n) => n.id !== notification.id),
           ],
         })),
 
@@ -70,12 +105,32 @@ const useStore = create(
       },
 
       setApiHealth: (health) => set({ apiHealth: health }),
+
+      // ── Stale Data (for real-time refresh) ─────────────
+      staleData: {
+        requests: false,
+        meetings: false,
+        expenses: false,
+        approvals: false,
+        analytics: false,
+      },
+
+      markStale: (key) =>
+        set((state) => ({
+          staleData: { ...state.staleData, [key]: true },
+        })),
+
+      clearStale: (key) =>
+        set((state) => ({
+          staleData: { ...state.staleData, [key]: false },
+        })),
     }),
     {
       name: 'travelsync-store',
       partialize: (state) => ({
         auth: state.auth,
         sidebar: state.sidebar,
+        theme: state.theme,
       }),
     }
   )
